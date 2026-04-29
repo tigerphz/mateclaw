@@ -10,21 +10,21 @@ MERGE INTO mate_agent (id, name, description, agent_type, system_prompt, model_n
 KEY (id)
 VALUES (1000000001, 'MateClaw Assistant', '默认 AI 助手，基于 ReAct 模式，支持工具调用', 'react',
         '你是 MateClaw，一个智能 AI 助手。你可以帮助用户回答问题、分析数据、执行任务。请用中文回复，保持专业、友好的态度。',
-        NULL, 25, TRUE, '🤖', 'default,assistant', NOW(), NOW(), 0);
+        NULL, 100, TRUE, '🤖', 'default,assistant', NOW(), NOW(), 0);
 
 -- 默认 Agent：任务规划助手（Plan-Execute 模式）
 MERGE INTO mate_agent (id, name, description, agent_type, system_prompt, model_name, max_iterations, enabled, icon, tags, create_time, update_time, deleted)
 KEY (id)
 VALUES (1000000002, 'Task Planner', '任务规划助手，适合复杂多步骤任务', 'plan_execute',
         '你是一个专业的任务规划和执行助手。你擅长将复杂目标分解为可执行的步骤，并逐步完成。请用中文回复。',
-        NULL, 20, TRUE, '📋', 'planning,task', NOW(), NOW(), 0);
+        NULL, 100, TRUE, '📋', 'planning,task', NOW(), NOW(), 0);
 
 -- StateGraph ReAct Agent（支持 StateGraph 架构）
 MERGE INTO mate_agent (id, name, description, agent_type, system_prompt, model_name, max_iterations, enabled, icon, tags, create_time, update_time, deleted)
 KEY (id)
 VALUES (1000000003, 'StateGraph ReAct', '基于 StateGraph 的 ReAct Agent，支持显式推理循环和工具调用', 'react',
         '你是基于 StateGraph 架构的智能助手。你可以使用工具来帮助用户解决问题。请用中文回复，保持专业、友好的态度。',
-        NULL, 25, TRUE, '🔄', 'react,stategraph,tools', NOW(), NOW(), 0);
+        NULL, 100, TRUE, '🔄', 'react,stategraph,tools', NOW(), NOW(), 0);
 
 -- ==================== 本地模型 Provider（优先展示） ====================
 
@@ -112,7 +112,11 @@ VALUES ('zhipu-intl', 'Zhipu AI (International)', '', 'OpenAIChatModel', '', 'ht
 
 MERGE INTO mate_model_provider (provider_id, name, api_key_prefix, chat_model, api_key, base_url, generate_kwargs, is_custom, is_local, support_model_discovery, support_connection_check, freeze_url, require_api_key, create_time, update_time)
 KEY (provider_id)
-VALUES ('volcengine', 'Volcano Engine (火山引擎)', '', 'OpenAIChatModel', '', 'https://ark.cn-beijing.volces.com/api/v3', '{}', FALSE, FALSE, FALSE, TRUE, TRUE, TRUE, NOW(), NOW());
+VALUES ('volcengine', 'Volcano Engine (火山引擎)', '', 'OpenAIChatModel', '', 'https://ark.cn-beijing.volces.com/api/v3', '{}', FALSE, FALSE, TRUE, TRUE, TRUE, TRUE, NOW(), NOW());
+
+MERGE INTO mate_model_provider (provider_id, name, api_key_prefix, chat_model, api_key, base_url, generate_kwargs, is_custom, is_local, support_model_discovery, support_connection_check, freeze_url, require_api_key, create_time, update_time)
+KEY (provider_id)
+VALUES ('volcengine-plan', 'Volcano Engine Coding Plan (火山方舟代码计划)', '', 'OpenAIChatModel', '', 'https://ark.cn-beijing.volces.com/api/coding/v3', '{}', FALSE, FALSE, TRUE, TRUE, TRUE, TRUE, NOW(), NOW());
 
 MERGE INTO mate_model_provider (provider_id, name, api_key_prefix, chat_model, api_key, base_url, generate_kwargs, is_custom, is_local, support_model_discovery, support_connection_check, freeze_url, require_api_key, auth_type, create_time, update_time)
 KEY (provider_id)
@@ -252,12 +256,17 @@ MERGE INTO mate_model_config (id, name, provider, model_name, description, tempe
 (1000000221, 'GLM-5V-Turbo', 'zhipu-intl', 'glm-5v-turbo', '多模态视觉模型（国际版，推荐）', 0.7, 4096, 0.8, TRUE, TRUE, FALSE, NOW(), NOW(), 0),
 (1000000222, 'GLM-5', 'zhipu-intl', 'glm-5', '旗舰模型（国际版）', 0.7, 4096, 0.8, TRUE, TRUE, FALSE, NOW(), NOW(), 0),
 (1000000223, 'GLM-5.1', 'zhipu-intl', 'glm-5.1', '最新旗舰模型（国际版）', 0.7, 4096, 0.8, TRUE, TRUE, FALSE, NOW(), NOW(), 0),
-(1000000230, 'Doubao 1.5 Pro 256K', 'volcengine', 'doubao-1.5-pro-256k', '豆包旗舰模型，256K 超长上下文', 0.7, 4096, 0.8, TRUE, TRUE, FALSE, NOW(), NOW(), 0),
-(1000000231, 'Doubao 1.5 Pro 32K', 'volcengine', 'doubao-1.5-pro-32k', '豆包旗舰模型，32K 上下文', 0.7, 4096, 0.8, TRUE, TRUE, FALSE, NOW(), NOW(), 0),
-(1000000232, 'Doubao 1.5 Lite 32K', 'volcengine', 'doubao-1.5-lite-32k', '豆包轻量模型，高性价比', 0.7, 4096, 0.8, TRUE, TRUE, FALSE, NOW(), NOW(), 0),
-(1000000233, 'Doubao 1.5 Vision Pro 32K', 'volcengine', 'doubao-1.5-vision-pro-32k', '豆包多模态视觉模型', 0.7, 4096, 0.8, TRUE, TRUE, FALSE, NOW(), NOW(), 0),
-(1000000234, 'Doubao 1.5 Thinking Pro', 'volcengine', 'doubao-1.5-thinking-pro', '豆包深度推理模型', 0.7, 4096, 0.8, TRUE, TRUE, FALSE, NOW(), NOW(), 0),
-(1000000235, 'Doubao 1.5 Thinking Lite', 'volcengine', 'doubao-1.5-thinking-lite', '豆包轻量推理模型', 0.7, 4096, 0.8, TRUE, TRUE, FALSE, NOW(), NOW(), 0),
+(1000000310, 'Doubao Seed 1.8', 'volcengine', 'doubao-seed-1-8-251228', '豆包旗舰多模态模型，文本+图像，256K 上下文', 0.7, 4096, 0.8, TRUE, TRUE, FALSE, NOW(), NOW(), 0),
+(1000000311, 'Doubao Seed Code Preview', 'volcengine', 'doubao-seed-code-preview-251028', '豆包代码预览模型，文本+图像，256K 上下文', 0.7, 4096, 0.8, TRUE, TRUE, FALSE, NOW(), NOW(), 0),
+(1000000312, 'Kimi K2.5', 'volcengine', 'kimi-k2-5-260127', 'Kimi K2.5（火山方舟托管），文本+图像，256K 上下文', 0.7, 4096, 0.8, TRUE, TRUE, FALSE, NOW(), NOW(), 0),
+(1000000313, 'GLM 4.7', 'volcengine', 'glm-4-7-251222', 'GLM 4.7（火山方舟托管），文本+图像，200K 上下文', 0.7, 4096, 0.8, TRUE, TRUE, FALSE, NOW(), NOW(), 0),
+(1000000314, 'DeepSeek V3.2', 'volcengine', 'deepseek-v3-2-251201', 'DeepSeek V3.2（火山方舟托管），文本+图像，128K 上下文', 0.7, 4096, 0.8, TRUE, TRUE, FALSE, NOW(), NOW(), 0),
+(1000000320, 'Ark Coding Plan', 'volcengine-plan', 'ark-code-latest', '方舟代码计划旗舰模型，256K 上下文', 0.2, 4096, 0.8, TRUE, TRUE, FALSE, NOW(), NOW(), 0),
+(1000000321, 'Doubao Seed Code', 'volcengine-plan', 'doubao-seed-code', '豆包代码模型，256K 上下文', 0.2, 4096, 0.8, TRUE, TRUE, FALSE, NOW(), NOW(), 0),
+(1000000322, 'Doubao Seed Code Preview', 'volcengine-plan', 'doubao-seed-code-preview-251028', '豆包代码预览模型，256K 上下文', 0.2, 4096, 0.8, TRUE, TRUE, FALSE, NOW(), NOW(), 0),
+(1000000323, 'GLM 4.7 Coding', 'volcengine-plan', 'glm-4.7', 'GLM 4.7 编码版（火山方舟托管），200K 上下文', 0.2, 4096, 0.8, TRUE, TRUE, FALSE, NOW(), NOW(), 0),
+(1000000324, 'Kimi K2 Thinking', 'volcengine-plan', 'kimi-k2-thinking', 'Kimi K2 推理版（火山方舟托管），256K 上下文', 0.2, 4096, 0.8, TRUE, TRUE, FALSE, NOW(), NOW(), 0),
+(1000000325, 'Kimi K2.5 Coding', 'volcengine-plan', 'kimi-k2.5', 'Kimi K2.5 编码版（火山方舟托管），256K 上下文', 0.2, 4096, 0.8, TRUE, TRUE, FALSE, NOW(), NOW(), 0),
 (1000000240, 'Kimi for Coding', 'kimi-code', 'kimi-for-coding', 'Kimi Code 专用编码模型', 0.2, 32768, 0.8, TRUE, TRUE, FALSE, NOW(), NOW(), 0),
 (1000000250, 'GPT-5.4', 'openai-chatgpt', 'gpt-5.4', 'ChatGPT Plus/Pro 会员模型（OAuth 登录）', NULL, 128000, NULL, TRUE, TRUE, FALSE, NOW(), NOW(), 0),
 (1000000251, 'GPT-5.4 Mini', 'openai-chatgpt', 'gpt-5.4-mini', 'ChatGPT 会员轻量模型', NULL, 128000, NULL, TRUE, TRUE, FALSE, NOW(), NOW(), 0),
@@ -1204,13 +1213,13 @@ UPDATE mate_skill SET skill_content = '# Steve Jobs · 思维操作系统
 -- 1. Web Console（默认启用）
 MERGE INTO mate_channel (id, name, channel_type, agent_id, bot_prefix, config_json, enabled, description, create_time, update_time, deleted)
 KEY (id)
-VALUES (1000000001, 'Web Console', 'web', 1000000001, '', '{}', TRUE,
+VALUES (1000000001, 'Web 控制台', 'web', 1000000001, '', '{}', TRUE,
         '默认 Web 控制台渠道，通过浏览器 SSE 流式交互', NOW(), NOW(), 0);
 
 -- 2. 钉钉（默认禁用，需配置 client_id/client_secret）
 MERGE INTO mate_channel (id, name, channel_type, agent_id, bot_prefix, config_json, enabled, description, create_time, update_time, deleted)
 KEY (id)
-VALUES (1000000002, 'DingTalk Bot', 'dingtalk', 1000000001, '', '{
+VALUES (1000000002, '钉钉机器人', 'dingtalk', 1000000001, '', '{
   "client_id": "",
   "client_secret": "",
   "robot_code": "",
@@ -1230,7 +1239,7 @@ VALUES (1000000002, 'DingTalk Bot', 'dingtalk', 1000000001, '', '{
 -- 3. 飞书（默认禁用，需配置 app_id/app_secret）
 MERGE INTO mate_channel (id, name, channel_type, agent_id, bot_prefix, config_json, enabled, description, create_time, update_time, deleted)
 KEY (id)
-VALUES (1000000003, 'Feishu Bot', 'feishu', 1000000001, '', '{
+VALUES (1000000003, '飞书机器人', 'feishu', 1000000001, '', '{
   "app_id": "",
   "app_secret": "",
   "encrypt_key": "",
@@ -1249,7 +1258,7 @@ VALUES (1000000003, 'Feishu Bot', 'feishu', 1000000001, '', '{
 -- 4. Telegram（默认禁用，需配置 bot_token）
 MERGE INTO mate_channel (id, name, channel_type, agent_id, bot_prefix, config_json, enabled, description, create_time, update_time, deleted)
 KEY (id)
-VALUES (1000000004, 'Telegram Bot', 'telegram', 1000000001, '', '{
+VALUES (1000000004, 'Telegram 机器人', 'telegram', 1000000001, '', '{
   "bot_token": "",
   "http_proxy": "",
   "show_typing": true,
@@ -1267,7 +1276,7 @@ VALUES (1000000004, 'Telegram Bot', 'telegram', 1000000001, '', '{
 -- 5. Discord（默认禁用，需配置 bot_token）
 MERGE INTO mate_channel (id, name, channel_type, agent_id, bot_prefix, config_json, enabled, description, create_time, update_time, deleted)
 KEY (id)
-VALUES (1000000005, 'Discord Bot', 'discord', 1000000001, '!mc ', '{
+VALUES (1000000005, 'Discord 机器人', 'discord', 1000000001, '!mc ', '{
   "bot_token": "",
   "http_proxy": "",
   "dm_policy": "open",
@@ -1284,7 +1293,7 @@ VALUES (1000000005, 'Discord Bot', 'discord', 1000000001, '!mc ', '{
 -- 6. 企业微信智能机器人（默认禁用，需配置 bot_id/secret）
 MERGE INTO mate_channel (id, name, channel_type, agent_id, bot_prefix, config_json, enabled, description, create_time, update_time, deleted)
 KEY (id)
-VALUES (1000000006, 'WeCom Bot', 'wecom', 1000000001, '', '{
+VALUES (1000000006, '企业微信机器人', 'wecom', 1000000001, '', '{
   "bot_id": "",
   "secret": "",
   "welcome_text": "",
@@ -1305,7 +1314,7 @@ VALUES (1000000006, 'WeCom Bot', 'wecom', 1000000001, '', '{
 -- 7. QQ 机器人（默认禁用，需配置 app_id/client_secret）
 MERGE INTO mate_channel (id, name, channel_type, agent_id, bot_prefix, config_json, enabled, description, create_time, update_time, deleted)
 KEY (id)
-VALUES (1000000007, 'QQ Bot', 'qq', 1000000001, '', '{
+VALUES (1000000007, 'QQ 机器人', 'qq', 1000000001, '', '{
   "app_id": "",
   "client_secret": "",
   "markdown_enabled": true,
@@ -1342,7 +1351,7 @@ VALUES (1000000008, '微信', 'weixin', 1000000001, '', '{
 -- 9. Slack（默认禁用，需配置 bot_token / app_token）
 MERGE INTO mate_channel (id, name, channel_type, agent_id, bot_prefix, config_json, enabled, description, create_time, update_time, deleted)
 KEY (id)
-VALUES (1000000009, 'Slack Bot', 'slack', 1000000001, '', '{
+VALUES (1000000009, 'Slack 机器人', 'slack', 1000000001, '', '{
   "bot_token": "",
   "app_token": "",
   "signing_secret": "",
@@ -1687,7 +1696,7 @@ VALUES (
 ## 边界
 
 - 私密的保持私密。
-- 需要执行文件操作或命令时，直接调用对应的工具（如 execute_shell_command、read_file 等），不要用文本描述你要做什么。系统会自动对危险操作弹出审批确认。
+- 需要执行文件操作或命令时，直接调用对应的工具：read_file（读文件）、write_file（写新文件 / 覆盖整个文件，一次写完整内容，不要用 printf / heredoc / echo 拼）、edit_file（修改局部）、execute_shell_command（执行命令）。不要用文本描述你要做什么。系统会自动对危险操作弹出审批确认。
 - 拿不准就先问。
 
 ## 风格
@@ -1834,7 +1843,7 @@ VALUES (
 ## 边界
 
 - 私密的保持私密。
-- 需要执行文件操作或命令时，直接调用对应的工具（如 execute_shell_command、read_file 等），不要用文本描述你要做什么。系统会自动对危险操作弹出审批确认。
+- 需要执行文件操作或命令时，直接调用对应的工具：read_file（读文件）、write_file（写新文件 / 覆盖整个文件，一次写完整内容，不要用 printf / heredoc / echo 拼）、edit_file（修改局部）、execute_shell_command（执行命令）。不要用文本描述你要做什么。系统会自动对危险操作弹出审批确认。
 - 拿不准就先问。
 
 ## 风格
@@ -1920,7 +1929,7 @@ SELECT
     1000000001,
     TRUE,
     'all',
-    '["write_file","edit_file","execute_shell_command"]',
+    '["execute_shell_command"]',
     '[]',
     TRUE,
     '["/etc","/usr","/bin","/sbin","/boot","/sys","/proc","/dev"]',

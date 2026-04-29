@@ -15,6 +15,8 @@ import lombok.extern.slf4j.Slf4j;
 // PR-0b: Anthropic imports moved with the construction code into AgentAnthropicChatModelBuilder.
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.chat.model.ChatModel;
+import org.springframework.ai.model.ApiKey;
+import org.springframework.ai.model.NoopApiKey;
 import org.springframework.ai.model.SimpleApiKey;
 import org.springframework.ai.openai.OpenAiChatModel;
 import org.springframework.ai.openai.OpenAiChatOptions;
@@ -194,7 +196,15 @@ public class AgentGraphBuilder {
             // 内置搜索作为首选，search 工具作为补充/兜底
             log.info("内置搜索已开启 (provider={})，search 工具保留作为补充通道", provider.getProviderId());
         }
-        int maxIter = entity.getMaxIterations() != null ? entity.getMaxIterations() : 25;
+        // Default 100 if DB row leaves max_iterations null; clamp per-agent overrides
+        // to the hard ceiling (BaseAgent.MAX_ITERATIONS_HARD_CEILING) so a misconfigured
+        // row can never push an unbounded loop. Aligned with QwenPaw's 1..100 range.
+        int rawMaxIter = entity.getMaxIterations() != null ? entity.getMaxIterations() : 100;
+        int maxIter = Math.max(1, Math.min(rawMaxIter, BaseAgent.MAX_ITERATIONS_HARD_CEILING));
+        if (maxIter != rawMaxIter) {
+            log.warn("Agent {} max_iterations={} clamped to {} (1..{})",
+                    entity.getId(), rawMaxIter, maxIter, BaseAgent.MAX_ITERATIONS_HARD_CEILING);
+        }
 
         String enhancedPrompt = buildEnhancedPrompt(entity, builtinSearchEnabled);
 
@@ -343,6 +353,25 @@ public class AgentGraphBuilder {
                     // 审批重放键
                     .addStrategy(MateClawStateKeys.FORCED_TOOL_CALL, KeyStrategy.REPLACE)
                     .addStrategy(MateClawStateKeys.PRE_APPROVED_TOOL_CALL, KeyStrategy.REPLACE)
+                    // RFC-063r §2.5: ChatOrigin must survive every node merge so
+                    // sub-graph nodes (StepExecutionNode + DelegateAgentTool's
+                    // child agents) can read the originating channel binding.
+                    // Without explicit REPLACE the framework's merge drops it
+                    // on multi-iteration paths — root cause of the channel-binding
+                    // flakiness reported on first deployment.
+                    .addStrategy(MateClawStateKeys.CHAT_ORIGIN, KeyStrategy.REPLACE)
+                    // Caught by StateKeyRegistrationCoverageTest — these state keys
+                    // were silently unregistered before the post-deploy audit.
+                    // WORKSPACE_BASE_PATH: written by buildInitialState; sub-graph
+                    //   tools read it via WorkspacePathGuard.
+                    // STOP_REQUESTED: external cancel flag checked by every node.
+                    // RETURN_DIRECT_TRIGGERED / DIRECT_TOOL_OUTPUTS (RFC-052):
+                    //   Plan-Execute itself doesn't trigger returnDirect, but
+                    //   DelegateAgentTool sub-agents could; register defensively.
+                    .addStrategy(MateClawStateKeys.WORKSPACE_BASE_PATH, KeyStrategy.REPLACE)
+                    .addStrategy(MateClawStateKeys.STOP_REQUESTED, KeyStrategy.REPLACE)
+                    .addStrategy(MateClawStateKeys.RETURN_DIRECT_TRIGGERED, KeyStrategy.REPLACE)
+                    .addStrategy(MateClawStateKeys.DIRECT_TOOL_OUTPUTS, KeyStrategy.REPLACE)
                     // Token Usage
                     .addStrategy(MateClawStateKeys.PROMPT_TOKENS, KeyStrategy.REPLACE)
                     .addStrategy(MateClawStateKeys.COMPLETION_TOKENS, KeyStrategy.REPLACE)
@@ -473,6 +502,22 @@ public class AgentGraphBuilder {
                     .addStrategy(MateClawStateKeys.REQUESTER_ID, KeyStrategy.REPLACE)
                     // 审批重放
                     .addStrategy(MateClawStateKeys.FORCED_TOOL_CALL, KeyStrategy.REPLACE)
+                    // RFC-063r §2.5: ChatOrigin must survive every node merge so
+                    // ActionNode (and DelegateAgentTool's child agents) can read
+                    // the originating channel binding across multi-iteration ReAct
+                    // loops. Without explicit REPLACE the framework's merge drops
+                    // it after the first node transition — root cause of the
+                    // channel-binding flakiness reported on first deployment.
+                    .addStrategy(MateClawStateKeys.CHAT_ORIGIN, KeyStrategy.REPLACE)
+                    // Caught by StateKeyRegistrationCoverageTest — silently
+                    // unregistered before the audit. WORKSPACE_BASE_PATH from
+                    // initial state; STOP_REQUESTED is the external cancel flag;
+                    // RETURN_DIRECT_TRIGGERED / DIRECT_TOOL_OUTPUTS are RFC-052
+                    // returnDirect short-circuit signals consumed by ObservationDispatcher.
+                    .addStrategy(MateClawStateKeys.WORKSPACE_BASE_PATH, KeyStrategy.REPLACE)
+                    .addStrategy(MateClawStateKeys.STOP_REQUESTED, KeyStrategy.REPLACE)
+                    .addStrategy(MateClawStateKeys.RETURN_DIRECT_TRIGGERED, KeyStrategy.REPLACE)
+                    .addStrategy(MateClawStateKeys.DIRECT_TOOL_OUTPUTS, KeyStrategy.REPLACE)
                     // Token Usage
                     .addStrategy(MateClawStateKeys.PROMPT_TOKENS, KeyStrategy.REPLACE)
                     .addStrategy(MateClawStateKeys.COMPLETION_TOKENS, KeyStrategy.REPLACE)
@@ -998,7 +1043,13 @@ public class AgentGraphBuilder {
             throw new MateClawException("err.agent.provider_not_configured", "Provider 未完成配置，请在模型设置中填写有效的 API Key 和 Base URL");
         }
         String apiKey = provider.getApiKey();
-        if (!modelProviderService.hasUsableApiKey(apiKey)) {
+        // Honor the provider's requireApiKey flag instead of hard-failing on every empty key.
+        // Local + key-free providers (Ollama, LM Studio, MLX, llama.cpp, OpenCode) declare
+        // requireApiKey=false; for them an empty / placeholder key means "no Authorization
+        // header" — Spring AI's NoopApiKey expresses that. Without this the chat path
+        // rejected providers that probe / discovery / connection-test all considered usable.
+        boolean keyRequired = !Boolean.FALSE.equals(provider.getRequireApiKey());
+        if (keyRequired && !modelProviderService.hasUsableApiKey(apiKey)) {
             throw new MateClawException("err.agent.provider_apikey_invalid", "Provider API Key 未配置或无效: " + provider.getProviderId());
         }
         String baseUrl = normalizeOpenAiBaseUrl(provider.getBaseUrl());
@@ -1034,9 +1085,12 @@ public class AgentGraphBuilder {
         boolean kimiSearchEnabled = isKimiProvider(provider)
                 && Boolean.TRUE.equals(kwargs.get("enableSearch"));
 
+        ApiKey apiKeyImpl = (keyRequired && StringUtils.hasText(apiKey))
+                ? new SimpleApiKey(apiKey.trim())
+                : new NoopApiKey();
         return new OpenAiApi(
                 baseUrl,
-                new SimpleApiKey(apiKey.trim()),
+                apiKeyImpl,
                 headers,
                 completionsPath,
                 "/v1/embeddings",
@@ -1050,6 +1104,7 @@ public class AgentGraphBuilder {
                 chatRequest = sanitizeReasoningEffortForProvider(chatRequest, provider);
                 chatRequest = patchReasoningContent(chatRequest, provider);
                 chatRequest = stripReasoningEffortIfIncompatible(chatRequest);
+                chatRequest = stripAutoToolChoice(chatRequest);
                 chatRequest = patchVideoMediaContent(chatRequest);
                 if (kimiSearchEnabled) {
                     chatRequest = injectKimiWebSearch(chatRequest);
@@ -1070,6 +1125,7 @@ public class AgentGraphBuilder {
                 chatRequest = sanitizeReasoningEffortForProvider(chatRequest, provider);
                 chatRequest = patchReasoningContent(chatRequest, provider);
                 chatRequest = stripReasoningEffortIfIncompatible(chatRequest);
+                chatRequest = stripAutoToolChoice(chatRequest);
                 chatRequest = patchVideoMediaContent(chatRequest);
                 if (kimiSearchEnabled) {
                     chatRequest = injectKimiWebSearch(chatRequest);
@@ -1387,17 +1443,28 @@ public class AgentGraphBuilder {
         return result;
     }
 
+    // Trailing "/v{digits}" segment in a base URL — the OpenAI-compatible convention
+    // (/v1 OpenAI, /v3 Volcano Ark, /v4 Zhipu). When the baseUrl already carries this
+    // segment, the default /v1 prefix on the path must be stripped to avoid building
+    // a broken URL like /api/v3/v1/chat/completions.
+    private static final java.util.regex.Pattern OPENAI_BASE_URL_VERSION_SUFFIX =
+            java.util.regex.Pattern.compile(".*/v\\d+$");
+
     private String resolveOpenAiCompletionsPath(String baseUrl, Map<String, Object> kwargs) {
         Object raw = kwargs.get("completionsPath");
-        String path = raw instanceof String value && StringUtils.hasText(value) ? value.trim() : "/v1/chat/completions";
+        boolean explicit = raw instanceof String value && StringUtils.hasText(value);
+        String path = explicit ? ((String) raw).trim() : "/v1/chat/completions";
         if (!path.startsWith("/")) {
             path = "/" + path;
         }
-        if (baseUrl.endsWith("/v1") && path.startsWith("/v1/")) {
+        // An explicit completionsPath is honored as-is. Otherwise, dedupe the /v1
+        // prefix when the baseUrl already ends with /v{N} (Volcano Engine Ark /v3,
+        // Zhipu /v4, etc.).
+        if (!explicit
+                && baseUrl != null
+                && OPENAI_BASE_URL_VERSION_SUFFIX.matcher(baseUrl).matches()
+                && path.startsWith("/v1/")) {
             path = path.substring(3);
-            if (!path.startsWith("/")) {
-                path = "/" + path;
-            }
         }
         return path;
     }
@@ -1589,7 +1656,18 @@ public class AgentGraphBuilder {
      * those into new 400s.
      */
     private enum FallbackPolicy {
-        DEEPSEEK(null, true,  true),
+        // RFC-049 follow-up (2026-04-27): DEEPSEEK previously used (null, true, true)
+        // to "surface explicit provider error" when the producer-side relay had no
+        // captured reasoning_content. In practice this kept failing every multi-tool
+        // turn that crossed a summarizing boundary — the summarizer-produced
+        // assistant message has no reasoning_content by construction, the relay
+        // iterator has no entry for it, and DeepSeek returns 400 inside the same
+        // turn (not just multi-turn replay), aborting the whole graph at the
+        // reasoning step right after summarizing. Switching to the same " "
+        // tolerance KIMI/OPENAI use restores forward progress; the producer-side
+        // capture gap remains a real bug to fix in RFC-049 PR-3 but doesn't
+        // belong on the user-facing failure path.
+        DEEPSEEK(" ",  false, true),
         KIMI    (" ",  false, false),
         OPENAI  (" ",  false, false),
         DEFAULT (" ",  false, false);
@@ -1836,6 +1914,65 @@ public class AgentGraphBuilder {
     private static boolean requiresReasoningContentPatch(String modelName) {
         ModelFamily family = ModelFamily.detect(modelName);
         return family.isThinking();
+    }
+
+    /**
+     * Strip {@code tool_choice="auto"} from outbound chat-completion requests.
+     *
+     * <p>Per the OpenAI spec, omitting {@code tool_choice} when {@code tools} is non-empty
+     * is functionally equivalent to {@code "auto"} (the server defaults to auto-pick).
+     * Stripping the explicit literal {@code "auto"}:
+     * <ul>
+     *   <li>does not change behavior on compliant servers (e.g. OpenAI, DashScope) — they
+     *       still default to auto when tools are present</li>
+     *   <li>unblocks strict OpenAI-compatible self-hosted serving frameworks that reject
+     *       {@code tool_choice="auto"} at request validation time unless launched with an
+     *       auto-tool-choice opt-in flag, which is a common reason custom endpoints
+     *       respond with a generic 400 / "body=None" Pydantic error</li>
+     * </ul>
+     *
+     * <p>Explicit values other than {@code "auto"} ({@code "none"}, {@code "required"},
+     * or a specific function descriptor) are passed through unchanged.
+     */
+    private static OpenAiApi.ChatCompletionRequest stripAutoToolChoice(OpenAiApi.ChatCompletionRequest request) {
+        Object tc = request.toolChoice();
+        if (tc == null || !"auto".equals(String.valueOf(tc))) {
+            return request;
+        }
+        return new OpenAiApi.ChatCompletionRequest(
+                request.messages(),
+                request.model(),
+                request.store(),
+                request.metadata(),
+                request.frequencyPenalty(),
+                request.logitBias(),
+                request.logprobs(),
+                request.topLogprobs(),
+                request.maxTokens(),
+                request.maxCompletionTokens(),
+                request.n(),
+                request.outputModalities(),
+                request.audioParameters(),
+                request.presencePenalty(),
+                request.responseFormat(),
+                request.seed(),
+                request.serviceTier(),
+                request.stop(),
+                request.stream(),
+                request.streamOptions(),
+                request.temperature(),
+                request.topP(),
+                request.tools(),
+                null,  // toolChoice — strip "auto" so strict OpenAI-compatible servers accept the request
+                request.parallelToolCalls(),
+                request.user(),
+                request.reasoningEffort(),
+                request.webSearchOptions(),
+                request.verbosity(),
+                request.promptCacheKey(),
+                request.safetyIdentifier(),
+                request.extraBody()
+        );
     }
 
     /**

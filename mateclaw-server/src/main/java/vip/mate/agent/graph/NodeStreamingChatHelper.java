@@ -349,7 +349,12 @@ public class NodeStreamingChatHelper {
                 || msg.contains("does not exist")
                 || msg.contains("[InvalidParameter]")
                 || msg.contains("InvalidParameter")
-                || msg.contains("url error")) {
+                || msg.contains("url error")
+                // Volcano Ark: model exists but the user's account hasn't opened it,
+                // or the id isn't valid for this region. Both are hard failures —
+                // retrying won't help, and a different provider may serve the model.
+                || msg.contains("ModelNotOpen")
+                || msg.contains("InvalidEndpointOrModel")) {
             return ErrorType.MODEL_NOT_FOUND;
         }
         // Client errors (400 Bad Request — unsupported format, invalid params, etc.) — NOT retryable
@@ -376,6 +381,20 @@ public class NodeStreamingChatHelper {
                 sb.append(cur.getMessage()).append(" | ");
             }
             sb.append(cur.getClass().getSimpleName()).append(" | ");
+            // Include the HTTP response body for WebClient errors. Many providers
+            // (Volcano Ark, Ollama, …) put the actionable error code only in the
+            // body, while the surface message is just "404 Not Found from POST X".
+            // Without this, classifyError() can never see codes like ModelNotOpen.
+            if (cur instanceof WebClientResponseException wre) {
+                try {
+                    String body = wre.getResponseBodyAsString();
+                    if (body != null && !body.isEmpty()) {
+                        sb.append(body.length() > 1024 ? body.substring(0, 1024) : body)
+                          .append(" | ");
+                    }
+                } catch (Exception ignored) {
+                }
+            }
             cur = cur.getCause();
         }
         return sb.toString();
@@ -575,6 +594,16 @@ public class NodeStreamingChatHelper {
         // The returned Prompt shares `options` by reference with the input prompt.
         Prompt outbound = stripThinkingFromPrompt(prompt);
 
+        // RFC-049 follow-up (2026-04-27): trim trailing AssistantMessage from the
+        // outbound prompt. Triggered in practice by the summarizing→reasoning
+        // graph transition: the summarizer emits an in-turn AssistantMessage,
+        // graph state ends with it, reasoning's next LLM call sends history
+        // ending with assistant. Anthropic Claude returns 400 "does not
+        // support assistant message prefill"; some DeepSeek model variants 400
+        // similarly. The dropped assistant is summarizer scaffolding, not
+        // user-relevant content, so removing it before egress is safe.
+        outbound = dropTrailingAssistant(outbound);
+
         // PR-2 L3 (RFC-049 §2.3.2): producer-side relay stash. Extract per-assistant
         // thinking from the normalized prompt (cross-turn positions are already "" due
         // to strip), stash with the caller's original `user` field, and overwrite
@@ -733,10 +762,6 @@ public class NodeStreamingChatHelper {
                     }
 
                     // 4. 提取 token usage（通常最后一个 chunk 携带完整 usage）
-                    // E-4 probe: log metadata keys to check for x-ratelimit-* headers
-                    if (chatResponse.getMetadata() != null && log.isDebugEnabled()) {
-                        log.debug("[E4-probe] metadata keys: {}", chatResponse.getMetadata().keySet());
-                    }
                     if (chatResponse.getMetadata() != null && chatResponse.getMetadata().getUsage() != null) {
                         var usage = chatResponse.getMetadata().getUsage();
                         if (usage.getPromptTokens() != null && usage.getPromptTokens() > 0) {
@@ -1064,6 +1089,37 @@ public class NodeStreamingChatHelper {
         return new Prompt(cleaned, prompt.getOptions());
     }
 
+    /**
+     * Drop trailing {@link AssistantMessage} entries from a Prompt's instructions.
+     * Most LLM providers reject prompts whose history ends with an assistant turn —
+     * Anthropic Claude with a 400 "does not support assistant message prefill",
+     * DeepSeek thinking-mode variants with reasoning_content errors. The
+     * trailing assistant is typically a summarizer-emitted scaffold message that
+     * shouldn't be sent as the final user-facing prompt anyway. Returns the
+     * input unchanged if there's nothing to drop.
+     */
+    static Prompt dropTrailingAssistant(Prompt prompt) {
+        List<Message> messages = prompt.getInstructions();
+        if (messages.isEmpty()) {
+            return prompt;
+        }
+        int end = messages.size();
+        while (end > 0 && messages.get(end - 1) instanceof AssistantMessage) {
+            end--;
+        }
+        if (end == messages.size()) {
+            return prompt;
+        }
+        if (end == 0) {
+            // Refuse to produce an empty prompt — caller's bug; let provider error surface.
+            log.warn("[dropTrailingAssistant] all messages were AssistantMessage; skipping trim to avoid empty prompt");
+            return prompt;
+        }
+        log.debug("[dropTrailingAssistant] trimmed {} trailing AssistantMessage(s) from prompt (size {} -> {})",
+                messages.size() - end, messages.size(), end);
+        return new Prompt(new ArrayList<>(messages.subList(0, end)), prompt.getOptions());
+    }
+
     private StreamResult buildErrorResult(String errorMsg, String conversationId, String phase) {
         log.error("[{}] Building error result for conversation {}: {}", phase, conversationId, errorMsg);
         if (streamTracker != null && conversationId != null) {
@@ -1118,6 +1174,19 @@ public class NodeStreamingChatHelper {
         }
     }
 
+    // Pulls the offending model id out of a Volcano Ark error body. Both
+    // ModelNotOpen and InvalidEndpointOrModel.NotFound mention it after a
+    // recognizable phrase ("activated the model X" / "model or endpoint X").
+    private static final java.util.regex.Pattern ARK_MODEL_NAME_PATTERN =
+            java.util.regex.Pattern.compile(
+                    "(?:activated the model|model or endpoint)\\s+([A-Za-z0-9._-]+)");
+
+    private static String extractArkModelName(String body) {
+        if (body == null) return null;
+        java.util.regex.Matcher m = ARK_MODEL_NAME_PATTERN.matcher(body);
+        return m.find() ? m.group(1) : null;
+    }
+
     /** 从异常链提取用户友好的错误信息 */
     private static String extractUserFriendlyError(Throwable error) {
         String msg = error.getMessage();
@@ -1149,6 +1218,26 @@ public class NodeStreamingChatHelper {
         if (bodySample.contains("does not support tools") || msg.contains("does not support tools")) {
             return "当前模型不支持工具调用（function calling）。请在 设置 → 模型 里切换到支持 tools 的模型，"
                     + "例如 qwen3、qwen2.5:7b+、llama3.1:8b+、mistral-nemo、command-r 等。";
+        }
+
+        // Volcano Engine Ark — model exists but the user's account hasn't activated it.
+        // Body shape: {"error":{"code":"ModelNotOpen","message":"Your account ... has not activated the model X. Please activate the model service in the Ark Console..."}}
+        if (combined.contains("ModelNotOpen")) {
+            String modelId = extractArkModelName(combined);
+            String suffix = modelId != null ? "「" + modelId + "」" : "";
+            return "火山方舟（Volcano Ark）尚未为该账号开通模型" + suffix
+                    + "。请前往 Ark 控制台 → 模型广场，对该模型点击「开通服务」后重试。"
+                    + "（控制台：https://console.volcengine.com/ark）";
+        }
+
+        // Volcano Engine Ark — model id doesn't exist for the user's region/key.
+        // Body shape: {"error":{"code":"InvalidEndpointOrModel.NotFound","message":"The model or endpoint X does not exist or you do not have access to it..."}}
+        if (combined.contains("InvalidEndpointOrModel")) {
+            String modelId = extractArkModelName(combined);
+            String suffix = modelId != null ? "「" + modelId + "」" : "";
+            return "火山方舟（Volcano Ark）找不到模型" + suffix
+                    + "。原因可能是模型 ID 不在当前区域，或你的账号没有访问权限。"
+                    + "建议在 设置 → 模型 里点「刷新模型」重新发现，或在 Ark 控制台创建「推理接入点」(ep-XXX) 后使用该 ID。";
         }
 
         // DashScope "url error" is really "model name not mapped to any valid endpoint".

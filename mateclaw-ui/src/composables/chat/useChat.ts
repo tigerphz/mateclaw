@@ -288,18 +288,21 @@ export function useChat(options: UseChatOptions): UseChatReturn {
       if (streamPhase.value !== 'summarizing_observations') {
         streamPhase.value = options.thinkingLevel?.value === 'off' ? 'streaming' : 'thinking'
       }
-      // Segments: all thinking deltas merge into one segment (not split by tool_call interruptions)
+      // Segments: per-round thinking. When tool_call_started / phase change closes the running
+      // thinking segment (status='completed'), a fresh thinking_delta opens a new segment instead
+      // of reopening the closed one. Without this split, multi-round ReAct (3 reasoning + 2
+      // summarizing rounds) accumulates 9K+ chars in a single bubble.
       const segs = currentSegments.value
-      // Reuse an existing thinking segment regardless of status (running or completed)
-      let thinkSeg = segs.find((s: MessageSegment) => s.type === 'thinking')
+      let thinkSeg = segs.findLast((s: MessageSegment) =>
+        s.type === 'thinking' && s.status === 'running'
+      )
       if (!thinkSeg) {
         thinkSeg = { id: genSegId(), type: 'thinking', status: 'running', thinkingText: '', timestamp: Date.now() }
-        // Insert at front — thinking always appears at the top
-        segs.unshift(thinkSeg)
+        // Append in timeline order (interleaved with tool_calls) — old behavior unshift'd to top,
+        // but with per-round splitting that misorders rounds 2+ relative to their tool calls.
+        segs.push(thinkSeg)
         flushSegmentsToMessage()
       }
-      // Re-mark as running when new thinking content arrives
-      thinkSeg.status = 'running'
       thinkSeg.thinkingText = (thinkSeg.thinkingText || '') + (data.delta || '')
     }
   })
@@ -451,8 +454,14 @@ export function useChat(options: UseChatOptions): UseChatReturn {
   let errorFired = false
   stream.on('error', (data) => {
     if (isStaleEvent(data)) return
+    // Always carry data.message as rawMessage, so the inline error card can
+    // surface the actual reason ("无权操作该会话" etc.) instead of the generic
+    // unknown.description template. classifyBackendError already does this
+    // when errorType is present; the fallback path used to drop it.
     const errorInfo: ChatErrorInfo = data.errorInfo
-      || (data.errorType ? classifyBackendError(data) : { category: 'unknown', retryable: true, timestamp: Date.now() })
+      || (data.errorType
+        ? classifyBackendError(data)
+        : { category: 'unknown', rawMessage: data.message, retryable: true, timestamp: Date.now() })
     if (currentAssistantId.value) {
       const msg = getMessage(currentAssistantId.value)
       if (msg) {
@@ -466,7 +475,8 @@ export function useChat(options: UseChatOptions): UseChatReturn {
       }
       currentAssistantId.value = null
     }
-    error.value = new Error(data.message || '请求失败')
+    const errorMessage = data.message || '请求失败'
+    error.value = new Error(errorMessage)
     streamPhase.value = 'idle'
     phaseInfo.value = null
     // Clear queue on error to avoid stale state
@@ -495,6 +505,7 @@ export function useChat(options: UseChatOptions): UseChatReturn {
         const metadata = parseMetadata((msg as any).metadata)
         const toolCalls = metadata?.toolCalls || []
         toolCalls.push({
+          toolCallId: data.toolCallId || '',
           name: data.toolName,
           arguments: data.arguments,
           status: 'running',
@@ -505,12 +516,16 @@ export function useChat(options: UseChatOptions): UseChatReturn {
           metadata: { ...metadata, toolCalls, currentPhase: 'executing_tool', runningToolName: data.toolName }
         } as any)
       }
-      // Segments: close any running thinking/content segment, then push a new tool_call segment
+      // Segments: close any running thinking/content segment, then push a new tool_call segment.
+      // Carry toolCallId so completes can pair back precisely; falling back to toolName-based
+      // pairing strands the first card with a permanent spinner whenever the LLM fires multiple
+      // calls of the same tool (observed with execute_shell_command + python3 retries).
       const segs = currentSegments.value
       const runningSeg = segs.findLast((s: MessageSegment) => s.status === 'running' && (s.type === 'thinking' || s.type === 'content'))
       if (runningSeg) runningSeg.status = 'completed'
       segs.push({
         id: genSegId(), type: 'tool_call', status: 'running',
+        toolCallId: data.toolCallId || '',
         toolName: data.toolName, toolArgs: data.arguments,
         timestamp: data.timestamp || Date.now(),
       })
@@ -525,10 +540,17 @@ export function useChat(options: UseChatOptions): UseChatReturn {
       if (msg) {
         const metadata = parseMetadata((msg as any).metadata)
         const toolCalls = [...(metadata?.toolCalls || [])]
-        const lastRunning = toolCalls.findLastIndex((tc: any) => tc.status === 'running')
-        if (lastRunning >= 0) {
-          toolCalls[lastRunning] = {
-            ...toolCalls[lastRunning],
+        // Match by toolCallId when available, fall back to "first running" for legacy events.
+        let target = -1
+        if (data.toolCallId) {
+          target = toolCalls.findIndex((tc: any) => tc.toolCallId === data.toolCallId && tc.status === 'running')
+        }
+        if (target < 0) {
+          target = toolCalls.findIndex((tc: any) => tc.status === 'running' && tc.name === data.toolName)
+        }
+        if (target >= 0) {
+          toolCalls[target] = {
+            ...toolCalls[target],
             result: data.result,
             success: data.success,
             status: 'completed'
@@ -539,10 +561,17 @@ export function useChat(options: UseChatOptions): UseChatReturn {
           metadata: { ...metadata, toolCalls, runningToolName: undefined }
         } as any)
       }
-      // Segments: find the matching running tool_call segment and mark it complete
+      // Segments: prefer toolCallId match, fall back to first-running by toolName.
       const segs = currentSegments.value
-      const toolSeg = segs.findLast((s: MessageSegment) =>
-        s.type === 'tool_call' && s.status === 'running' && s.toolName === data.toolName)
+      let toolSeg: MessageSegment | undefined
+      if (data.toolCallId) {
+        toolSeg = segs.find((s: MessageSegment) =>
+          s.type === 'tool_call' && s.status === 'running' && s.toolCallId === data.toolCallId)
+      }
+      if (!toolSeg) {
+        toolSeg = segs.find((s: MessageSegment) =>
+          s.type === 'tool_call' && s.status === 'running' && s.toolName === data.toolName)
+      }
       if (toolSeg) {
         toolSeg.status = data.success !== false ? 'completed' : 'error'
         toolSeg.toolResult = data.result
@@ -595,6 +624,15 @@ export function useChat(options: UseChatOptions): UseChatReturn {
           ...msg,
           metadata: { ...metadata, currentPhase: data.phase }
         } as any)
+      }
+      // Close any running thinking/content segment on phase transition so the next thinking_delta
+      // (e.g. summarizing → reasoning) starts a fresh round-scoped segment instead of growing the
+      // previous one unbounded.
+      const segs = currentSegments.value
+      for (const seg of segs) {
+        if (seg.status === 'running' && (seg.type === 'thinking' || seg.type === 'content')) {
+          seg.status = 'completed'
+        }
       }
     }
   })
@@ -905,10 +943,47 @@ export function useChat(options: UseChatOptions): UseChatReturn {
       if (msg) {
         const metadata = parseMetadata((msg as any).metadata)
         if (metadata?.pendingApproval) {
-          const toolCalls = [...(metadata?.toolCalls || [])]
-          for (let i = 0; i < toolCalls.length; i++) {
-            if (toolCalls[i].status !== 'completed') {
-              toolCalls[i] = { ...toolCalls[i], status: 'completed' }
+          // RFC-067 §4.10: every still-pending tool call on this gate message
+          // must surface as a terminal state — both deny AND approve. RFC-067
+          // §3 guarantees "one turn at most one pending", so any running/
+          // awaiting entry IS the resolved one — skip strict (name, arguments)
+          // matching since JSON formatting can drift between the live SSE
+          // buffer and pendingApproval.arguments.
+          //   approve → success=true  + result='[已批准]' → green ✓ on the gate
+          //             row; the actual execution result is in the replayed
+          //             assistant message that follows.
+          //   deny    → success=false + result='[已拒绝]' → red ✗.
+          // Both branches must also flip metadata.segments[] entries because
+          // MessageBubble renders the timeline via ToolCallSegment.vue (driven
+          // by metadata.segments, not metadata.toolCalls).
+          const approved = data.decision === 'approved'
+          const successFlag = approved
+          const resultText = approved ? '[已批准]' : '[已拒绝]'
+          const toolCalls = (metadata?.toolCalls || []).map((tc: any) => {
+            const wasPending = tc.status === 'awaiting_approval' || tc.status === 'running'
+            if (wasPending) {
+              return { ...tc, status: 'completed', success: successFlag, result: resultText }
+            }
+            return tc
+          })
+          const segments = (metadata?.segments || []).map((seg: any) => {
+            if (seg.type !== 'tool_call') return seg
+            const wasPending = seg.status === 'running' || seg.status === 'awaiting_approval'
+            if (wasPending) {
+              return { ...seg, status: 'completed', toolSuccess: successFlag, toolResult: resultText }
+            }
+            return seg
+          })
+          // Sync currentSegments.value so the live streaming buffer agrees
+          // with the persisted message metadata.
+          for (let i = 0; i < currentSegments.value.length; i++) {
+            const liveSeg: any = currentSegments.value[i]
+            if (liveSeg.type !== 'tool_call') continue
+            const wasPending = liveSeg.status === 'running' || liveSeg.status === 'awaiting_approval'
+            if (wasPending) {
+              liveSeg.status = 'completed'
+              liveSeg.toolSuccess = successFlag
+              liveSeg.toolResult = resultText
             }
           }
           updateMessage(targetId, {
@@ -918,9 +993,10 @@ export function useChat(options: UseChatOptions): UseChatReturn {
               ...metadata,
               currentPhase: 'completed',
               toolCalls,
+              segments,
               pendingApproval: {
                 ...metadata.pendingApproval,
-                status: data.decision === 'approved' ? 'approved' : 'denied'
+                status: approved ? 'approved' : 'denied'
               }
             }
           } as any)

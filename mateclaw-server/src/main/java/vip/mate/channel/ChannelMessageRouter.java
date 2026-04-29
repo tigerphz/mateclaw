@@ -4,7 +4,9 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 import reactor.core.publisher.Flux;
 import vip.mate.agent.AgentService;
-import vip.mate.approval.ApprovalService;
+import vip.mate.agent.context.ChatOrigin;
+import vip.mate.approval.ApprovalWorkflowService;
+import vip.mate.approval.ResolveOutcome;
 import vip.mate.approval.PendingApproval;
 import vip.mate.channel.model.ChannelEntity;
 import vip.mate.channel.notification.ApprovalNotificationService;
@@ -47,12 +49,13 @@ public class ChannelMessageRouter {
     private final ConversationService conversationService;
     private final ChannelService channelService;
     private final ChannelSessionStore channelSessionStore;
-    private final ApprovalService approvalService;
+    private final ApprovalWorkflowService approvalService;
     private final ApprovalNotificationService approvalNotificationService;
     private final ConversationCompletionPublisher completionPublisher;
     private final TtsService ttsService;
     private final ObjectMapper objectMapper;
     private final ChatStreamTracker streamTracker;
+    private final ChannelChatOriginFactory chatOriginFactory;
 
     /** 队列条目：封装消息及其路由上下文 */
     private record QueueEntry(ChannelMessage message, ChannelAdapter adapter, ChannelEntity channelEntity) {}
@@ -92,12 +95,13 @@ public class ChannelMessageRouter {
                                 ConversationService conversationService,
                                 ChannelService channelService,
                                 ChannelSessionStore channelSessionStore,
-                                ApprovalService approvalService,
+                                ApprovalWorkflowService approvalService,
                                 ApprovalNotificationService approvalNotificationService,
                                 ConversationCompletionPublisher completionPublisher,
                                 TtsService ttsService,
                                 ObjectMapper objectMapper,
-                                ChatStreamTracker streamTracker) {
+                                ChatStreamTracker streamTracker,
+                                ChannelChatOriginFactory chatOriginFactory) {
         this.agentService = agentService;
         this.conversationService = conversationService;
         this.channelService = channelService;
@@ -108,6 +112,7 @@ public class ChannelMessageRouter {
         this.ttsService = ttsService;
         this.objectMapper = objectMapper;
         this.streamTracker = streamTracker;
+        this.chatOriginFactory = chatOriginFactory;
     }
 
     // ==================== 防抖辅助类 ====================
@@ -362,36 +367,40 @@ public class ChannelMessageRouter {
                                 adapter.getChannelType(), message.getSenderId(), originalRequester);
                         return;
                     }
-                    // 批准：原子解决+消费审批记录（消除 resolve/consume race condition）
-                    PendingApproval consumed = approvalService.resolveAndConsume(
+                    // Approve via IM: workflow.resolveAndConsume runs DB + metadata + memory atomically.
+                    ResolveOutcome consumeOutcome = approvalService.resolveAndConsume(
                             pending.getPendingId(), message.getSenderId());
-                    if (consumed == null) {
+                    if (consumeOutcome.isAlreadyResolved()) {
                         adapter.sendMessage(replyTarget, "⚠️ 审批记录已过期或已被处理。");
                         return;
                     }
-                    log.info("[{}] Approval APPROVED via IM command: pendingId={}, tool={}",
-                            adapter.getChannelType(), consumed.getPendingId(), consumed.getToolName());
+                    PendingApproval consumed = consumeOutcome.consumedSnapshot();
+                    log.info("[{}] Approval APPROVED via IM command: pendingId={}, tool={}, msgRewritten={}",
+                            adapter.getChannelType(), consumed.getPendingId(), consumed.getToolName(),
+                            consumeOutcome.messagesRewritten());
 
                     replayApprovedToolCall(consumed, conversationId, adapter, message, channelEntity);
                     return;
 
                 } else if (isDenyCommand(userText)) {
-                    // 拒绝 + 清理 DB 残留审批占位消息
-                    approvalService.resolve(pending.getPendingId(), message.getSenderId(), "denied");
+                    // Deny via IM: workflow.resolve owns the full state-machine transition.
+                    ResolveOutcome denyOutcome = approvalService.resolve(
+                            pending.getPendingId(), message.getSenderId(), "denied");
                     conversationService.removeApprovalPlaceholders(conversationId);
                     adapter.sendMessage(replyTarget, "⛔ 已拒绝执行工具: " + pending.getToolName());
-                    log.info("[{}] Approval DENIED via IM command: pendingId={}, tool={}",
-                            adapter.getChannelType(), pending.getPendingId(), pending.getToolName());
+                    log.info("[{}] Approval DENIED via IM command: pendingId={}, tool={}, msgRewritten={}",
+                            adapter.getChannelType(), pending.getPendingId(), pending.getToolName(),
+                            denyOutcome.messagesRewritten());
                     return;
 
                 } else {
-                    // 非审批命令但有 pending → 视为隐式拒绝 + 清理残留
+                    // Non-approval message while a pending exists → treat as implicit deny.
                     approvalService.resolve(pending.getPendingId(), message.getSenderId(), "denied");
                     conversationService.removeApprovalPlaceholders(conversationId);
                     adapter.sendMessage(replyTarget, "⛔ 审批已取消。将继续处理您的新消息。");
                     log.info("[{}] Approval auto-cancelled (non-approval message): pendingId={}",
                             adapter.getChannelType(), pending.getPendingId());
-                    // 继续正常流程处理当前消息
+                    // Fall through to process the new message normally.
                 }
             }
             // ======= 审批拦截层结束 =======
@@ -435,11 +444,17 @@ public class ChannelMessageRouter {
             Long savedAssistantId = null;
             try {
                 // 流式路径：渠道实现了 StreamingChannelAdapter 则委托渠道渲染流式事件
+                // RFC-063r §2.5: build the ChatOrigin once per channel-message
+                // so cron jobs created during this conversation inherit the
+                // channel binding (Issue #25 root path).
+                ChatOrigin chatOrigin = chatOriginFactory.from(
+                        channelEntity, message, conversationId, /* workspaceBasePath */ null);
+
                 if (adapter instanceof StreamingChannelAdapter streamingAdapter) {
-                    savedAssistantId = processWithStreaming(message, streamingAdapter, conversationId, agentId, promptText, channelEntity);
+                    savedAssistantId = processWithStreaming(message, streamingAdapter, conversationId, agentId, promptText, channelEntity, chatOrigin);
                 } else {
                     // 同步路径：直接获取完整回复
-                    String reply = agentService.chat(agentId, promptText, conversationId);
+                    String reply = agentService.chat(agentId, promptText, conversationId, chatOrigin);
 
                     // 检查 chat 过程中是否产生了审批 pending
                     PendingApproval newPending = approvalService.findPendingByConversation(conversationId);
@@ -516,14 +531,14 @@ public class ChannelMessageRouter {
      */
     private Long processWithStreaming(ChannelMessage message, StreamingChannelAdapter streamingAdapter,
                                       String conversationId, Long agentId, String promptText,
-                                      ChannelEntity channelEntity) {
+                                      ChannelEntity channelEntity, ChatOrigin chatOrigin) {
         String channelType = streamingAdapter.getChannelType();
         log.info("[{}] Streaming processing started: conversationId={}", channelType, conversationId);
 
         try {
-            // Step 1: 产生事件流
+            // Step 1: 产生事件流（RFC-063r §2.5: forward ChatOrigin so tools see channelId）
             Flux<AgentService.StreamDelta> stream = agentService.chatStructuredStream(
-                    agentId, promptText, conversationId, message.getSenderId());
+                    agentId, promptText, conversationId, message.getSenderId(), chatOrigin);
 
             // Step 2: 委托渠道渲染（渠道内部消费 Flux 并处理 UI 更新）
             String finalContent = streamingAdapter.processStream(stream, message, conversationId);
@@ -586,8 +601,17 @@ public class ChannelMessageRouter {
         String replayPrompt = "继续执行已批准的工具调用。";
 
         try {
+            // RFC-063r §2.12: prefer the persisted Memento (covers
+            // cross-restart approval where the channel session changed) and
+            // only fall back to rebuilding from the current inbound message
+            // when no snapshot was captured (legacy rows from before this PR).
+            ChatOrigin replayOrigin = approvalService.restoreChatOrigin(consumed.getChatOrigin());
+            if (replayOrigin == ChatOrigin.EMPTY) {
+                replayOrigin = chatOriginFactory.from(
+                        channelEntity, triggerMessage, conversationId, /* workspaceBasePath */ null);
+            }
             String reply = agentService.chatWithReplay(
-                    agentId, replayPrompt, conversationId, consumed.getToolCallPayload());
+                    agentId, replayPrompt, conversationId, consumed.getToolCallPayload(), replayOrigin);
 
             // 保存 replay 结果（这是正常结果，入库）
             conversationService.saveMessage(conversationId, "assistant", reply);
@@ -639,7 +663,11 @@ public class ChannelMessageRouter {
         conversationService.saveMessage(conversationId, "user", message.getContent(), parts);
 
         String promptText = buildPromptFromParts(message.getContent(), parts, message.getInputMode());
-        return agentService.chatStream(agentId, promptText, conversationId);
+        // RFC-063r §2.5: forward ChatOrigin so tools created during this
+        // streaming conversation inherit channel binding.
+        ChatOrigin origin = chatOriginFactory.from(
+                channelEntity, message, conversationId, /* workspaceBasePath */ null);
+        return agentService.chatStream(agentId, promptText, conversationId, origin);
     }
 
     // ==================== 优雅关闭 ====================

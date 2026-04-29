@@ -4,10 +4,12 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.chat.messages.AssistantMessage;
 import org.springframework.ai.chat.messages.ToolResponseMessage;
+import org.springframework.ai.chat.model.ToolContext;
 import org.springframework.ai.tool.ToolCallback;
 import vip.mate.tool.builtin.ToolExecutionContext;
 import vip.mate.agent.AgentToolSet;
 import vip.mate.agent.GraphEventPublisher;
+import vip.mate.agent.context.ChatOrigin;
 import vip.mate.agent.graph.state.DirectToolOutput;
 import vip.mate.approval.ApprovalWorkflowService;
 import vip.mate.channel.web.ChatStreamTracker;
@@ -198,11 +200,6 @@ public class ToolExecutionExecutor {
         return execute(toolCalls, conversationId, agentId, isReplay, "");
     }
 
-    /** 当前执行的 requesterId，传递给 ToolExecutionContext */
-    private volatile String currentRequesterId;
-    /** 当前工作区活动目录（为空不限制），传递给 ToolExecutionContext */
-    private volatile String currentWorkspaceBasePath;
-
     public ToolExecutionResult execute(List<AssistantMessage.ToolCall> toolCalls,
                                         String conversationId, String agentId,
                                         boolean isReplay, String requesterId) {
@@ -213,8 +210,38 @@ public class ToolExecutionExecutor {
                                         String conversationId, String agentId,
                                         boolean isReplay, String requesterId,
                                         String workspaceBasePath) {
-        this.currentRequesterId = requesterId;
-        this.currentWorkspaceBasePath = workspaceBasePath;
+        return execute(toolCalls, conversationId, agentId, isReplay, requesterId,
+                workspaceBasePath, ChatOrigin.EMPTY);
+    }
+
+    /**
+     * RFC-063r §2.5: preferred overload — accepts a {@link ChatOrigin} that the
+     * top-level agent has enriched with agentId/workspace/channel context.
+     * Builds a Spring AI {@link ToolContext} per tool invocation so
+     * {@code @Tool} methods can read the origin via
+     * {@code ChatOrigin.from(toolContext)}.
+     *
+     * <p>During the PR-1 transition the legacy {@link ToolExecutionContext}
+     * ThreadLocal is also populated, so existing tools that read from it keep
+     * working unchanged. After all 8 callsites migrate, the ThreadLocal can be
+     * removed.
+     *
+     * <p><b>Thread safety</b>: this executor instance is shared across all
+     * concurrent invocations of a single agent (one executor per agent, per
+     * {@code AgentGraphBuilder.build}). Origin / requester / workspace are
+     * therefore <em>method-local</em> — they live as parameters all the way
+     * down into {@link PreparedToolCall} and never touch instance state. An
+     * earlier draft used {@code volatile} fields here; concurrent users hitting
+     * the same agent (Web + IM at once) raced on those fields and the channel
+     * binding was occasionally cross-contaminated. Do not reintroduce the
+     * fields — pass via parameters.
+     */
+    public ToolExecutionResult execute(List<AssistantMessage.ToolCall> toolCalls,
+                                        String conversationId, String agentId,
+                                        boolean isReplay, String requesterId,
+                                        String workspaceBasePath,
+                                        ChatOrigin origin) {
+        ChatOrigin safeOrigin = origin != null ? origin : ChatOrigin.EMPTY;
         List<ToolResponseMessage.ToolResponse> allResponses = new ArrayList<>();
         List<GraphEventPublisher.GraphEvent> events = Collections.synchronizedList(new ArrayList<>());
         // RFC-052: accumulate full-text outputs from returnDirect tools so the
@@ -232,7 +259,7 @@ public class ToolExecutionExecutor {
             String toolName = toolCall.name();
             String arguments = toolCall.arguments();
 
-            events.add(GraphEventPublisher.toolStart(toolName, arguments));
+            events.add(GraphEventPublisher.toolStart(toolCall.id(), toolName, arguments));
 
             // 0. 子会话工具拦截：委派上下文中的子 Agent 禁止调用特定工具
             if (vip.mate.tool.builtin.DelegationContext.currentDepth() > 0) {
@@ -240,7 +267,7 @@ public class ToolExecutionExecutor {
                 if (denied.contains(toolName)) {
                     String msg = "[安全限制] 子 Agent 不允许使用工具: " + toolName;
                     log.info("[ToolExecutor] Child agent blocked from using tool: {}", toolName);
-                    events.add(GraphEventPublisher.toolComplete(toolName, msg, false));
+                    events.add(GraphEventPublisher.toolComplete(toolCall.id(), toolName, msg, false));
                     allResponses.add(new org.springframework.ai.chat.messages.ToolResponseMessage.ToolResponse(
                             toolCall.id(), toolName, msg));
                     continue;
@@ -255,7 +282,7 @@ public class ToolExecutionExecutor {
                     log.warn("[ToolExecutor] Tool {} arguments invalid/truncated JSON (len={}): {}",
                             toolName, arguments.length(), jsonEx.getMessage());
                     String truncationError = normalizeToolExecutionError(jsonEx);
-                    events.add(GraphEventPublisher.toolComplete(toolName, truncationError, false));
+                    events.add(GraphEventPublisher.toolComplete(toolCall.id(), toolName, truncationError, false));
                     allResponses.add(new ToolResponseMessage.ToolResponse(
                             toolCall.id(), toolName, truncationError));
                     continue;
@@ -300,7 +327,7 @@ public class ToolExecutionExecutor {
             ToolCallback callback = toolCallbackMap.get(toolName);
             if (callback == null) {
                 log.warn("[ToolExecutor] Tool not found: {}", toolName);
-                events.add(GraphEventPublisher.toolComplete(toolName, "Tool not found: " + toolName, false));
+                events.add(GraphEventPublisher.toolComplete(toolCall.id(), toolName, "Tool not found: " + toolName, false));
                 allResponses.add(new ToolResponseMessage.ToolResponse(
                         toolCall.id(), toolName, "Tool not found: " + toolName));
                 continue;
@@ -309,7 +336,7 @@ public class ToolExecutionExecutor {
             // 4. 分类: concurrencySafe
             boolean safe = isConcurrencySafe(toolName);
             preparedCalls.add(new PreparedToolCall(toolCall, callback, arguments, safe, allResponses.size(),
-                    conversationId, currentRequesterId, currentWorkspaceBasePath));
+                    conversationId, requesterId, workspaceBasePath, safeOrigin));
             // 占位，Phase 2 填充
             allResponses.add(null);
         }
@@ -327,7 +354,7 @@ public class ToolExecutionExecutor {
         // response in turn until the cumulative size fits the budget.
         if (resultStorage != null && !allResponses.isEmpty()) {
             allResponses = new ArrayList<>(resultStorage.enforceTurnBudget(
-                    allResponses, conversationId, currentWorkspaceBasePath));
+                    allResponses, conversationId, workspaceBasePath));
         }
 
         boolean hasApprovalPending = barrier != null;
@@ -376,13 +403,21 @@ public class ToolExecutionExecutor {
         ToolCallback callback = toolCallbackMap.get(toolName);
         if (callback == null) {
             log.warn("[ToolExecutor] Pre-approved tool not found: {}", toolName);
-            events.add(GraphEventPublisher.toolComplete(toolName, "Tool not found: " + toolName, false));
+            events.add(GraphEventPublisher.toolComplete(toolCall.id(), toolName, "Tool not found: " + toolName, false));
             return new ToolResponseMessage.ToolResponse(toolCall.id(), toolName, "Tool not found: " + toolName);
         }
 
         try {
             log.info("[ToolExecutor] Executing pre-approved tool: {}", toolName);
-            String result = callback.call(callArguments);
+            // RFC-063r §2.5: forward ToolContext so the pre-approved tool can
+            // still observe the originating ChatOrigin (channel/workspace).
+            // Origin is method-local (see thread-safety note on execute());
+            // the legacy ThreadLocal that used to carry it across executePreApproved
+            // calls was a cross-conversation footgun and has been removed.
+            ChatOrigin replayOrigin = ChatOrigin.EMPTY
+                    .withConversationId(conversationId)
+                    .withWorkspace(null, workspaceBasePath);
+            String result = callback.call(callArguments, replayOrigin.toToolContext());
             int rawLen = result != null ? result.length() : 0;
 
             // RFC-052: pre-approved tool may itself be returnDirect — in that
@@ -414,7 +449,7 @@ public class ToolExecutionExecutor {
             result = truncateToolResult(result, MAX_TOOL_RESULT_CHARS);
             log.info("[ToolExecutor] Pre-approved tool {} returned {} chars{}", toolName, rawLen,
                     result != null && result.length() < rawLen ? " (now " + result.length() + " after spill/truncate)" : "");
-            events.add(GraphEventPublisher.toolComplete(toolName, result, true));
+            events.add(GraphEventPublisher.toolComplete(toolCall.id(), toolName, result, true));
             return new ToolResponseMessage.ToolResponse(
                     toolCall.id(), toolName, result != null ? result : "");
         } catch (Exception e) {
@@ -422,7 +457,7 @@ public class ToolExecutionExecutor {
             String safeError = isReturnDirect(callback)
                     ? "Tool execution failed (details withheld per returnDirect policy)"
                     : "Tool execution failed: " + e.getMessage();
-            events.add(GraphEventPublisher.toolComplete(toolName, safeError, false));
+            events.add(GraphEventPublisher.toolComplete(toolCall.id(), toolName, safeError, false));
             return new ToolResponseMessage.ToolResponse(toolCall.id(), toolName, safeError);
         }
     }
@@ -439,7 +474,10 @@ public class ToolExecutionExecutor {
     public ToolResponseMessage.ToolResponse executePreApproved(
             AssistantMessage.ToolCall toolCall, String storedArguments,
             List<GraphEventPublisher.GraphEvent> events) {
-        return executePreApproved(toolCall, storedArguments, events, null, currentWorkspaceBasePath);
+        // Workspace base path is no longer carried as instance state — legacy
+        // callers that don't supply one get unrestricted file access (matches
+        // pre-RFC behavior when WorkspacePathGuard.basePath was null).
+        return executePreApproved(toolCall, storedArguments, events, null, null);
     }
 
     // ==================== Phase 2: 并发执行 ====================
@@ -559,17 +597,25 @@ public class ToolExecutionExecutor {
             if (streamTracker != null) {
                 streamTracker.updateRunningTool(pc.conversationId, toolName);
                 streamTracker.broadcastObject(pc.conversationId, GraphEventPublisher.EVENT_TOOL_START,
-                        GraphEventPublisher.toolStart(toolName, pc.arguments).data());
+                        GraphEventPublisher.toolStart(pc.toolCall.id(), toolName, pc.arguments).data());
             }
             log.info("[ToolExecutor] Executing tool: {} with args: {}",
                     toolName, pc.arguments != null && pc.arguments.length() > 200
                             ? pc.arguments.substring(0, 200) + "..." : pc.arguments);
 
-            // 注入工具执行上下文（供 VideoGenerateTool 等获取 conversationId / username / workspaceBasePath）
+            // RFC-063r §2.5 / PR-1 transition window: populate BOTH the explicit
+            // Spring AI ToolContext (preferred — read via ChatOrigin.from(ctx))
+            // AND the legacy ToolExecutionContext ThreadLocal so tools that have
+            // not yet migrated to ToolContext keep working unchanged.
             ToolExecutionContext.set(pc.conversationId, pc.requesterId, pc.workspaceBasePath);
             String result;
             try {
-                result = pc.callback.call(pc.arguments);
+                ChatOrigin runtimeOrigin = pc.origin != null ? pc.origin : ChatOrigin.EMPTY;
+                runtimeOrigin = runtimeOrigin
+                        .withConversationId(pc.conversationId)
+                        .withWorkspace(runtimeOrigin.workspaceId(), pc.workspaceBasePath);
+                ToolContext toolContext = runtimeOrigin.toToolContext();
+                result = pc.callback.call(pc.arguments, toolContext);
             } finally {
                 ToolExecutionContext.clear();
             }
@@ -611,10 +657,10 @@ public class ToolExecutionExecutor {
             result = truncateToolResult(result, MAX_TOOL_RESULT_CHARS);
             log.info("[ToolExecutor] Tool {} returned {} chars{}", toolName, rawLen,
                     result != null && result.length() < rawLen ? " (now " + result.length() + " after spill/truncate)" : "");
-            events.add(GraphEventPublisher.toolComplete(toolName, result, true));
+            events.add(GraphEventPublisher.toolComplete(pc.toolCall.id(), toolName, result, true));
             if (streamTracker != null) {
                 streamTracker.broadcastObject(pc.conversationId, GraphEventPublisher.EVENT_TOOL_COMPLETE,
-                        GraphEventPublisher.toolComplete(toolName, result, true).data());
+                        GraphEventPublisher.toolComplete(pc.toolCall.id(), toolName, result, true).data());
                 streamTracker.updateRunningTool(pc.conversationId, null);
             }
             return new ToolResponseMessage.ToolResponse(
@@ -629,10 +675,10 @@ public class ToolExecutionExecutor {
             String reportedError = isReturnDirect(pc.callback)
                     ? "Tool execution failed (details withheld per returnDirect policy)"
                     : normalizeToolExecutionError(e);
-            events.add(GraphEventPublisher.toolComplete(toolName, reportedError, false));
+            events.add(GraphEventPublisher.toolComplete(pc.toolCall.id(), toolName, reportedError, false));
             if (streamTracker != null) {
                 streamTracker.broadcastObject(pc.conversationId, GraphEventPublisher.EVENT_TOOL_COMPLETE,
-                        GraphEventPublisher.toolComplete(toolName, reportedError, false).data());
+                        GraphEventPublisher.toolComplete(pc.toolCall.id(), toolName, reportedError, false).data());
                 streamTracker.updateRunningTool(pc.conversationId, null);
             }
             return new ToolResponseMessage.ToolResponse(
@@ -653,7 +699,7 @@ public class ToolExecutionExecutor {
 
             if (evaluation.shouldBlock()) {
                 log.warn("[ToolExecutor] Tool call BLOCKED: tool={}, summary={}", toolName, evaluation.summary());
-                events.add(GraphEventPublisher.toolComplete(toolName, evaluation.summary(), false));
+                events.add(GraphEventPublisher.toolComplete(toolCall.id(), toolName, evaluation.summary(), false));
                 return GuardDecision.blocked(
                         "[安全拦截] " + evaluation.summary() + "。请使用更安全的替代方案。");
             }
@@ -672,7 +718,7 @@ public class ToolExecutionExecutor {
 
             if (guardResult.isBlocked()) {
                 log.warn("[ToolExecutor] Tool call BLOCKED by ToolGuard: tool={}, reason={}", toolName, guardResult.reason());
-                events.add(GraphEventPublisher.toolComplete(toolName, guardResult.reason(), false));
+                events.add(GraphEventPublisher.toolComplete(toolCall.id(), toolName, guardResult.reason(), false));
                 return GuardDecision.blocked(
                         "[安全拦截] " + guardResult.reason() + "。请使用更安全的替代方案。");
             }
@@ -739,8 +785,20 @@ public class ToolExecutionExecutor {
                 || lower.contains("unexpected character escape sequence")
                 || lower.contains("json parse error")
                 || lower.contains("malformed json")) {
-            return "Tool execution failed: model generated invalid JSON for tool arguments. "
-                    + "或在字符串转义位置被截断。请改为分步骤写入，拆成多个文件，或缩小单次 write_file/edit_file 的内容后重试。";
+            // Truncated tool_call args — typically from max_tokens being hit while
+            // streaming a large `content` field (e.g. renderDocx with 7000+ char
+            // markdown body). The fix MUST come from the model: re-emit the same
+            // tool call with smaller content per call, OR split the work across
+            // multiple sequential tool calls. We tell the LLM directly so the
+            // next reasoning iteration knows what to do — without this, models
+            // tend to fall back to narrating the result as final_answer text.
+            return "Tool execution failed: your tool_call arguments JSON was truncated mid-stream "
+                    + "(very likely you hit max_tokens while emitting a long content field). "
+                    + "Action required: re-call the SAME tool now in your next response, but "
+                    + "(1) make the content field shorter, OR (2) split the work into multiple "
+                    + "sequential tool calls (e.g. write the doc in 2-3 chunks via separate calls). "
+                    + "Do NOT describe the result as text — you must call the tool again to actually "
+                    + "produce the output.";
         }
 
         if (lower.contains("access denied") && lower.contains("path outside allowed directories")) {
@@ -769,7 +827,8 @@ public class ToolExecutionExecutor {
             int resultIndex,
             String conversationId,
             String requesterId,
-            String workspaceBasePath
+            String workspaceBasePath,
+            ChatOrigin origin
     ) {}
 
     private record ApprovalBarrier(String pendingId, String toolName) {}
