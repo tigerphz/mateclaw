@@ -24,9 +24,11 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.time.Duration;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.*;
 import java.util.concurrent.locks.ReentrantLock;
 
@@ -56,6 +58,7 @@ public class ChannelMessageRouter {
     private final ObjectMapper objectMapper;
     private final ChatStreamTracker streamTracker;
     private final ChannelChatOriginFactory chatOriginFactory;
+    private final ChannelErrorClassifier errorClassifier;
 
     /** 队列条目：封装消息及其路由上下文 */
     private record QueueEntry(ChannelMessage message, ChannelAdapter adapter, ChannelEntity channelEntity) {}
@@ -88,6 +91,30 @@ public class ChannelMessageRouter {
     /** 防抖等待时间（毫秒） */
     private static final long DEBOUNCE_MS = 500;
 
+    /**
+     * Plan-Execute SSE events that the Web Console mirror needs to see when
+     * a conversation runs through an IM channel.
+     * <p>
+     * The agent emits these via {@code GraphEventPublisher} and they ride on
+     * the {@code chatStructuredStream} Flux as {@code StreamDelta.event(...)}.
+     * Web direct chats already broadcast them via the ChatController
+     * accumulator. IM channels (DingTalk + the seven sync-path adapters)
+     * historically dropped them — DingTalk's {@code processStreamAsText}
+     * only consumes {@code delta.content()}, and the sync {@code chat()}
+     * collector explicitly filters {@code delta.isEvent()} out. The whitelist
+     * is applied in the IM stream path so PlanStepsPanel renders correctly
+     * when an operator monitors an IM conversation in the Web Console.
+     * <p>
+     * Whitelist (not pass-through) so Web-side accumulator-internal events
+     * like {@code _usage_final} or future agent-internal markers don't leak
+     * to subscribers.
+     */
+    private static final Set<String> MIRRORED_PLAN_EVENTS = Set.of(
+            "plan_created",
+            "plan_step_started",
+            "plan_step_completed"
+    );
+
     /** 是否已关闭 */
     private volatile boolean shutdown = false;
 
@@ -101,7 +128,8 @@ public class ChannelMessageRouter {
                                 TtsService ttsService,
                                 ObjectMapper objectMapper,
                                 ChatStreamTracker streamTracker,
-                                ChannelChatOriginFactory chatOriginFactory) {
+                                ChannelChatOriginFactory chatOriginFactory,
+                                ChannelErrorClassifier errorClassifier) {
         this.agentService = agentService;
         this.conversationService = conversationService;
         this.channelService = channelService;
@@ -113,6 +141,7 @@ public class ChannelMessageRouter {
         this.objectMapper = objectMapper;
         this.streamTracker = streamTracker;
         this.chatOriginFactory = chatOriginFactory;
+        this.errorClassifier = errorClassifier;
     }
 
     // ==================== 防抖辅助类 ====================
@@ -453,8 +482,31 @@ public class ChannelMessageRouter {
                 if (adapter instanceof StreamingChannelAdapter streamingAdapter) {
                     savedAssistantId = processWithStreaming(message, streamingAdapter, conversationId, agentId, promptText, channelEntity, chatOrigin);
                 } else {
-                    // 同步路径：直接获取完整回复
-                    String reply = agentService.chat(agentId, promptText, conversationId, chatOrigin);
+                    // Sync path for non-streaming IM adapters (feishu / wecom / weixin /
+                    // slack / discord / qq / telegram). We can't use agentService.chat()
+                    // because its collector filters out `delta.isEvent()` deltas — that
+                    // would silently drop plan_created / plan_step_* events that the Web
+                    // Console mirror needs to render PlanStepsPanel. Instead we consume
+                    // chatStructuredStream directly: content gets accumulated for the IM
+                    // reply, and whitelisted plan events are mirrored to ChatStreamTracker
+                    // for any Web SSE viewer of the same conversationId.
+                    StringBuilder replyAccumulator = new StringBuilder();
+                    final String channelType = adapter.getChannelType();
+                    agentService.chatStructuredStream(agentId, promptText, conversationId,
+                                    message.getSenderId(), chatOrigin)
+                            .doOnNext(delta -> {
+                                if (delta.isEvent()) {
+                                    mirrorPlanEventToTracker(conversationId, delta, channelType);
+                                } else if (delta.content() != null) {
+                                    // Match the legacy agentService.chat() behavior: include
+                                    // persistOnly deltas too. DirectAnswerNode-routed answers
+                                    // arrive as persistOnly when CONTENT_STREAMED=true and IM
+                                    // channels still need the text for the outgoing reply.
+                                    replyAccumulator.append(delta.content());
+                                }
+                            })
+                            .blockLast(Duration.ofMinutes(10));
+                    String reply = replyAccumulator.toString();
 
                     // 检查 chat 过程中是否产生了审批 pending
                     PendingApproval newPending = approvalService.findPendingByConversation(conversationId);
@@ -465,10 +517,20 @@ public class ChannelMessageRouter {
                         log.info("[{}] Approval triggered during chat, sent notice (NOT saved to DB): tool={}",
                                 adapter.getChannelType(), newPending.getToolName());
                     } else {
-                        // 正常回复：保存并发送
-                        MessageEntity saved = conversationService.saveMessage(conversationId, "assistant", reply);
+                        // Tag error replies (matched by ChannelErrorClassifier — the
+                        // "[错误]" content prefix / Bad request: / LLM error templates)
+                        // with status='error' so BaseAgent.sanitizeForLlm drops them
+                        // from the next turn's LLM history, breaking the self-replicating
+                        // 400 loop. Only successful replies fire the ConversationCompletedEvent —
+                        // error turns must not pollute memory extraction.
+                        boolean isError = errorClassifier.isErrorReply(reply);
+                        String status = isError ? "error" : "completed";
+                        MessageEntity saved = conversationService.saveMessage(
+                                conversationId, "assistant", reply, null, status);
                         savedAssistantId = saved != null ? saved.getId() : null;
-                        publishConversationCompletedEvent(agentId, conversationId, message.getContent(), reply);
+                        if (!isError) {
+                            publishConversationCompletedEvent(agentId, conversationId, message.getContent(), reply);
+                        }
                         adapter.renderAndSend(replyTarget, reply);
                         log.info("[{}] Reply sent to {}: {}chars",
                                 adapter.getChannelType(), replyTarget, reply.length());
@@ -529,6 +591,30 @@ public class ChannelMessageRouter {
      * - StreamingChannelAdapter 负责渲染（AI Card / 卡片更新 / 文本累积等）
      * - Router 负责后续的审批检查、消息持久化、事件发布
      */
+    /**
+     * Forward whitelisted Plan-Execute SSE events to ChatStreamTracker so a
+     * Web Console viewer of an IM-routed conversation sees PlanStepsPanel.
+     * <p>
+     * Bounded to {@link #MIRRORED_PLAN_EVENTS} — see the constant's javadoc
+     * for why this is a whitelist rather than a pass-through. Failures here
+     * are best-effort and never propagate, since dropping a UI update is
+     * preferable to derailing the channel reply.
+     */
+    private void mirrorPlanEventToTracker(String conversationId,
+                                          AgentService.StreamDelta delta,
+                                          String channelTypeForLog) {
+        String eventType = delta.eventType();
+        if (eventType == null || !MIRRORED_PLAN_EVENTS.contains(eventType)) {
+            return;
+        }
+        try {
+            streamTracker.broadcastObject(conversationId, eventType, delta.eventData());
+        } catch (Exception ex) {
+            log.debug("[{}] Failed to mirror plan event {}: {}",
+                    channelTypeForLog, eventType, ex.getMessage());
+        }
+    }
+
     private Long processWithStreaming(ChannelMessage message, StreamingChannelAdapter streamingAdapter,
                                       String conversationId, Long agentId, String promptText,
                                       ChannelEntity channelEntity, ChatOrigin chatOrigin) {
@@ -540,8 +626,16 @@ public class ChannelMessageRouter {
             Flux<AgentService.StreamDelta> stream = agentService.chatStructuredStream(
                     agentId, promptText, conversationId, message.getSenderId(), chatOrigin);
 
+            // Mirror plan-execute SSE events to ChatStreamTracker before the
+            // adapter consumes the Flux. DingTalkChannelAdapter.processStreamAsText
+            // only reads `delta.content()` and would otherwise eat plan_created /
+            // plan_step_* events, leaving the Web Console mirror with no
+            // PlanStepsPanel for IM-routed conversations.
+            Flux<AgentService.StreamDelta> mirroredStream = stream.doOnNext(delta ->
+                    mirrorPlanEventToTracker(conversationId, delta, channelType));
+
             // Step 2: 委托渠道渲染（渠道内部消费 Flux 并处理 UI 更新）
-            String finalContent = streamingAdapter.processStream(stream, message, conversationId);
+            String finalContent = streamingAdapter.processStream(mirroredStream, message, conversationId);
 
             // Step 3: 审批检查 + 持久化（渠道无关逻辑，由 Router 统一处理）
             PendingApproval newPending = approvalService.findPendingByConversation(conversationId);
@@ -551,9 +645,15 @@ public class ChannelMessageRouter {
                 log.info("[{}] Approval triggered during streaming (NOT saved to DB): tool={}",
                         channelType, newPending.getToolName());
             } else if (finalContent != null && !finalContent.isBlank()) {
-                MessageEntity saved = conversationService.saveMessage(conversationId, "assistant", finalContent);
-                publishConversationCompletedEvent(agentId, conversationId, promptText, finalContent);
-                log.info("[{}] Streaming completed: contentLen={}", channelType, finalContent.length());
+                boolean isError = errorClassifier.isErrorReply(finalContent);
+                String status = isError ? "error" : "completed";
+                MessageEntity saved = conversationService.saveMessage(
+                        conversationId, "assistant", finalContent, null, status);
+                if (!isError) {
+                    publishConversationCompletedEvent(agentId, conversationId, promptText, finalContent);
+                }
+                log.info("[{}] Streaming completed: contentLen={}, isError={}",
+                        channelType, finalContent.length(), isError);
 
                 // 流式回复完成后也触发语音回复
                 String replyTarget = resolveReplyTarget(message);
@@ -566,7 +666,17 @@ public class ChannelMessageRouter {
 
         } catch (Exception e) {
             log.error("[{}] Streaming processing failed: {}", channelType, e.getMessage(), e);
-            // 尝试发送错误提示
+            // Persist an error placeholder (status='error') so that the next
+            // turn's history does not show a user → user sequence (which some
+            // providers reject with 400). sanitizeForLlm filters this row out
+            // before the LLM sees it, so it costs nothing at the prompt layer.
+            try {
+                conversationService.saveMessage(conversationId, "assistant",
+                        "[错误] " + e.getMessage(), null, "error");
+            } catch (Exception persistErr) {
+                log.warn("[{}] Failed to persist error placeholder: {}",
+                        channelType, persistErr.getMessage());
+            }
             try {
                 String errorTarget = resolveReplyTarget(message);
                 streamingAdapter.sendMessage(errorTarget, "抱歉，流式处理失败：" + e.getMessage());
@@ -576,6 +686,7 @@ public class ChannelMessageRouter {
         }
         return null;
     }
+
 
     // ==================== 审批重放 ====================
 
@@ -613,8 +724,13 @@ public class ChannelMessageRouter {
             String reply = agentService.chatWithReplay(
                     agentId, replayPrompt, conversationId, consumed.getToolCallPayload(), replayOrigin);
 
-            // 保存 replay 结果（这是正常结果，入库）
-            conversationService.saveMessage(conversationId, "assistant", reply);
+            // Persist the replay result. If the LLM 400'd during replay,
+            // the error reply must also get status='error' — otherwise the
+            // next turn's history would re-feed the error placeholder back
+            // into the prompt and re-trigger the same failure.
+            boolean isError = errorClassifier.isErrorReply(reply);
+            conversationService.saveMessage(conversationId, "assistant", reply, null,
+                    isError ? "error" : "completed");
 
             // 发送回复
             adapter.renderAndSend(replyTarget, reply);

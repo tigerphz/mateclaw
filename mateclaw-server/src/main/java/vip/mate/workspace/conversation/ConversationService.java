@@ -21,6 +21,7 @@ import vip.mate.workspace.conversation.vo.MessageVO;
 
 import java.io.IOException;
 import java.nio.file.Files;
+import java.nio.file.InvalidPathException;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.time.LocalDateTime;
@@ -304,6 +305,30 @@ public class ConversationService {
             conv.setStreamStatus(streamStatus);
             conversationMapper.updateById(conv);
         }
+    }
+
+    /**
+     * Persist an assistant placeholder marker only when the last message is a
+     * user turn (i.e., the assistant never got to reply). Used by the admin
+     * force-recycle path so a torn-down turn leaves a visible "已被用户中止"
+     * marker instead of an empty conversation. Idempotent: if the previous
+     * emergency-save path already wrote an assistant row, this is a no-op.
+     *
+     * @return the saved message, or {@code null} if the marker was not needed
+     */
+    @Transactional
+    public MessageEntity saveStopMarkerIfDangling(String conversationId, String markerText, String status) {
+        List<MessageEntity> recent = messageMapper.selectList(
+                new LambdaQueryWrapper<MessageEntity>()
+                        .eq(MessageEntity::getConversationId, conversationId)
+                        .orderByDesc(MessageEntity::getCreateTime)
+                        .orderByDesc(MessageEntity::getId)
+                        .last("LIMIT 1"));
+        if (recent.isEmpty()) return null;
+        MessageEntity last = recent.get(0);
+        if (!"user".equals(last.getRole())) return null;
+        return saveMessage(conversationId, "assistant", markerText, null,
+                status != null ? status : "stopped");
     }
 
     /**
@@ -791,7 +816,17 @@ public class ConversationService {
      * 清理会话关联的附件文件
      */
     public void cleanAttachmentFiles(String conversationId) {
-        Path dir = UPLOAD_ROOT.resolve(conversationId);
+        Path dir;
+        try {
+            dir = UPLOAD_ROOT.resolve(conversationId);
+        } catch (InvalidPathException e) {
+            // Conversation id contains characters illegal on this filesystem
+            // (e.g. ':' in cron:<jobId> on Windows). No attachments could
+            // ever have been written under such an id on this OS, so there
+            // is nothing to clean.
+            log.debug("Skipping attachment cleanup for non-path-safe conversation id: {}", conversationId);
+            return;
+        }
         if (!Files.exists(dir)) {
             return;
         }
