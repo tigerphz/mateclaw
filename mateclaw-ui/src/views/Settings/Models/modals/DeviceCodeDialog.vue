@@ -40,7 +40,8 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
-import { ElMessage } from 'element-plus'
+import { mcToast } from '@/composables/useMcToast'
+import { copyToClipboard } from '@/utils/clipboard'
 
 const props = defineProps<{
   visible: boolean
@@ -83,11 +84,11 @@ onBeforeUnmount(() => {
 
 async function copyCode() {
   try {
-    await navigator.clipboard.writeText(props.userCode)
+    await copyToClipboard(props.userCode)
     copied.value = true
     setTimeout(() => { copied.value = false }, 2000)
   } catch {
-    ElMessage.warning(t('settings.model.copyFailed'))
+    mcToast.warning(t('settings.model.copyFailed'))
   }
 }
 </script>

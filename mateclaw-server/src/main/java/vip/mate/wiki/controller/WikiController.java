@@ -4,22 +4,22 @@ import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.http.MediaType;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.multipart.MultipartFile;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
+import vip.mate.audit.service.AuditEventService;
 import vip.mate.channel.web.Utf8SseEmitter;
 import vip.mate.common.result.R;
 import vip.mate.exception.MateClawException;
 import vip.mate.workspace.core.annotation.RequireWorkspaceRole;
 import vip.mate.wiki.WikiProperties;
-import vip.mate.wiki.event.WikiProcessingEvent;
 import vip.mate.wiki.model.WikiKnowledgeBaseEntity;
 import vip.mate.wiki.model.WikiPageEntity;
 import vip.mate.wiki.model.WikiRawMaterialEntity;
 import vip.mate.wiki.service.WikiDirectoryScanService;
 import vip.mate.wiki.service.WikiKnowledgeBaseService;
+import vip.mate.wiki.service.WikiLintJobService;
 import vip.mate.wiki.service.WikiPageService;
 import vip.mate.wiki.service.WikiProcessingService;
 import vip.mate.wiki.service.WikiRawMaterialService;
@@ -51,9 +51,10 @@ public class WikiController {
     private final WikiPageService pageService;
     private final WikiProcessingService processingService;
     private final WikiDirectoryScanService scanService;
+    private final WikiLintJobService lintJobService;
     private final WikiProperties properties;
-    private final ApplicationEventPublisher eventPublisher;
     private final WikiProgressBus progressBus;
+    private final AuditEventService auditEventService;
 
     // ==================== Knowledge Base ====================
 
@@ -63,7 +64,7 @@ public class WikiController {
     public R<List<WikiKnowledgeBaseEntity>> listKBs(
             @RequestHeader(value = "X-Workspace-Id", required = false) Long workspaceId) {
         long wsId = workspaceId != null ? workspaceId : 1L;
-        return R.ok(kbService.listByWorkspace(wsId));
+        return R.ok(withLivePageCount(kbService.listByWorkspace(wsId)));
     }
 
     @RequireWorkspaceRole("viewer")
@@ -73,8 +74,27 @@ public class WikiController {
                                              @RequestHeader(value = "X-Workspace-Id", required = false) Long workspaceId) {
         verifyKBWorkspace(id, workspaceId);
         WikiKnowledgeBaseEntity kb = kbService.getById(id);
-        if (kb == null) return R.fail("Knowledge base not found");
-        return R.ok(kb);
+        if (kb == null) return R.fail(404, "Knowledge base not found");
+        return R.ok(withLivePageCount(kb));
+    }
+
+    /**
+     * Overlay the live page count onto knowledge bases before returning them.
+     * The {@code pageCount} column is denormalized and only refreshed by the
+     * processing pipeline, so system-page generation (overview/log) and other
+     * out-of-band mutations leave it stale. Recomputing on read keeps the count
+     * the UI shows consistent with the page list.
+     */
+    private List<WikiKnowledgeBaseEntity> withLivePageCount(List<WikiKnowledgeBaseEntity> kbs) {
+        kbs.forEach(this::withLivePageCount);
+        return kbs;
+    }
+
+    private WikiKnowledgeBaseEntity withLivePageCount(WikiKnowledgeBaseEntity kb) {
+        if (kb != null && kb.getId() != null) {
+            kb.setPageCount(pageService.countByKbId(kb.getId()));
+        }
+        return kb;
     }
 
     @RequireWorkspaceRole("viewer")
@@ -85,9 +105,9 @@ public class WikiController {
         long wsId = workspaceId != null ? workspaceId : 1L;
         // 按 agent 查询后，过滤出属于当前 workspace 的知识库
         List<WikiKnowledgeBaseEntity> kbs = kbService.listByAgentId(agentId);
-        return R.ok(kbs.stream()
+        return R.ok(withLivePageCount(kbs.stream()
                 .filter(kb -> kb.getWorkspaceId() == null || kb.getWorkspaceId().equals(wsId))
-                .toList());
+                .collect(java.util.stream.Collectors.toList())));
     }
 
     @RequireWorkspaceRole("member")
@@ -131,7 +151,12 @@ public class WikiController {
     public R<Void> deleteKB(@PathVariable Long id,
                              @RequestHeader(value = "X-Workspace-Id", required = false) Long workspaceId) {
         verifyKBWorkspace(id, workspaceId);
-        kbService.delete(id);
+        WikiKnowledgeBaseService.CascadeDeleteResult result = kbService.delete(id);
+        String detail = String.format(
+                "{\"rawMaterialCount\":%d,\"pageCount\":%d,\"chunkCount\":%d,\"citationCount\":%d,\"processingJobCount\":%d}",
+                result.rawMaterialCount(), result.pageCount(), result.chunkCount(),
+                result.citationCount(), result.processingJobCount());
+        auditEventService.record("DELETE", "WIKI_KB", String.valueOf(id), result.kbName(), detail);
         return R.ok();
     }
 
@@ -142,7 +167,7 @@ public class WikiController {
                                              @RequestHeader(value = "X-Workspace-Id", required = false) Long workspaceId) {
         verifyKBWorkspace(id, workspaceId);
         WikiKnowledgeBaseEntity kb = kbService.getById(id);
-        if (kb == null) return R.fail("Knowledge base not found");
+        if (kb == null) return R.fail(404, "Knowledge base not found");
         return R.ok(Map.of("content", kb.getConfigContent() != null ? kb.getConfigContent() : ""));
     }
 
@@ -240,22 +265,28 @@ public class WikiController {
                 : "txt";
 
         // Resolve source type from extension. Image extensions route to the
-        // vision-in pipeline at extraction time; everything else falls through
-        // to the existing text / pdf / docx handling.
+        // vision-in pipeline at extraction time; Office / PDF / HTML extensions
+        // are staged on disk and extracted by DocumentExtractTool; plain-text
+        // formats (incl. CSV) are stored directly. Unknown extensions fall back
+        // to text so the upload never hard-fails.
         String sourceType = switch (extension) {
             case "pdf" -> "pdf";
             case "docx", "doc" -> "docx";
-            case "txt", "md" -> "text";
+            case "xlsx", "xls" -> "xlsx";
+            case "pptx", "ppt" -> "pptx";
+            case "html", "htm" -> "html";
+            case "txt", "md", "csv" -> "text";
             case "png", "jpg", "jpeg", "webp", "gif", "bmp", "tiff", "tif" -> "image";
             default -> "text";
         };
 
         if ("text".equals(sourceType)) {
-            // 文本文件直接读取内容
+            // Text files can be stored directly without staging to disk.
             String content = new String(file.getBytes(), StandardCharsets.UTF_8);
             return R.ok(rawService.addText(kbId, originalName, content));
         } else {
-            // 二进制文件保存到磁盘（转绝对路径，避免 Tomcat 临时目录解析问题）
+            // Binary files are staged under an absolute path so Tomcat temp
+            // directory resolution does not affect later processing.
             Path uploadDir = Paths.get(properties.getUploadDir()).toAbsolutePath().normalize();
             Files.createDirectories(uploadDir);
             Path targetPath = uploadDir.resolve(System.currentTimeMillis() + "_" + originalName);
@@ -274,7 +305,7 @@ public class WikiController {
         verifyKBWorkspace(kbId, workspaceId);
         WikiRawMaterialEntity raw = rawService.getById(rawId);
         if (raw == null || !kbId.equals(raw.getKbId())) {
-            return R.fail("Raw material not found in this knowledge base");
+            return R.fail(404, "Raw material not found in this knowledge base");
         }
         rawService.delete(rawId);
         kbService.decrementRawCount(kbId);
@@ -290,13 +321,30 @@ public class WikiController {
         verifyKBWorkspace(kbId, workspaceId);
         WikiRawMaterialEntity raw = rawService.getById(rawId);
         if (raw == null || !kbId.equals(raw.getKbId())) {
-            return R.fail("Raw material not found in this knowledge base");
+            return R.fail(404, "Raw material not found in this knowledge base");
         }
-        // RFC-012 Change 5：force=true 时清空 last_processed_hash，让下一次处理必然执行完整管线
+        // Force reprocessing by clearing the hash used to skip unchanged inputs.
         if (force) {
             rawService.setLastProcessedHash(rawId, null);
         }
         rawService.reprocess(rawId);
+        return R.ok();
+    }
+
+    @RequireWorkspaceRole("member")
+    @Operation(summary = "请求取消正在进行的处理（仅在 processing 状态有效）")
+    @PostMapping("/knowledge-bases/{kbId}/raw/{rawId}/cancel")
+    public R<Void> cancelRaw(@PathVariable Long kbId, @PathVariable Long rawId,
+                              @RequestHeader(value = "X-Workspace-Id", required = false) Long workspaceId) {
+        verifyKBWorkspace(kbId, workspaceId);
+        WikiRawMaterialEntity raw = rawService.getById(rawId);
+        if (raw == null || !kbId.equals(raw.getKbId())) {
+            return R.fail(404, "Raw material not found in this knowledge base");
+        }
+        // requestCancel is idempotent: a no-op when the row is not processing,
+        // so repeated clicks (or a click after the run already finished) are
+        // safe and do not surface an error to the user.
+        rawService.requestCancel(rawId);
         return R.ok();
     }
 
@@ -394,8 +442,37 @@ public class WikiController {
                                       @RequestHeader(value = "X-Workspace-Id", required = false) Long workspaceId) {
         verifyKBWorkspace(kbId, workspaceId);
         WikiPageEntity page = pageService.getBySlug(kbId, slug);
-        if (page == null) return R.fail("Page not found");
+        if (page == null) return R.fail(404, "Page not found");
         return R.ok(page);
+    }
+
+    /**
+     * Lightweight wikilink resolution index.
+     * <p>
+     * The viewer's wikilink resolver needs a {slug, title, archived} list that
+     * (1) is not constrained by the user's selected raw-material filter, and
+     * (2) is not paginated. The general page list endpoint above is filtered
+     * by rawId and may scope down based on UI state, so this is a separate,
+     * minimal endpoint dedicated to the resolver.
+     * <p>
+     * Archived pages are excluded by default. Pass {@code includeArchived=true}
+     * to retrieve archived rows as well (useful when the renderer needs to mark
+     * existing links to archived targets as such instead of treating them as
+     * broken links).
+     */
+    @RequireWorkspaceRole("viewer")
+    @Operation(summary = "获取 Wiki 页面引用索引（slug/title/archived，供 wikilink 解析）")
+    @GetMapping("/knowledge-bases/{kbId}/pages/refs")
+    public R<Map<String, Object>> listPageRefs(
+            @PathVariable Long kbId,
+            @RequestParam(name = "includeArchived", defaultValue = "false") boolean includeArchived,
+            @RequestHeader(value = "X-Workspace-Id", required = false) Long workspaceId) {
+        verifyKBWorkspace(kbId, workspaceId);
+        List<WikiPageService.PageRef> items = pageService.listAllRefs(kbId, includeArchived);
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("kbId", kbId);
+        body.put("items", items);
+        return R.ok(body);
     }
 
     @RequireWorkspaceRole("member")
@@ -431,6 +508,65 @@ public class WikiController {
         return R.ok(deleted);
     }
 
+    /**
+     * Cross-KB page lookup by title or slug, scoped to the requesting user's
+     * workspace. Used by the global wikilink click delegator: when a user
+     * clicks a {@code [[Title]]} reference inside a chat message, the
+     * frontend has no idea which KB the wiki tool read from, so this
+     * endpoint searches every KB visible to the user and returns the
+     * candidates.
+     * <p>
+     * Lookup precedence:
+     * <ul>
+     *   <li>If {@code slug} is provided, match against {@code page.slug}
+     *       (case-insensitive exact).</li>
+     *   <li>Else if {@code title} is provided, match against
+     *       {@code page.title} (case-insensitive exact, trimmed).</li>
+     * </ul>
+     * Returns {@code []} if neither parameter is supplied or no match is
+     * found in any visible KB.
+     */
+    @RequireWorkspaceRole("viewer")
+    @Operation(summary = "跨 KB 按 title 或 slug 查找页面（chat 端 wikilink 跳转用）")
+    @GetMapping("/pages/lookup")
+    public R<List<Map<String, Object>>> lookupPages(
+            @RequestParam(required = false) String title,
+            @RequestParam(required = false) String slug,
+            @RequestHeader(value = "X-Workspace-Id", required = false) Long workspaceId) {
+        long wsId = workspaceId != null ? workspaceId : 1L;
+        List<Map<String, Object>> matches = new java.util.ArrayList<>();
+        if ((title == null || title.isBlank()) && (slug == null || slug.isBlank())) {
+            return R.ok(matches);
+        }
+        String slugLower = slug != null ? slug.trim().toLowerCase(java.util.Locale.ROOT) : null;
+        String titleLower = title != null ? title.trim().toLowerCase(java.util.Locale.ROOT) : null;
+
+        for (WikiKnowledgeBaseEntity kb : kbService.listByWorkspace(wsId)) {
+            // listSummaries excludes archived; that's what we want for the
+            // chat-click navigation contract (clicking a [[link]] should
+            // take the user to an active page, not a tombstone).
+            for (WikiPageEntity p : pageService.listSummaries(kb.getId())) {
+                boolean hit = false;
+                if (slugLower != null && p.getSlug() != null
+                        && p.getSlug().toLowerCase(java.util.Locale.ROOT).equals(slugLower)) {
+                    hit = true;
+                } else if (titleLower != null && p.getTitle() != null
+                        && p.getTitle().trim().toLowerCase(java.util.Locale.ROOT).equals(titleLower)) {
+                    hit = true;
+                }
+                if (!hit) continue;
+                Map<String, Object> row = new LinkedHashMap<>();
+                row.put("kbId", String.valueOf(kb.getId()));
+                row.put("kbName", kb.getName());
+                row.put("slug", p.getSlug());
+                row.put("title", p.getTitle());
+                row.put("archived", false);
+                matches.add(row);
+            }
+        }
+        return R.ok(matches);
+    }
+
     @RequireWorkspaceRole("viewer")
     @Operation(summary = "获取反向链接")
     @GetMapping("/knowledge-bases/{kbId}/pages/{slug}/backlinks")
@@ -438,6 +574,122 @@ public class WikiController {
                                                  @RequestHeader(value = "X-Workspace-Id", required = false) Long workspaceId) {
         verifyKBWorkspace(kbId, workspaceId);
         return R.ok(pageService.getBacklinks(kbId, slug));
+    }
+
+    /**
+     * Rename a page within a KB. The old slug is no longer reachable after
+     * this call; every wikilink in the KB that pointed at it is rewritten
+     * to the new slug in the same transaction. Aliases ({@code [[oldSlug|x]]})
+     * are preserved by carrying the alias text over to the new target.
+     */
+    @RequireWorkspaceRole("admin")
+    @Operation(summary = "重命名 Wiki 页面，并级联更新所有引用方")
+    @PostMapping("/knowledge-bases/{kbId}/pages/{slug}/rename")
+    public R<Map<String, Object>> renamePage(
+            @PathVariable Long kbId,
+            @PathVariable String slug,
+            @RequestBody Map<String, String> body,
+            @RequestHeader(value = "X-Workspace-Id", required = false) Long workspaceId) {
+        verifyKBWorkspace(kbId, workspaceId);
+        String newSlug = body == null ? null : body.get("newSlug");
+        WikiPageEntity renamed;
+        try {
+            renamed = pageService.rename(kbId, slug, newSlug);
+        } catch (IllegalArgumentException e) {
+            return R.fail(400, e.getMessage());
+        } catch (IllegalStateException e) {
+            return R.fail(409, e.getMessage());
+        }
+        if (renamed == null) return R.fail(404, "Page not found");
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("oldSlug", slug);
+        out.put("newSlug", renamed.getSlug());
+        out.put("pageId", String.valueOf(renamed.getId()));
+        return R.ok(out);
+    }
+
+    // ==================== Wikilink lint (broken-link scan) ====================
+
+    /**
+     * Start a KB-wide broken-link scan. Job-based async: returns immediately
+     * with a {@code {jobId, status, startedAt}} envelope; the real work runs
+     * on a single-threaded background executor and writes per-page results
+     * back to {@code mate_wiki_page.broken_links}. Idempotent under in-flight
+     * load — repeated POSTs while a scan is queued or running return the
+     * existing job rather than queueing duplicates.
+     */
+    @RequireWorkspaceRole("member")
+    @Operation(summary = "启动 Wiki 死链扫描 job（异步）")
+    @PostMapping("/knowledge-bases/{kbId}/lint/broken-links")
+    public R<Map<String, Object>> startBrokenLinksScan(
+            @PathVariable Long kbId,
+            @RequestHeader(value = "X-Workspace-Id", required = false) Long workspaceId) {
+        verifyKBWorkspace(kbId, workspaceId);
+        WikiLintJobService.LintJob job = lintJobService.startOrGetRunning(kbId);
+        return R.ok(jobEnvelope(job));
+    }
+
+    /**
+     * Read the most recent completed scan result for {@code kbId}. Aggregated
+     * from persisted {@code broken_links} fields, so it survives a server
+     * restart that drops the in-memory job state.
+     */
+    @RequireWorkspaceRole("viewer")
+    @Operation(summary = "读取最近一次死链扫描的聚合结果")
+    @GetMapping("/knowledge-bases/{kbId}/lint/broken-links")
+    public R<Map<String, Object>> getBrokenLinksReport(
+            @PathVariable Long kbId,
+            @RequestHeader(value = "X-Workspace-Id", required = false) Long workspaceId) {
+        verifyKBWorkspace(kbId, workspaceId);
+        WikiLintJobService.Aggregate agg = lintJobService.aggregate(kbId);
+        if (agg == null) {
+            return R.fail(404, "no scan yet, POST to start one");
+        }
+        WikiLintJobService.LintJob latest = lintJobService.getLatestJob(kbId);
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("kbId", agg.kbId());
+        body.put("jobId", latest != null ? latest.jobId() : null);
+        body.put("completedAt", agg.completedAt());
+        body.put("totalPages", agg.totalPages());
+        body.put("pagesWithBrokenLinks", agg.pagesWithBrokenLinks());
+        body.put("totalBrokenRefs", agg.totalBrokenRefs());
+        body.put("pages", agg.pages());
+        return R.ok(body);
+    }
+
+    /**
+     * Optional job-status endpoint. Not strictly needed for the v1 UX
+     * (the frontend can poll the aggregate endpoint and watch
+     * {@code completedAt}), but useful for debugging and future progress
+     * reporting.
+     */
+    @RequireWorkspaceRole("viewer")
+    @Operation(summary = "查询 Wiki 死链扫描 job 状态")
+    @GetMapping("/knowledge-bases/{kbId}/lint/broken-links/jobs/{jobId}")
+    public R<Map<String, Object>> getBrokenLinksJob(
+            @PathVariable Long kbId,
+            @PathVariable String jobId,
+            @RequestHeader(value = "X-Workspace-Id", required = false) Long workspaceId) {
+        verifyKBWorkspace(kbId, workspaceId);
+        WikiLintJobService.LintJob job = lintJobService.getJob(jobId);
+        if (job == null || !job.kbId().equals(kbId)) {
+            return R.fail(404, "job not found");
+        }
+        return R.ok(jobEnvelope(job));
+    }
+
+    private Map<String, Object> jobEnvelope(WikiLintJobService.LintJob job) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("jobId", job.jobId());
+        body.put("kbId", job.kbId());
+        body.put("status", job.status().name().toLowerCase());
+        body.put("startedAt", job.startedAt());
+        body.put("completedAt", job.completedAt());
+        body.put("totalPages", job.totalPages());
+        body.put("pagesWithBrokenLinks", job.pagesWithBrokenLinks());
+        body.put("totalBrokenRefs", job.totalBrokenRefs());
+        if (job.errorMessage() != null) body.put("errorMessage", job.errorMessage());
+        return body;
     }
 
     // RFC-051 PR-7 follow-up: archive surfaces. Default-list is filtered, so the UI
@@ -483,21 +735,8 @@ public class WikiController {
                                              @RequestParam(value = "force", defaultValue = "false") boolean force,
                                              @RequestHeader(value = "X-Workspace-Id", required = false) Long workspaceId) {
         verifyKBWorkspace(kbId, workspaceId);
-        List<WikiRawMaterialEntity> targets;
-        if (force) {
-            // 强制重处理：所有非 pending 的材料重置为 pending，并清空 hash 短路
-            targets = rawService.listByKbId(kbId);
-            for (WikiRawMaterialEntity r : targets) {
-                rawService.setLastProcessedHash(r.getId(), null);
-                rawService.reprocess(r.getId());   // reprocess 会把状态设为 pending 并发布事件
-            }
-            return R.ok(Map.of("queued", targets.size(), "force", true));
-        }
-        targets = rawService.listPending(kbId);
-        for (WikiRawMaterialEntity raw : targets) {
-            eventPublisher.publishEvent(new WikiProcessingEvent(this, raw.getId(), kbId));
-        }
-        return R.ok(Map.of("queued", targets.size(), "force", false));
+        int queued = processingService.processKB(kbId, force);
+        return R.ok(Map.of("queued", queued, "force", force));
     }
 
     @RequireWorkspaceRole("viewer")
@@ -507,23 +746,83 @@ public class WikiController {
                                                        @RequestHeader(value = "X-Workspace-Id", required = false) Long workspaceId) {
         verifyKBWorkspace(kbId, workspaceId);
         WikiKnowledgeBaseEntity kb = kbService.getById(kbId);
-        if (kb == null) return R.fail("Knowledge base not found");
+        if (kb == null) return R.fail(404, "Knowledge base not found");
 
         List<WikiRawMaterialEntity> rawList = rawService.listByKbId(kbId);
         long pending = rawList.stream().filter(r -> "pending".equals(r.getProcessingStatus())).count();
         long processing = rawList.stream().filter(r -> "processing".equals(r.getProcessingStatus())).count();
         long completed = rawList.stream().filter(r -> "completed".equals(r.getProcessingStatus())).count();
+        long partial = rawList.stream().filter(r -> "partial".equals(r.getProcessingStatus())).count();
         long failed = rawList.stream().filter(r -> "failed".equals(r.getProcessingStatus())).count();
+        long cancelled = rawList.stream().filter(r -> "cancelled".equals(r.getProcessingStatus())).count();
 
-        return R.ok(Map.of(
-                "status", kb.getStatus(),
-                "pending", pending,
-                "processing", processing,
-                "completed", completed,
-                "failed", failed,
-                "totalRaw", rawList.size(),
-                "totalPages", kb.getPageCount()
-        ));
+        // Derive totalPages from the real `mate_wiki_page` table rather than
+        // `kb.pageCount`, which can lag behind if a processing run aborts
+        // between page creation and the page-count refresh. Using the live
+        // count keeps the UI honest even when the bookkeeping field is stale.
+        int realPageCount = pageService.countByKbId(kbId);
+        // Self-heal: if the stored pageCount drifted from the real count,
+        // quietly fix it so downstream callers reading `kb.pageCount` see
+        // the truth too. This is the cheapest place to repair without
+        // disrupting the in-flight processing path.
+        if (kb.getPageCount() == null || kb.getPageCount() != realPageCount) {
+            try {
+                kbService.setPageCount(kbId, realPageCount);
+            } catch (Exception ignore) {
+                // Self-heal is best-effort; never let it fail the status read.
+            }
+        }
+
+        // KB-level status field reflects whether the heavy pipeline is still
+        // running; once it flips back to "active" no raw material is actually
+        // mid-processing, regardless of any row whose `processing_status`
+        // didn't get its terminal-state update (a known failure mode in
+        // long-running ingest paths). Override the per-raw count so the UI
+        // doesn't show "processing" forever after the KB itself is idle.
+        boolean kbIdle = !"processing".equals(kb.getStatus());
+        long effectiveProcessing = kbIdle ? 0 : processing;
+        long inferredCompleted = kbIdle ? (completed + (realPageCount > 0 ? processing : 0)) : completed;
+
+        // Per-raw progress snapshot — lets callers distinguish "LLM still
+        // working through phase-b 4 of 10 pages" from "thread is wedged".
+        // Without this the polling client sees `processing: 1` for the entire
+        // multi-minute pipeline and can't tell whether to wait or alert.
+        // `staleSeconds` is the gap since the raw's last bookkeeping update;
+        // a freshly-progressing pipeline updates progressDone every minute or
+        // two, so a gap > 600s suggests a real stall worth investigating.
+        long nowMs = System.currentTimeMillis();
+        java.util.List<Map<String, Object>> rawProgress = new java.util.ArrayList<>(rawList.size());
+        for (WikiRawMaterialEntity r : rawList) {
+            long staleSeconds = -1;
+            if (r.getUpdateTime() != null) {
+                long updatedMs = r.getUpdateTime()
+                        .atZone(java.time.ZoneId.systemDefault())
+                        .toInstant().toEpochMilli();
+                staleSeconds = (nowMs - updatedMs) / 1000L;
+            }
+            Map<String, Object> row = new java.util.LinkedHashMap<>();
+            row.put("rawId", r.getId());
+            row.put("title", r.getTitle());
+            row.put("status", r.getProcessingStatus());
+            row.put("phase", r.getProgressPhase());
+            row.put("done", r.getProgressDone() == null ? 0 : r.getProgressDone());
+            row.put("total", r.getProgressTotal() == null ? 0 : r.getProgressTotal());
+            row.put("staleSeconds", staleSeconds);
+            rawProgress.add(row);
+        }
+
+        Map<String, Object> body = new java.util.LinkedHashMap<>();
+        body.put("status", kb.getStatus());
+        body.put("pending", pending);
+        body.put("processing", effectiveProcessing);
+        body.put("completed", inferredCompleted);
+        body.put("partial", partial);
+        body.put("failed", failed);
+        body.put("cancelled", cancelled);
+        body.put("totalRaw", rawList.size());
+        body.put("totalPages", realPageCount);
+        body.put("rawProgress", rawProgress);
+        return R.ok(body);
     }
 
     /**
@@ -585,11 +884,11 @@ public class WikiController {
     private void verifyKBWorkspace(Long kbId, Long headerWorkspaceId) {
         WikiKnowledgeBaseEntity kb = kbService.getById(kbId);
         if (kb == null) {
-            throw new MateClawException("Knowledge base not found");
+            throw new MateClawException(404, "Knowledge base not found");
         }
         long wsId = headerWorkspaceId != null ? headerWorkspaceId : 1L;
         if (kb.getWorkspaceId() != null && !kb.getWorkspaceId().equals(wsId)) {
-            throw new MateClawException("err.common.wrong_workspace", "资源不属于当前工作区");
+            throw new MateClawException("err.common.wrong_workspace", 403, "资源不属于当前工作区");
         }
     }
 }

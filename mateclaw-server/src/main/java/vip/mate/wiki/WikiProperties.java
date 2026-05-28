@@ -130,6 +130,37 @@ public class WikiProperties {
      */
     private int embeddingMaxChars = 6000;
 
+    /**
+     * Expected embedding-input format version. The authoritative source is
+     * the builder's {@code CURRENT_INPUT_VERSION} constant; this property
+     * exists for staged rollouts and ops overrides.
+     * <p>
+     * Behavior on startup:
+     * <ul>
+     *   <li>Blank: use the builder version.</li>
+     *   <li>Less than builder version: WARN and continue, so a KB can be
+     *       embedded against an older format during a gradual rollback.</li>
+     *   <li>Greater than builder version: fail fast — this usually means the
+     *       config was deployed ahead of the code that implements that format.</li>
+     * </ul>
+     */
+    private String embeddingTextVersionCurrent = "";
+
+    /**
+     * Circuit-breaker threshold: abort an embedding pass after this many
+     * consecutive batch failures (auth / rate-limit / network errors that
+     * cause an entire batch to embed zero chunks). Without it, a broken
+     * provider would silently iterate through every pending chunk in the
+     * KB, producing only log noise and wasted wall-clock time before the
+     * user can intervene.
+     * <p>
+     * Set too low and a transient blip aborts a healthy pass; set too
+     * high and the user waits forever on a clearly-broken provider.
+     * Default 5 covers most real outages while tolerating a couple of
+     * isolated 5xx hiccups.
+     */
+    private int embeddingConsecutiveFailureThreshold = 5;
+
     /** 混合搜索默认模式：keyword / semantic / hybrid */
     private String searchDefaultMode = "hybrid";
 
@@ -239,4 +270,17 @@ public class WikiProperties {
      * top-3 RRF hit but doesn't dominate it.
      */
     private double relationBoostLambda = 0.05;
+
+    /**
+     * Feature flag for the cascade-delete / cascade-rename pipeline: when a
+     * page is deleted (or renamed), find every other page that linked to it
+     * via {@code [[slug]]} and rewrite those references so they don't dangle.
+     * <p>
+     * Defaults to {@code true} — the legacy row-only delete left dangling
+     * {@code [[slug]]} markers behind, which is exactly the bug class this
+     * RFC closes. Set to {@code false} only as a temporary kill-switch if a
+     * cascade pass starts mangling referrer content (which would be a real
+     * bug to chase down, not a steady state).
+     */
+    private boolean cascadeDeleteEnabled = true;
 }

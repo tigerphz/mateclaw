@@ -2,6 +2,7 @@ package vip.mate.wiki.service;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.chat.messages.SystemMessage;
@@ -17,7 +18,9 @@ import vip.mate.llm.model.ModelConfigEntity;
 import vip.mate.llm.service.ModelConfigService;
 import vip.mate.wiki.WikiProperties;
 import vip.mate.wiki.dto.WikiChunkDraft;
+import vip.mate.wiki.event.WikiProcessingEvent;
 import vip.mate.wiki.job.WikiKbConfig;
+import vip.mate.wiki.job.WikiKbConfigParser;
 import vip.mate.wiki.model.WikiKnowledgeBaseEntity;
 import vip.mate.wiki.model.WikiPageEntity;
 import vip.mate.wiki.model.WikiRawMaterialEntity;
@@ -50,6 +53,7 @@ public class WikiProcessingService {
     private final WikiPageService pageService;
     private final WikiChunkService chunkService;
     private final WikiEmbeddingService embeddingService;
+    private final WikiLinkService linkService;
     private final WikiProperties properties;
     private final ModelConfigService modelConfigService;
     private final AgentGraphBuilder agentGraphBuilder;
@@ -114,6 +118,15 @@ public class WikiProcessingService {
     @org.springframework.beans.factory.annotation.Autowired(required = false)
     private WikiLogService logService;
 
+    /**
+     * Optional. When present, every successful ingest triggers an async sweep
+     * of the KB's apply-default transformation templates. Missing in the
+     * legacy unit tests that wire this service directly.
+     */
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    @org.springframework.context.annotation.Lazy
+    private WikiTransformationExecutor transformationExecutor;
+
     /** Parallel chunk / material processing executor (JDK 21 virtual threads) */
     public static final ExecutorService WIKI_EXECUTOR = Executors.newVirtualThreadPerTaskExecutor();
 
@@ -153,26 +166,25 @@ public class WikiProcessingService {
     private final ConcurrentHashMap<Long, ProgressCounter> progressCounters = new ConcurrentHashMap<>();
 
     /**
-     * 处理单个原始材料
+     * Process one raw material.
      */
     public void processRawMaterial(Long rawId) {
         processRawMaterial(rawId, false);
     }
 
     /**
-     * 处理单个原始材料（支持强制重跑）
+     * Process one raw material, optionally bypassing the content-hash shortcut.
      *
-     * @param rawId 材料 ID
-     * @param force 为 true 时忽略 content_hash 短路（RFC-012 Change 5），用于模型/提示词变更后的强制重跑
+     * @param rawId raw material ID
+     * @param force when true, ignore content_hash so model or prompt changes can re-run the full pipeline
      */
     public void processRawMaterial(Long rawId, boolean force) {
-        // RFC-012 follow-up #3：消费续传标志（reprocess() 把 partial 改回 pending 之前打的标）。
-        // 必须在 claimForProcessing 之前读，因为 claim 会把状态再改一次。
-        // flag 只在内存中，server 重启会丢 → 重启后仍按 pending 走正常流程（退化为全量重跑，
-        // 功能不丢失只是性能回退）。
+        // Consume the partial-resume marker before claimForProcessing changes
+        // the row status again. The marker is in-memory only; after a restart
+        // the pending row falls back to a full re-run.
         boolean isPartialResume = rawService.consumePartialResumeFlag(rawId);
 
-        // CAS 式抢占：防止并发重复处理
+        // Claim once so concurrent workers do not process the same raw twice.
         if (!rawService.claimForProcessing(rawId)) {
             log.debug("[Wiki] Raw material {} already claimed or not pending, skipping", rawId);
             return;
@@ -184,7 +196,7 @@ public class WikiProcessingService {
             return;
         }
 
-        // RFC-012 Change 5：若 content_hash 与上次成功处理时一致，直接短路
+        // Skip unchanged content unless the caller requested a forced re-run.
         if (!force
                 && raw.getContentHash() != null
                 && raw.getContentHash().equals(raw.getLastProcessedHash())) {
@@ -201,15 +213,14 @@ public class WikiProcessingService {
 
         kbService.updateStatus(kb.getId(), "processing");
 
-        // RFC-051 PR-2: every ingest path opens with a scaffold check so older
-        // KBs get their overview / log pages on first use without a manual step.
+        // Every ingest path opens with a scaffold check so older KBs get their
+        // overview / log pages on first use without a manual step.
         if (scaffoldService != null) {
             scaffoldService.ensureScaffold(kb.getId());
         }
 
-        // RFC-051 PR-1b: lazy ingest short-circuit. Per KB config, skip the heavy
-        // pipeline entirely: extract → chunk → embed → completed. 0 pages is the
-        // expected outcome, not a failure. ingestMode==null keeps existing behavior.
+        // Lazy ingest skips the heavy generation pipeline: extract, chunk,
+        // embed, completed. Zero pages is expected, not a failure.
         if ("lazy".equals(resolveIngestMode(kb))) {
             processLazyIngest(kb, raw);
             return;
@@ -303,7 +314,17 @@ public class WikiProcessingService {
 
             String finalStatus;
             String finalDetail = null;
-            if (totalPages == 0) {
+            // Cancellation takes precedence over the normal terminal-state logic:
+            // chunks that observed the cancel flag returned early as "failed", but
+            // those aren't real failures — the user asked to stop. Surface that
+            // intent explicitly so the UI can show "cancelled" instead of "failed"
+            // or "partial".
+            if (rawService.isCancelRequested(rawId)) {
+                finalDetail = "Cancelled by user (" + totalPages + " page(s) generated, "
+                        + (totalChunks - failedChunks) + "/" + totalChunks + " chunks completed before stop).";
+                rawService.updateProcessingStatus(rawId, "cancelled", finalDetail);
+                finalStatus = "cancelled";
+            } else if (totalPages == 0) {
                 // RFC-051 follow-up: previously this was an unconditional "failed".
                 // But chunks were already persisted (and the materials are searchable
                 // via wiki_semantic_search) — the only thing that actually went wrong
@@ -343,7 +364,7 @@ public class WikiProcessingService {
             } else {
                 rawService.updateProcessingStatus(rawId, "completed", null);
                 finalStatus = "completed";
-                // RFC-012 Change 5：记录本次成功处理时的 hash，供下次短路判断
+                // Record the successful hash for the next unchanged-content shortcut.
                 if (raw.getContentHash() != null) {
                     rawService.setLastProcessedHash(rawId, raw.getContentHash());
                 }
@@ -371,32 +392,43 @@ public class WikiProcessingService {
                     var terminalStage = switch (finalStatus) {
                         case "failed" -> vip.mate.wiki.job.WikiJobStage.FAILED;
                         case "partial" -> vip.mate.wiki.job.WikiJobStage.PARTIAL;
+                        case "cancelled" -> vip.mate.wiki.job.WikiJobStage.CANCELLED;
                         default -> vip.mate.wiki.job.WikiJobStage.COMPLETED;
                     };
                     wikiJobService.transition(jobId, terminalStage);
                 } catch (Exception ignored) {}
             }
 
-            // RFC-051 PR-2c: log every non-failed eager ingest. Failures already get a
-            // RAW_FAILED broadcast and an error message in the raw row. Title goes first
-            // so the log reads as "what just landed" instead of an opaque raw id.
-            if (logService != null && !"failed".equals(finalStatus)) {
+            // Skip the post-terminal side effects (log line, overview rebuild,
+            // KB-dirty event) for cancelled and failed runs. A cancelled run
+            // means the user explicitly stopped — don't burn LLM tokens on
+            // overview regeneration over an unstable partial state.
+            boolean nonTerminalSideEffects = !"failed".equals(finalStatus) && !"cancelled".equals(finalStatus);
+            if (logService != null && nonTerminalSideEffects) {
                 String title = (raw.getTitle() == null || raw.getTitle().isBlank())
                         ? ("raw#" + rawId) : raw.getTitle();
                 logService.append(kb.getId(), WikiLogService.EventType.INGEST,
                         "eager " + finalStatus + " · " + title
                                 + " · " + totalPages + " pages · " + totalChunks + " chunks");
             }
-            // RFC-051 PR-2b: refresh overview stats whenever a raw lands in a terminal state
-            // (completed or partial). Failures don't shift the stats meaningfully.
-            if (overviewService != null && !"failed".equals(finalStatus)) {
+            // Refresh overview stats whenever a raw lands in a terminal state
+            // (completed or partial). Failures and cancellations don't shift the stats meaningfully.
+            if (overviewService != null && nonTerminalSideEffects) {
                 overviewService.rebuild(kb.getId());
             }
             // Tier 2: signal "KB content is dirty" so WikiNarrativeService can
             // schedule (debounced) an LLM-generated overview narrative refresh.
             // Stats rebuild above is sync; narrative regen runs after-commit.
-            if (!"failed".equals(finalStatus)) {
+            if (nonTerminalSideEffects) {
                 eventPublisher.publishEvent(new vip.mate.wiki.event.WikiKbDirtyEvent(this, kb.getId()));
+            }
+
+            // Run apply-default transformation templates against the newly
+            // ingested raw material. Fire-and-forget; failures are logged
+            // inside the executor and do not affect the ingest outcome.
+            if (transformationExecutor != null && nonTerminalSideEffects) {
+                Long wsId = kb.getWorkspaceId() == null ? 1L : kb.getWorkspaceId();
+                transformationExecutor.runDefaultsAsync(kb.getId(), wsId, rawId, "apply_default");
             }
 
             log.info("[Wiki] Processing completed for raw={}, kbId={}, generatedPages={}, totalPages={}",
@@ -410,7 +442,12 @@ public class WikiProcessingService {
             // RFC-051 follow-up: trigger embedding whenever chunks landed, not only when
             // pages were produced. Otherwise the partial-with-no-pages case above ends up
             // with chunks in DB but never embedded, so semantic search silently misses them.
-            if (totalChunks > 0) {
+            // Skip the post-ingest embedding sweep when this run was cancelled.
+            // The user almost certainly stopped because the embedding provider
+            // is failing (out of credits, wrong key, etc.); kicking off another
+            // embedding pass on the same provider would just churn through
+            // every pending chunk and produce more "all chunks failed" noise.
+            if (totalChunks > 0 && !"cancelled".equals(finalStatus)) {
                 final Long fKbId = kb.getId();
                 WIKI_EXECUTOR.submit(() -> {
                     try {
@@ -418,6 +455,12 @@ public class WikiProcessingService {
                         if (embedded > 0) {
                             log.info("[Wiki] Async embedding completed: kbId={}, embedded={}", fKbId, embedded);
                         }
+                    } catch (vip.mate.wiki.job.WikiEmbeddingProviderFailingException ex) {
+                        // Circuit-breaker tripped — the provider has consistently failed.
+                        // The exception's own log line in WikiEmbeddingService is enough;
+                        // emit a calmer notice here instead of a generic failure log.
+                        log.warn("[Wiki] Async embedding aborted by circuit-breaker for kbId={}: {}",
+                                fKbId, ex.getMessage());
                     } catch (Exception ex) {
                         log.warn("[Wiki] Async embedding failed for kbId={}: {}", fKbId, ex.getMessage());
                     }
@@ -425,16 +468,39 @@ public class WikiProcessingService {
             }
 
         } catch (Exception e) {
-            log.error("[Wiki] Processing failed for raw={}: {}", rawId, e.getMessage(), e);
-            rawService.updateProcessingStatus(rawId, "failed", e.getMessage());
-            kbService.updateStatus(kb.getId(), "active");
-            // Transition job to failed
-            if (wikiJobService != null && jobId != null) {
-                try { wikiJobService.transition(jobId, vip.mate.wiki.job.WikiJobStage.FAILED); } catch (Exception ignored) {}
+            // If the user requested cancellation while this run was in flight,
+            // surface the abort as 'cancelled' rather than 'failed' even when
+            // the exception bubbled up from somewhere mid-pipeline (e.g. a
+            // checkpoint rejected between chunks).
+            boolean cancelled = rawService.isCancelRequested(rawId);
+            String terminalStatus = cancelled ? "cancelled" : "failed";
+            String detail = cancelled
+                    ? "Cancelled by user (interrupted: " + (e.getMessage() == null ? "unknown" : e.getMessage()) + ")"
+                    : e.getMessage();
+            if (cancelled) {
+                log.info("[Wiki] Processing cancelled for raw={}: {}", rawId, e.getMessage());
+            } else {
+                log.error("[Wiki] Processing failed for raw={}: {}", rawId, e.getMessage(), e);
             }
-            // RFC-012 M3：广播异常终态
-            progressBus.broadcast(kb.getId(), WikiProgressBus.EVENT_RAW_FAILED,
-                    java.util.Map.of("rawId", rawId, "error", e.getMessage() == null ? "unknown" : e.getMessage()));
+            rawService.updateProcessingStatus(rawId, terminalStatus, detail);
+            kbService.updateStatus(kb.getId(), "active");
+            if (wikiJobService != null && jobId != null) {
+                try {
+                    wikiJobService.transition(jobId, cancelled
+                            ? vip.mate.wiki.job.WikiJobStage.CANCELLED
+                            : vip.mate.wiki.job.WikiJobStage.FAILED);
+                } catch (Exception ignored) {}
+            }
+            // Broadcast: cancelled rows reuse the COMPLETED event with status="cancelled"
+            // so subscribers can render the terminal-but-not-error UI; only true failures
+            // go through RAW_FAILED (which the UI surfaces as a red banner).
+            if (cancelled) {
+                progressBus.broadcast(kb.getId(), WikiProgressBus.EVENT_RAW_COMPLETED,
+                        java.util.Map.of("rawId", rawId, "status", "cancelled"));
+            } else {
+                progressBus.broadcast(kb.getId(), WikiProgressBus.EVENT_RAW_FAILED,
+                        java.util.Map.of("rawId", rawId, "error", e.getMessage() == null ? "unknown" : e.getMessage()));
+            }
         } finally {
             // RFC-012 M2 v2 UI v2：写入最终进度并清理共享计数器
             ProgressCounter pc = progressCounters.remove(rawId);
@@ -442,6 +508,39 @@ public class WikiProcessingService {
                 rawService.updateProgress(rawId, "done", pc.done.get(), pc.total.get());
             }
         }
+    }
+
+    /**
+     * Queue every raw material in a KB for asynchronous processing and
+     * return the number of materials queued. Does not block on processing.
+     * <p>
+     * When {@code force=true}, every raw material is reset to {@code pending}
+     * and its {@code last_processed_hash} is cleared so the dedup short-circuit
+     * is bypassed; otherwise only currently-{@code pending} materials are
+     * republished to the event bus (the same shape as the manual
+     * {@code POST /knowledge-bases/{kbId}/process} endpoint).
+     *
+     * @return the number of raw materials queued
+     */
+    public int processKB(Long kbId, boolean force) {
+        if (kbId == null) {
+            throw new IllegalArgumentException("kbId is required");
+        }
+        if (force) {
+            List<WikiRawMaterialEntity> all = rawService.listByKbId(kbId);
+            for (WikiRawMaterialEntity raw : all) {
+                rawService.setLastProcessedHash(raw.getId(), null);
+                rawService.reprocess(raw.getId());
+            }
+            log.info("[Wiki] processKB queued {} raw material(s) for kbId={} (force=true)", all.size(), kbId);
+            return all.size();
+        }
+        List<WikiRawMaterialEntity> pending = rawService.listPending(kbId);
+        for (WikiRawMaterialEntity raw : pending) {
+            eventPublisher.publishEvent(new WikiProcessingEvent(this, raw.getId(), kbId));
+        }
+        log.info("[Wiki] processKB queued {} pending raw material(s) for kbId={}", pending.size(), kbId);
+        return pending.size();
     }
 
     /**
@@ -532,9 +631,9 @@ public class WikiProcessingService {
                     return;
                 }
                 try {
-                    // RFC-051 PR-9: skip remaining chunks if the user deleted the raw
-                    // while earlier chunks were still in flight. Counts as a "failed chunk"
-                    // for terminal-status accounting (not actually failed, just abandoned).
+                    // Skip remaining chunks if the user deleted the raw while
+                    // earlier chunks were still in flight. Counts as a failed
+                    // chunk for terminal-status accounting.
                     if (isAborted(raw.getId(), "chunk " + (chunkIndex + 1) + "/" + totalChunks)) {
                         failedChunks.incrementAndGet();
                         return;
@@ -704,9 +803,7 @@ public class WikiProcessingService {
 
         String routeSystem = PromptLoader.loadPrompt("wiki/route-system");
         String routeUserTemplate = PromptLoader.loadPrompt("wiki/route-user");
-        String documentMapSection = (documentMap != null && !documentMap.isBlank())
-                ? "## 文档全局概念地图（预分析结果，供路由参考）\n\n```json\n" + documentMap + "\n```\n"
-                : "";
+        String documentMapSection = buildDocumentMapSection(documentMap);
         String routeUser = routeUserTemplate
                 .replace("{config}", configContent)
                 .replace("{document_map_section}", documentMapSection)
@@ -969,9 +1066,7 @@ public class WikiProcessingService {
 
             String batchSystem = PromptLoader.loadPrompt("wiki/batch-create-system");
             String batchUserTemplate = PromptLoader.loadPrompt("wiki/batch-create-user");
-            String docMapSection = (documentMap != null && !documentMap.isBlank())
-                    ? "## 文档全局概念地图（预分析结果，供页面内容生成参考）\n\n```json\n" + documentMap + "\n```\n"
-                    : "";
+            String docMapSection = buildDocumentMapSection(documentMap);
             String batchUser = batchUserTemplate
                     .replace("{config}", configContent)
                     .replace("{document_map_section}", docMapSection)
@@ -1075,10 +1170,20 @@ public class WikiProcessingService {
                     if (wasCreated) {
                         created.incrementAndGet();
                         totalCreated++;
-                        // Append to liveIndex so next sub-batch can link to this page
+                        // Append to liveIndex so the NEXT sub-batch can link to this freshly
+                        // created page. Mirrors the slug-first row format produced by
+                        // {@link #buildExistingPagesIndex}: `[[slug]] — title — summary`.
+                        // Keeps the LLM's view of the index uniformly slug-first across
+                        // pre-existing rows and just-created rows.
                         String briefSummary = pageSummary.length() > 100
                                 ? pageSummary.substring(0, 100) : pageSummary;
-                        liveIndex.append("\n- ").append(slug).append(": ").append(briefSummary);
+                        liveIndex.append("\n- [[").append(slug).append("]]");
+                        if (title != null && !title.isBlank()) {
+                            liveIndex.append(" — ").append(title);
+                        }
+                        if (briefSummary != null && !briefSummary.isBlank()) {
+                            liveIndex.append(" — ").append(briefSummary);
+                        }
                     }
                     ok = true;
                 } catch (RuntimeException e) {
@@ -1262,9 +1367,9 @@ public class WikiProcessingService {
         Long kbId = kb.getId();
         Long rawId = raw.getId();
 
-        // RFC-051 PR-9: refuse to materialize a page (or merge into an existing one) tied
-        // to a raw the user just deleted. Prevents zombie pages whose source_raw_ids point
-        // at a tombstoned row.
+        // Refuse to materialize a page, or merge into an existing one, for a
+        // raw the user just deleted. This prevents pages whose source_raw_ids
+        // point at a tombstoned row.
         if (isAborted(rawId, "savePageContent slug=" + slug)) return false;
 
         // Fallback 0: cross-spelling canonical match (DB has same concept under different slug)
@@ -1487,10 +1592,16 @@ public class WikiProcessingService {
         String sample = textContent.length() > sampleChars
                 ? textContent.substring(0, sampleChars) + "\n...[文档较长，以上为节选]"
                 : textContent;
+        // Inject the existing-pages index so the LLM can pick a real `related_pages`
+        // whitelist of slugs that already exist in the KB. Generation prompts
+        // downstream see the validated whitelist via `documentMap`, which lets
+        // them link confidently instead of inventing targets.
+        String existingPagesIndex = buildExistingPagesIndex(kb.getId());
         String system = PromptLoader.loadPrompt("wiki/analyze-system");
         String userTemplate = PromptLoader.loadPrompt("wiki/analyze-user");
         String user = userTemplate
                 .replace("{raw_title}", raw.getTitle())
+                .replace("{existing_pages}", existingPagesIndex)
                 .replace("{text_sample}", sample);
         Prompt prompt = new Prompt(List.of(
                 new SystemMessage(system),
@@ -1502,11 +1613,17 @@ public class WikiProcessingService {
                     kb.getId(), vip.mate.wiki.job.WikiJobStep.ROUTE);
             JsonNode json = parseJsonResponse(response);
             if (json != null) {
-                log.info("[Wiki] Document analysis done for raw={}: topics={}, concepts={}",
+                // Validate related_pages against the active KB slug set BEFORE
+                // letting it flow downstream. An LLM that ignores the "must
+                // come from the index" rule and invents slugs would otherwise
+                // pollute the generation prompt, undoing the work of Phase 3.
+                JsonNode validated = validateRelatedPages(kb.getId(), json);
+                log.info("[Wiki] Document analysis done for raw={}: topics={}, concepts={}, related_pages={}",
                         raw.getId(),
-                        json.path("topics").size(),
-                        json.path("key_concepts").size());
-                return json.toPrettyString();
+                        validated.path("topics").size(),
+                        validated.path("key_concepts").size(),
+                        validated.path("related_pages").size());
+                return validated.toPrettyString();
             }
         } catch (Exception e) {
             log.warn("[Wiki] Document analysis failed for raw={}, continuing without: {}", raw.getId(), e.getMessage());
@@ -1515,7 +1632,103 @@ public class WikiProcessingService {
     }
 
     /**
-     * 构建已有 Wiki 页面索引（供 LLM 参考）
+     * Render the analyze-stage output for inclusion in route / batch-create
+     * user prompts. The full JSON goes into a fenced code block, and any
+     * {@code related_pages} array is also surfaced as a plain "recommended
+     * link targets" section right above it so the LLM doesn't have to
+     * parse JSON to find the whitelist.
+     */
+    private String buildDocumentMapSection(String documentMap) {
+        if (documentMap == null || documentMap.isBlank()) return "";
+        StringBuilder sb = new StringBuilder();
+        try {
+            JsonNode node = objectMapper.readTree(documentMap);
+            JsonNode related = node.path("related_pages");
+            if (related.isArray() && related.size() > 0) {
+                sb.append("## 推荐链接到的页面（由分析阶段产出，已通过 slug 白名单校验，可优先使用）\n\n");
+                for (JsonNode el : related) {
+                    String slug = el.asText("").trim();
+                    if (slug.isEmpty()) continue;
+                    sb.append("- [[").append(slug).append("]]\n");
+                }
+                sb.append("\n");
+            }
+        } catch (Exception ignored) {
+            // documentMap might not be parseable JSON (older runs, partial
+            // output) — fall through and emit the raw block below.
+        }
+        sb.append("## 文档全局概念地图（预分析结果，供页面内容生成参考）\n\n```json\n")
+                .append(documentMap).append("\n```\n");
+        return sb.toString();
+    }
+
+    /**
+     * Drop any {@code related_pages} entry not in the KB's active slug set.
+     * <p>
+     * The analyze-stage system prompt explicitly tells the LLM that every
+     * entry must come from the supplied index, but production LLMs are not
+     * 100% reliable on negative constraints. This server-side validator is
+     * the contract enforcement: invalid entries are silently dropped (with
+     * a single warning log per analyze call, batched), so the downstream
+     * generation prompt never sees an invented slug masquerading as a
+     * curated whitelist.
+     */
+    private JsonNode validateRelatedPages(Long kbId, JsonNode analysisJson) {
+        JsonNode relatedNode = analysisJson.path("related_pages");
+        if (!relatedNode.isArray() || relatedNode.size() == 0) return analysisJson;
+
+        java.util.Set<String> activeSlugs;
+        try {
+            activeSlugs = linkService.lowercaseSlugSet(pageService.listSummaries(kbId));
+        } catch (RuntimeException e) {
+            // Without a slug set, no validation is possible. Drop the whole
+            // related_pages array — better than passing through unvalidated
+            // suggestions that could be hallucinated.
+            log.warn("[Wiki] Cannot validate related_pages for kbId={}, dropping array: {}",
+                    kbId, e.toString());
+            ObjectNode result = analysisJson.deepCopy();
+            result.putArray("related_pages");
+            return result;
+        }
+
+        com.fasterxml.jackson.databind.node.ArrayNode keptArray = objectMapper.createArrayNode();
+        java.util.List<String> dropped = new java.util.ArrayList<>();
+        for (JsonNode el : relatedNode) {
+            String slug = el.asText("").trim();
+            if (slug.isEmpty()) continue;
+            if (activeSlugs.contains(slug.toLowerCase(java.util.Locale.ROOT))) {
+                keptArray.add(slug);
+            } else {
+                dropped.add(slug);
+            }
+        }
+        if (!dropped.isEmpty()) {
+            log.warn("[Wiki] Analyze dropped {} hallucinated related_pages entries for kbId={}: {}",
+                    dropped.size(), kbId, dropped);
+        }
+        ObjectNode result = analysisJson.deepCopy();
+        result.set("related_pages", keptArray);
+        return result;
+    }
+
+    /**
+     * Build the "existing pages" index that the LLM consults when picking
+     * cross-references during page generation / merge / compile.
+     * <p>
+     * Slug-first format — each line begins with {@code [[slug]]} so the
+     * model has exactly one syntactically-valid target shape to copy. Title
+     * and summary follow as semantic context, separated by em-dashes, so the
+     * model can pick a relevant target without being confused about whether
+     * to write the title or the slug. The earlier "**[[Title]]** (slug: `x`)"
+     * format exposed two candidate target strings on every row, which let
+     * the model write {@code [[Title]]} freely and produced the lint noise
+     * this RFC exists to close.
+     * <p>
+     * Manual-edit and archived markers stay as plain-text trailing tags so
+     * they don't drift into the link form. The lint downstream treats a
+     * title-only match as a soft warning in v1; the long-term direction is
+     * to delete the title-fallback once content has been regenerated under
+     * the slug-first prompt.
      */
     private String buildExistingPagesIndex(Long kbId) {
         List<WikiPageEntity> summaries = pageService.listSummaries(kbId);
@@ -1525,12 +1738,17 @@ public class WikiProcessingService {
 
         StringBuilder sb = new StringBuilder();
         for (WikiPageEntity page : summaries) {
-            sb.append("- **[[").append(page.getTitle()).append("]]** (slug: `").append(page.getSlug()).append("`");
-            if ("manual".equals(page.getLastUpdatedBy())) {
-                sb.append(", 手动编辑");
+            sb.append("- [[").append(page.getSlug()).append("]]");
+            if (page.getTitle() != null && !page.getTitle().isBlank()) {
+                sb.append(" — ").append(page.getTitle());
             }
-            sb.append("): ");
-            sb.append(page.getSummary() != null ? page.getSummary() : "无摘要");
+            if ("manual".equals(page.getLastUpdatedBy())) {
+                sb.append(" (手动编辑)");
+            }
+            String summary = page.getSummary();
+            if (summary != null && !summary.isBlank()) {
+                sb.append(" — ").append(summary);
+            }
             sb.append("\n");
         }
         return sb.toString().trim();
@@ -2117,55 +2335,51 @@ public class WikiProcessingService {
     }
 
     /**
-     * RFC-051 PR-6b follow-up: KB-level override for structured route output,
-     * falling back to the global property when the KB hasn't set a preference.
-     * Parse failures fall back to global too — never block ingest on bad config.
+     * KB-level override for structured route output, falling back to the global
+     * property when the KB has not set a preference. Parse failures fall back to
+     * global too; ingestion must not be blocked by bad optional config.
      */
     private boolean resolveStructuredRouteFlag(WikiKnowledgeBaseEntity kb) {
         boolean fallback = properties.isUseStructuredRoute();
         if (kb == null || kb.getConfigContent() == null) return fallback;
-        try {
-            WikiKbConfig config = objectMapper.readValue(kb.getConfigContent(), WikiKbConfig.class);
-            return config.getUseStructuredRoute() != null
-                    ? config.getUseStructuredRoute()
-                    : fallback;
-        } catch (Exception e) {
-            return fallback;
-        }
+        WikiKbConfig config = WikiKbConfigParser.parse(objectMapper, kb.getConfigContent());
+        return config != null && config.getUseStructuredRoute() != null
+                ? config.getUseStructuredRoute()
+                : fallback;
     }
 
     /**
-     * RFC-051 PR-1b: read {@code ingestMode} from KB config JSON. Returns null
-     * on any parse error or missing field so the caller falls through to eager.
+     * Read {@code ingestMode} from KB config JSON or markdown frontmatter.
+     * Returns null on any parse error or missing field so the caller falls
+     * through to eager mode.
      */
     private String resolveIngestMode(WikiKnowledgeBaseEntity kb) {
         if (kb == null || kb.getConfigContent() == null) return null;
-        try {
-            WikiKbConfig config = objectMapper.readValue(kb.getConfigContent(), WikiKbConfig.class);
-            return config.getIngestMode();
-        } catch (Exception e) {
-            log.warn("[Wiki] Failed to parse KB config for ingest mode, falling back to eager: {}", e.getMessage());
-            return null;
-        }
+        WikiKbConfig config = WikiKbConfigParser.parse(objectMapper, kb.getConfigContent());
+        return config != null ? config.getIngestMode() : null;
     }
 
     /**
-     * RFC-051 PR-9: returns {@code true} when the caller should bail out of an
-     * in-flight processing path because the raw material has been deleted.
+     * Returns {@code true} when the caller should bail out of an in-flight
+     * processing path because the raw material has been deleted.
      * <p>
-     * {@link WikiRawMaterialService#delete(Long)} is a logical delete (the
-     * {@code @TableLogic} column flips to 1), so {@code selectById} returns
-     * {@code null} as soon as the deletion commits. Sprinkling this check
-     * right before each LLM call keeps token spend bounded by a single
-     * in-flight call after the user clicks delete.
+     * {@link WikiRawMaterialService#delete(Long)} is a logical delete. The row
+     * disappears from normal lookups as soon as deletion commits. Checking
+     * before each LLM call keeps token spend bounded by a single in-flight call
+     * after the user clicks delete.
      *
      * @param rawId the raw material id this processing path is about
      * @param ctx   short string used in the log line
      * @return {@code true} if the raw is gone; caller should stop work
      */
     private boolean isAborted(Long rawId, String ctx) {
-        if (rawService.getById(rawId) == null) {
+        WikiRawMaterialEntity raw = rawService.getById(rawId);
+        if (raw == null) {
             log.info("[Wiki] Aborting {} for raw={}: raw was deleted mid-processing", ctx, rawId);
+            return true;
+        }
+        if (Boolean.TRUE.equals(raw.getCancelRequested())) {
+            log.info("[Wiki] Aborting {} for raw={}: cancellation requested by user", ctx, rawId);
             return true;
         }
         return false;
@@ -2200,12 +2414,11 @@ public class WikiProcessingService {
     }
 
     /**
-     * RFC-051 PR-1b: lazy ingest — chunk + embed, no page generation.
+     * Lazy ingest: chunk and embed, without page generation.
      * <p>
      * Intentionally minimal: reuses the legacy {@code persistChunks(List<String>, offsets)}
-     * overload (no structural metadata; that lands in PR-1c with the preprocessor)
-     * and the existing {@code embedMissingChunks} entry point. Zero pages is the
-     * expected outcome, not a failure.
+     * overload and the existing {@code embedMissingChunks} entry point. Zero
+     * pages is the expected outcome, not a failure.
      */
     private void processLazyIngest(WikiKnowledgeBaseEntity kb, WikiRawMaterialEntity raw) {
         Long rawId = raw.getId();
@@ -2226,9 +2439,9 @@ public class WikiProcessingService {
                 return;
             }
 
-            // RFC-051 PR-9: text extraction can take many seconds on large binaries.
-            // If the user deleted the raw during that window, persisting chunks for a
-            // tombstoned row is wasted work that the cascade-cleanup already covered.
+            // Text extraction can take many seconds on large binaries. If the
+            // user deleted the raw during that window, persisting chunks for a
+            // tombstoned row is wasted work already covered by cascade cleanup.
             if (isAborted(rawId, "lazy ingest after extract")) {
                 kbService.updateStatus(kbId, "active");
                 return;
@@ -2260,6 +2473,9 @@ public class WikiProcessingService {
                     if (embedded > 0) {
                         log.info("[Wiki] Lazy async embedding completed: kbId={}, embedded={}", fKbId, embedded);
                     }
+                } catch (vip.mate.wiki.job.WikiEmbeddingProviderFailingException ex) {
+                    log.warn("[Wiki] Lazy async embedding aborted by circuit-breaker for kbId={}: {}",
+                            fKbId, ex.getMessage());
                 } catch (Exception ex) {
                     log.warn("[Wiki] Lazy async embedding failed for kbId={}: {}", fKbId, ex.getMessage());
                 }

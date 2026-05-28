@@ -148,7 +148,7 @@ public class StateGraphPlanExecuteAgent extends BaseAgent implements StructuredS
         AtomicReference<String> lastPersistedStepResult = new AtomicReference<>("");
         AtomicReference<String> lastPersistedStepThinking = new AtomicReference<>("");
 
-        return compiledGraph.stream(inputs, config)
+        return BaseAgent.routingStartupDelta(inputs).concatWith(compiledGraph.stream(inputs, config)
                 .flatMapIterable(output -> {
                     List<AgentService.StreamDelta> deltas = new ArrayList<>();
                     // 1. 提取事件（只发送新增部分）
@@ -218,7 +218,7 @@ public class StateGraphPlanExecuteAgent extends BaseAgent implements StructuredS
                         ));
                     }
                     return null;
-                }).flatMapMany(d -> d != null ? Flux.just(d) : Flux.empty()))
+                }).flatMapMany(d -> d != null ? Flux.just(d) : Flux.empty())))
                 .doOnComplete(() -> setState(AgentState.IDLE))
                 .doOnError(e -> {
                     log.error("[{}] Plan-Execute stream error: {}", agentName, e.getMessage());
@@ -267,11 +267,13 @@ public class StateGraphPlanExecuteAgent extends BaseAgent implements StructuredS
                     chatModel,
                     conversationId,
                     parsedAgentId,
-                    toolSet != null ? toolSet.callbacks() : null);
+                    toolSet != null ? toolSet.callbacks() : null,
+                    workspaceBasePath);
         }
 
         List<Message> messages = new ArrayList<>(historyMessages);
-        messages.add(buildCurrentUserMessage(conversationId, userMessage));
+        BaseAgent.CurrentTurnUserMessage currentTurn = buildCurrentUserMessageWithRouting(conversationId, userMessage);
+        messages.add(currentTurn.userMessage());
 
         // 构建 working context：对历史消息做受控长度摘要
         String workingContext = buildWorkingContext(historyMessages, List.of());
@@ -299,6 +301,12 @@ public class StateGraphPlanExecuteAgent extends BaseAgent implements StructuredS
         inputs.put(MateClawStateKeys.RUNTIME_PROVIDER_ID, runtimeProviderId != null ? runtimeProviderId : "");
         inputs.put(MateClawStateKeys.TRACE_ID, UUID.randomUUID().toString().substring(0, 8));
 
+        if (currentTurn.routingDecision() != null
+                && (currentTurn.routingDecision().strategy() != vip.mate.llm.routing.model.MultimodalRoutingDecision.Strategy.NONE
+                        || !currentTurn.routingDecision().skipped().isEmpty())) {
+            inputs.put(MateClawStateKeys.ROUTING_DECISION, currentTurn.routingDecision().toMap());
+        }
+
         // RFC-063r §2.5: same as ReAct path — enrich and store the ChatOrigin
         // so StepExecutionNode (and any sub-graphs spawned via DelegateAgentTool)
         // can read it back from state.
@@ -311,6 +319,24 @@ public class StateGraphPlanExecuteAgent extends BaseAgent implements StructuredS
         origin = origin.withConversationId(conversationId)
                 .withWorkspace(origin.workspaceId(), workspaceBasePath);
         inputs.put(MateClawStateKeys.CHAT_ORIGIN, origin);
+
+        // RFC 48 — inject active goal snapshot for GoalEvaluationNode.
+        // Mirrors StateGraphReActAgent.buildInitialState exactly.
+        if (goalService != null && conversationId != null && !conversationId.isBlank()) {
+            try {
+                vip.mate.goal.model.GoalEntity active =
+                        goalService.findActiveByConversation(conversationId);
+                if (active != null) {
+                    inputs.put(MateClawStateKeys.ACTIVE_GOAL, active);
+                }
+            } catch (Exception e) {
+                log.warn("[{}] findActiveByConversation failed: {}", agentName, e.getMessage());
+            }
+        }
+        inputs.put(MateClawStateKeys.GOAL_EVALUATED_THIS_RUN, false);
+        inputs.put(MateClawStateKeys.GOAL_FOLLOWUP_INJECTED, false);
+        inputs.put(MateClawStateKeys.GOAL_FOLLOWUP_PROMPT, "");
+
         return inputs;
     }
 

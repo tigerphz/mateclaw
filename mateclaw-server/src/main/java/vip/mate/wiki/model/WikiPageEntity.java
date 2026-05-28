@@ -73,6 +73,35 @@ public class WikiPageEntity {
      */
     private Integer archived;
 
+    /**
+     * Page-level embedding (float32 little-endian) used by the semantic
+     * retriever to surface pages whose generated content does not appear
+     * in any source raw's chunks — typically synthesis pages produced by
+     * a transformation. {@code null} = not yet embedded.
+     */
+    private byte[] embedding;
+
+    /** Model name that produced {@link #embedding}; used for re-embed detection. */
+    private String embeddingModel;
+
+    /** Input-format version for {@link #embedding}; bumped when the embedding builder changes. */
+    private String embeddingTextVersion;
+
+    /**
+     * JSON array of outlink targets present in {@link #content} but missing
+     * from the active KB slug set. Empty array = scanned, all targets resolve;
+     * {@code null} = never scanned. Recomputed in the same transaction as any
+     * content save/update, and by the on-demand KB-wide lint scan job.
+     */
+    @TableField(updateStrategy = FieldStrategy.ALWAYS)
+    private String brokenLinks;
+
+    /**
+     * Timestamp of the most recent {@link #brokenLinks} recompute. The lint UI
+     * banner uses this to mark stale data ("scanned 3 days ago — rescan?").
+     */
+    private LocalDateTime brokenLinksScannedAt;
+
     @TableField(fill = FieldFill.INSERT)
     private LocalDateTime createTime;
 

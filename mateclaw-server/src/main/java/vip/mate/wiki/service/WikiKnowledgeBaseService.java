@@ -5,8 +5,18 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import vip.mate.wiki.job.model.WikiProcessingJobEntity;
+import vip.mate.wiki.model.WikiChunkEntity;
 import vip.mate.wiki.model.WikiKnowledgeBaseEntity;
+import vip.mate.wiki.model.WikiPageCitationEntity;
+import vip.mate.wiki.model.WikiPageEntity;
+import vip.mate.wiki.model.WikiRawMaterialEntity;
+import vip.mate.wiki.repository.WikiChunkMapper;
 import vip.mate.wiki.repository.WikiKnowledgeBaseMapper;
+import vip.mate.wiki.repository.WikiPageCitationMapper;
+import vip.mate.wiki.repository.WikiPageMapper;
+import vip.mate.wiki.repository.WikiProcessingJobMapper;
+import vip.mate.wiki.repository.WikiRawMaterialMapper;
 
 import java.util.List;
 
@@ -21,6 +31,11 @@ import java.util.List;
 public class WikiKnowledgeBaseService {
 
     private final WikiKnowledgeBaseMapper kbMapper;
+    private final WikiRawMaterialMapper rawMapper;
+    private final WikiPageMapper pageMapper;
+    private final WikiChunkMapper chunkMapper;
+    private final WikiPageCitationMapper citationMapper;
+    private final WikiProcessingJobMapper processingJobMapper;
 
     /**
      * RFC-051 PR-2: optional system-page scaffold (overview / log). Marked
@@ -31,6 +46,19 @@ public class WikiKnowledgeBaseService {
     @org.springframework.beans.factory.annotation.Autowired(required = false)
     @org.springframework.context.annotation.Lazy
     private WikiScaffoldService scaffoldService;
+
+    /**
+     * Summary returned from cascade delete — used by callers (e.g. the
+     * controller) to record an audit event with affected-row counts.
+     */
+    public record CascadeDeleteResult(
+            String kbName,
+            int rawMaterialCount,
+            int pageCount,
+            int chunkCount,
+            int citationCount,
+            int processingJobCount) {
+    }
 
     private static final String DEFAULT_CONFIG = """
             # Wiki Processing Rules
@@ -82,6 +110,86 @@ public class WikiKnowledgeBaseService {
                         .and(w -> w.eq(WikiKnowledgeBaseEntity::getAgentId, agentId)
                                 .or().isNull(WikiKnowledgeBaseEntity::getAgentId))
                         .orderByDesc(WikiKnowledgeBaseEntity::getUpdateTime));
+    }
+
+    /**
+     * Resolve the single knowledge base an agent's wiki tools should operate on.
+     * <p>
+     * Prefers a KB explicitly bound to the agent; a shared (agent-less) KB is
+     * only used as a fallback when the agent has no bound KB of its own. This
+     * matters because {@link #listByAgentId} also returns shared KBs, and a
+     * shared KB with a more recent {@code update_time} would otherwise win the
+     * {@code get(0)} pick over the agent's own KB. Within each tier the most
+     * recently updated KB wins. Returns {@code null} when the agent can reach
+     * no knowledge base at all.
+     */
+    public WikiKnowledgeBaseEntity resolvePrimaryKb(Long agentId) {
+        List<WikiKnowledgeBaseEntity> kbs = listByAgentId(agentId);
+        if (kbs.isEmpty()) {
+            return null;
+        }
+        if (agentId != null) {
+            for (WikiKnowledgeBaseEntity kb : kbs) {
+                if (agentId.equals(kb.getAgentId())) {
+                    return kb;
+                }
+            }
+        }
+        return kbs.get(0);
+    }
+
+    /**
+     * Resolve a specific knowledge base by name, restricted to the agent's
+     * visibility set (agent-bound KBs + shared NULL KBs). Used by wiki tools
+     * that accept an optional {@code kbName} parameter so the LLM can target
+     * a non-primary KB when the agent reaches more than one.
+     * <p>
+     * Match is exact and case-sensitive — the LLM is expected to copy the
+     * name verbatim from {@code wiki_list_kbs} output. Returns {@code null}
+     * when zero OR more than one KB matches the name; callers wanting to
+     * distinguish the two cases (so the LLM can be told to disambiguate by
+     * id) should call {@link #findAllByName} instead. The single-match
+     * convenience contract here keeps the legacy call sites simple.
+     */
+    public WikiKnowledgeBaseEntity findByName(Long agentId, String kbName) {
+        List<WikiKnowledgeBaseEntity> matches = findAllByName(agentId, kbName);
+        return matches.size() == 1 ? matches.get(0) : null;
+    }
+
+    /**
+     * All KBs visible to {@code agentId} whose name matches {@code kbName}
+     * exactly. Returns an empty list when the name is blank or no KB matches;
+     * returns >1 entries when the workspace has duplicate KB names (no DB
+     * unique constraint protects against this), in which case the caller
+     * MUST disambiguate (typically by surfacing a kbId-based picker to the
+     * LLM) rather than silently picking the first one.
+     */
+    public List<WikiKnowledgeBaseEntity> findAllByName(Long agentId, String kbName) {
+        if (kbName == null || kbName.isBlank()) {
+            return List.of();
+        }
+        List<WikiKnowledgeBaseEntity> out = new java.util.ArrayList<>();
+        for (WikiKnowledgeBaseEntity kb : listByAgentId(agentId)) {
+            if (kbName.equals(kb.getName())) {
+                out.add(kb);
+            }
+        }
+        return out;
+    }
+
+    /**
+     * Resolve a KB by id, but ONLY when it's in the agent's visibility set —
+     * a deliberate fail-closed gate so an LLM cannot pivot to an arbitrary KB
+     * by guessing or scraping an id from someone else's workspace.
+     */
+    public WikiKnowledgeBaseEntity findVisibleById(Long agentId, Long kbId) {
+        if (kbId == null) return null;
+        for (WikiKnowledgeBaseEntity kb : listByAgentId(agentId)) {
+            if (kbId.equals(kb.getId())) {
+                return kb;
+            }
+        }
+        return null;
     }
 
     public WikiKnowledgeBaseEntity getById(Long id) {
@@ -216,9 +324,54 @@ public class WikiKnowledgeBaseService {
         }
     }
 
+    /**
+     * Cascade-delete a knowledge base and all data that belongs to it.
+     * <p>
+     * Single transaction: removes page citations (looked up via page IDs since
+     * the citation table has no {@code kb_id} column), then chunks, pages, raw
+     * materials, and processing jobs by {@code kb_id}, and finally the KB row
+     * itself. Returns a summary so callers can record audit metadata.
+     */
     @Transactional
-    public void delete(Long id) {
+    public CascadeDeleteResult delete(Long id) {
+        WikiKnowledgeBaseEntity kb = kbMapper.selectById(id);
+        if (kb == null) {
+            throw new IllegalArgumentException("Knowledge base not found: " + id);
+        }
+
+        List<Long> pageIds = pageMapper.selectList(
+                new LambdaQueryWrapper<WikiPageEntity>()
+                        .select(WikiPageEntity::getId)
+                        .eq(WikiPageEntity::getKbId, id))
+                .stream()
+                .map(WikiPageEntity::getId)
+                .toList();
+
+        int citationCount = pageIds.isEmpty() ? 0 : citationMapper.delete(
+                new LambdaQueryWrapper<WikiPageCitationEntity>()
+                        .in(WikiPageCitationEntity::getPageId, pageIds));
+
+        int pageCount = pageMapper.delete(
+                new LambdaQueryWrapper<WikiPageEntity>()
+                        .eq(WikiPageEntity::getKbId, id));
+
+        int chunkCount = chunkMapper.delete(
+                new LambdaQueryWrapper<WikiChunkEntity>()
+                        .eq(WikiChunkEntity::getKbId, id));
+
+        int rawCount = rawMapper.delete(
+                new LambdaQueryWrapper<WikiRawMaterialEntity>()
+                        .eq(WikiRawMaterialEntity::getKbId, id));
+
+        int jobCount = processingJobMapper.delete(
+                new LambdaQueryWrapper<WikiProcessingJobEntity>()
+                        .eq(WikiProcessingJobEntity::getKbId, id));
+
         kbMapper.deleteById(id);
-        log.info("[Wiki] Knowledge base deleted: id={}", id);
+
+        log.info("[Wiki] Knowledge base cascade-deleted: id={}, name={}, raw={}, page={}, chunk={}, citation={}, job={}",
+                id, kb.getName(), rawCount, pageCount, chunkCount, citationCount, jobCount);
+
+        return new CascadeDeleteResult(kb.getName(), rawCount, pageCount, chunkCount, citationCount, jobCount);
     }
 }

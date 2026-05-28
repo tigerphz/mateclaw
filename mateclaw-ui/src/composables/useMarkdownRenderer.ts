@@ -179,8 +179,29 @@ const customRenderer = {
 
     // Mermaid: ship raw source through a placeholder div for the
     // useMermaidRenderer post-mount step. Skip syntax highlighting entirely.
+    // The header (lang label + Copy + Download SVG) is part of the placeholder
+    // so users can copy the diagram source even before render completes; the
+    // composable paints the SVG into `.mermaid-block__body`.
     if (infoStr === 'mermaid') {
-      return `<div class="mermaid-block" data-mermaid="${encodeURIComponent(rawCode)}"></div>`
+      const encoded = encodeURIComponent(rawCode)
+      const copySvg = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>`
+      const downloadSvg = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>`
+      return `<div class="mermaid-block" data-mermaid="${encoded}">`
+        + `<div class="mermaid-block__header">`
+        + `<span class="mermaid-block__lang">Mermaid</span>`
+        + `<span class="mermaid-block__actions">`
+        + `<button class="code-block__copy" type="button" data-code="${encoded}" aria-label="Copy diagram source">`
+        + copySvg
+        + `<span class="code-block__copy-text">Copy</span>`
+        + `</button>`
+        + `<button class="mermaid-block__download" type="button" data-mermaid-download="1" aria-label="Download SVG">`
+        + downloadSvg
+        + `<span class="mermaid-block__download-text">SVG</span>`
+        + `</button>`
+        + `</span>`
+        + `</div>`
+        + `<div class="mermaid-block__body"></div>`
+        + `</div>`
     }
 
     // ECharts: same pattern, mounted by useEChartsRenderer.
@@ -298,7 +319,8 @@ const purifyConfig = {
   ADD_ATTR: [
     'target', 'rel', 'class',
     'data-code', 'data-echarts-option', 'data-wiki-title', 'data-slug',
-    'data-tex', 'data-mermaid',
+    'data-tex', 'data-mermaid', 'data-mermaid-download',
+    'x1', 'y1', 'x2', 'y2',
     'aria-label', 'open',
     'type', 'viewBox', 'fill', 'stroke', 'stroke-width', 'd',
     'x', 'y', 'width', 'height', 'rx', 'ry', 'points',
@@ -321,20 +343,43 @@ const purifyConfig = {
 const RENDER_CACHE = new Map<string, string>()
 const RENDER_CACHE_CAP = 200
 
-function cacheKey(text: string): string {
+function cacheKey(text: string, wikilink: WikilinkMode): string {
   // Compact key — collisions on the order of 10^-6 in single-conversation
   // scope, and a false hit only causes a "stale" render of unchanged content
   // (no security implication since cached values are sanitized HTML).
-  return `${text.length}:${text.slice(0, 40)}:${text.slice(-40)}`
+  // The wikilink mode is part of the key so a 'none' caller cannot read back
+  // a 'legacy'-substituted cached entry of the same source.
+  return `${wikilink}:${text.length}:${text.slice(0, 40)}:${text.slice(-40)}`
 }
 
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
+
+/**
+ * Wikilink handling mode for {@link useMarkdownRenderer}.
+ *
+ * - `'legacy'` (default): pre-markdown string substitution of `[[Title]]` into
+ *   `<a class="wiki-link" data-wiki-title="...">`, dispatching the global
+ *   `wiki-link-click` event when clicked. Kept for chat / other views that
+ *   already rely on this behaviour.
+ * - `'none'`: skip wikilink substitution entirely. Use this when the caller
+ *   wants to walk the rendered DOM itself and resolve `[[...]]` against an
+ *   authoritative `{slug, title}` index — the dedicated path used by the Wiki
+ *   page viewer, where the legacy "guess slug from title" approach is unsafe.
+ */
+export type WikilinkMode = 'legacy' | 'none'
+
+export interface RenderMarkdownOptions {
+  /** How to handle `[[...]]` syntax. Defaults to `'legacy'`. */
+  wikilink?: WikilinkMode
+}
+
 export function useMarkdownRenderer() {
-  function renderMarkdown(content: string): string {
+  function renderMarkdown(content: string, opts?: RenderMarkdownOptions): string {
     if (!content) return ''
-    const k = cacheKey(content)
+    const wikilink: WikilinkMode = opts?.wikilink ?? 'legacy'
+    const k = cacheKey(content, wikilink)
     const cached = RENDER_CACHE.get(k)
     if (cached !== undefined) {
       // Refresh LRU position — re-insert at the tail.
@@ -346,10 +391,30 @@ export function useMarkdownRenderer() {
     // 1. LaTeX placeholders (skips fenced/inline code).
     const withLatex = preprocessLatex(content)
     // 2. Wiki link substitution: [[Title]] → <a class="wiki-link" …>.
-    const withWikiLinks = withLatex.replace(
-      /\[\[([^\]]+)\]\]/g,
-      '<a class="wiki-link" href="#" data-wiki-title="$1" onclick="window.dispatchEvent(new CustomEvent(\'wiki-link-click\',{detail:{title:\'$1\'}}));return false">$1</a>'
-    )
+    //    Skipped in 'none' mode so the caller can do its own DOM postprocess.
+    const withWikiLinks =
+      wikilink === 'none'
+        ? withLatex
+        : // Split `[[slug|display]]` into slug + display halves so the
+          // `data-wiki-title` attribute carries the slug ALONE (the cross-KB
+          // lookup keys off that) and the visible label is the display text
+          // (the alias an author chose). The earlier single-capture regex
+          // copied the whole bracket interior — including the literal `|` —
+          // into both, producing `data-wiki-title="slug|display"` lookups
+          // that the backend would never resolve.
+          withLatex.replace(
+            /\[\[([^\]|]+)(?:\|([^\]]+))?\]\]/g,
+            (_match, slug: string, alias?: string) => {
+              const target = slug.trim().replace(/"/g, '&quot;')
+              const visible = (alias?.trim() || slug.trim()).replace(/"/g, '&quot;')
+              return (
+                '<a class="wiki-link" href="#" data-wiki-title="' + target +
+                '" onclick="window.dispatchEvent(new CustomEvent(\'wiki-link-click\',{detail:{title:\'' +
+                target.replace(/'/g, "\\'") +
+                '\'}}));return false">' + visible + '</a>'
+              )
+            },
+          )
     // 3. Marked → 4. DOMPurify.
     const rawHtml = markedInstance.parse(withWikiLinks) as string
     const result = DOMPurify.sanitize(rawHtml, purifyConfig)

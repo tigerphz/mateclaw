@@ -1,7 +1,7 @@
 <template>
   <div class="raw-panel">
     <!-- Upload + Add text row -->
-    <div class="upload-row">
+    <div v-if="canManageWiki" class="upload-row">
       <div
         class="upload-zone"
         :class="{ 'is-dragging': isDragging, 'is-uploading': uploadingFiles.length > 0 }"
@@ -32,10 +32,10 @@
             <template v-else-if="isDragging">{{ t('wiki.dropToUpload') }}</template>
             <template v-else>{{ t('wiki.dropFiles') }}</template>
           </span>
-          <span class="upload-hint">.txt, .md, .pdf, .docx</span>
+          <span class="upload-hint">.txt .md .csv .pdf .docx .xlsx .pptx .html</span>
         </div>
       </div>
-      <input ref="fileInput" type="file" style="display:none" accept=".txt,.md,.pdf,.docx,.doc" multiple @change="handleFileSelect" />
+      <input ref="fileInput" type="file" style="display:none" accept=".txt,.md,.csv,.pdf,.docx,.doc,.xlsx,.xls,.pptx,.ppt,.html,.htm" multiple @change="handleFileSelect" />
       <button class="btn-secondary add-text-btn" @click="showAddText = true">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
           <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
@@ -45,7 +45,7 @@
     </div>
 
     <!-- Directory scan -->
-    <div class="dir-scan-row">
+    <div v-if="canManageWiki" class="dir-scan-row">
       <div class="dir-input-wrap">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
           <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
@@ -138,23 +138,52 @@
             <span class="raw-item-type">{{ raw.sourceType }}</span>
           </div>
           <div class="raw-item-meta">
-            <span class="status-badge" :class="raw.processingStatus">
-              {{ t(`wiki.status.${raw.processingStatus}`) }}
+            <span
+              class="status-badge"
+              :class="cancellingIds.has(raw.id) && raw.processingStatus === 'processing' ? 'cancelling' : raw.processingStatus"
+            >
+              {{ cancellingIds.has(raw.id) && raw.processingStatus === 'processing'
+                ? t('wiki.status.cancelling')
+                : t(`wiki.status.${raw.processingStatus}`) }}
             </span>
             <span v-if="raw.pageCount != null && raw.pageCount > 0" class="page-count-chip">
               <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
               {{ raw.pageCount }}
             </span>
             <span
-              v-if="raw.errorMessage && (raw.processingStatus === 'failed' || raw.processingStatus === 'partial')"
+              v-if="raw.processingStatus === 'cancelled'"
+              class="error-hint" :title="raw.errorMessage || ''"
+            >
+              {{ t('wiki.cancelledHint') }}
+            </span>
+            <span
+              v-else-if="raw.errorMessage && (raw.processingStatus === 'failed' || raw.processingStatus === 'partial')"
               class="error-hint" :title="raw.errorMessage"
             >
               {{ raw.errorMessage }}
             </span>
           </div>
-          <div class="raw-item-actions">
+          <div v-if="canManageWiki" class="raw-item-actions">
             <button
-              v-if="raw.processingStatus === 'partial'"
+              v-if="raw.processingStatus === 'processing' && !cancellingIds.has(raw.id)"
+              class="btn-icon btn-icon-danger" :title="t('wiki.cancel')"
+              @click="cancelRaw(raw.id)"
+            >
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
+                <line x1="6" y1="6" x2="18" y2="18"/>
+                <line x1="6" y1="18" x2="18" y2="6"/>
+              </svg>
+            </button>
+            <button
+              v-else-if="raw.processingStatus === 'processing' && cancellingIds.has(raw.id)"
+              class="btn-icon btn-icon-cancelling" :title="t('wiki.cancelling')" disabled
+            >
+              <svg class="spinner" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
+                <path d="M21 12a9 9 0 1 1-6.22-8.56"/>
+              </svg>
+            </button>
+            <button
+              v-else-if="raw.processingStatus === 'partial'"
               class="btn-icon btn-icon-resume" :title="t('wiki.resume')"
               @click="reprocess(raw.id)"
             >
@@ -163,7 +192,7 @@
               </svg>
             </button>
             <button
-              v-else-if="raw.processingStatus === 'failed' || raw.processingStatus === 'completed'"
+              v-else-if="raw.processingStatus === 'failed' || raw.processingStatus === 'completed' || raw.processingStatus === 'cancelled'"
               class="btn-icon" :title="t('wiki.reprocess')"
               @click="reprocess(raw.id)"
             >
@@ -257,20 +286,27 @@
 <script setup lang="ts">
 import { ref, reactive, computed, watch, onBeforeUnmount } from 'vue'
 import { useI18n } from 'vue-i18n'
-import { ElMessage } from 'element-plus'
+import { mcToast } from '@/composables/useMcToast'
+import { useFileDrop } from '@/composables/useFileDrop'
 import { Download } from '@element-plus/icons-vue'
 import { useWikiStore } from '@/stores/useWikiStore'
+import { useWorkspaceStore } from '@/stores/useWorkspaceStore'
 import { wikiApi } from '@/api/index'
 import JobStageBar from './JobStageBar.vue'
 import type { WikiProcessingJob } from '@/composables/useWikiJobPoller'
 
 const { t } = useI18n()
 const store = useWikiStore()
+const workspace = useWorkspaceStore()
+
+// Uploading, scanning and (re)processing raw material all require manage:wiki.
+// Viewers can still see the material list but get no write controls.
+const canManageWiki = computed(() => workspace.can('manage:wiki'))
 const fileInput = ref<HTMLInputElement | null>(null)
 
-// RFC-012 M3：当列表中存在 processing 的材料时，优先订阅后端 SSE 实时进度流，
-// 60s 兜底拉取 processingStatus / fetchRawMaterials 作为 SSE 断线降级（DB 是真源）。
-// 处理完毕（无 processing 项）自动断开 SSE + 停止兜底轮询；组件卸载时也会清理。
+// While raw materials are active, subscribe to the backend SSE progress stream.
+// A slower polling fallback keeps the UI in sync if SSE reconnects or misses a
+// terminal event. The database remains the source of truth.
 let sse: EventSource | null = null
 let fallbackTimer: number | null = null
 let activeKbId: number | null = null
@@ -290,7 +326,7 @@ function applyProgressEvent(payload: any) {
 function openSse(kbId: number) {
   closeSse()
   activeKbId = kbId
-  // Vite 代理 /api → :18088；EventSource 走相对路径即可
+  // Vite proxies /api to the backend, so EventSource can use a relative URL.
   const es = new EventSource(`/api/v1/wiki/knowledge-bases/${kbId}/progress`)
   sse = es
 
@@ -324,7 +360,7 @@ function openSse(kbId: number) {
       }
       // Clear stale job entry so JobStageBar hides
       delete rawJobs[data.rawId]
-      if (store.currentKB) store.fetchRawMaterials(store.currentKB.id)
+      if (store.currentKB) void store.refreshCurrentKB()
     } catch { /* ignore */ }
   })
   es.addEventListener('raw.failed', (ev: MessageEvent) => {
@@ -334,7 +370,7 @@ function openSse(kbId: number) {
       if (raw) raw.processingStatus = 'failed'
       // Clear stale job entry
       delete rawJobs[data.rawId]
-      if (store.currentKB) store.fetchRawMaterials(store.currentKB.id)
+      if (store.currentKB) void store.refreshCurrentKB()
     } catch { /* ignore */ }
   })
   es.onerror = () => {
@@ -360,7 +396,7 @@ watch(
       // 60s fallback polling
       if (fallbackTimer == null) {
         fallbackTimer = window.setInterval(() => {
-          if (store.currentKB) store.fetchRawMaterials(store.currentKB.id)
+          if (store.currentKB) void store.refreshCurrentKB()
         }, 60000)
       }
     } else {
@@ -388,6 +424,14 @@ let jobPoller: ReturnType<typeof setTimeout> | null = null
 
 const TERMINAL_STATUSES = new Set(['completed', 'failed', 'partial', 'cancelled'])
 
+// Local optimistic state: rows the user has just clicked "cancel" on.
+// Backend cancellation is observed at the next abort checkpoint (which can
+// take 10+ seconds while a route-phase LLM call is in flight), so without
+// this set the click looks unresponsive — the button stays the same and
+// the badge keeps reading "处理中". Cleared as soon as the row's status
+// transitions out of "processing" via the next fetchRawMaterials.
+const cancellingIds = ref(new Set<number>())
+
 async function pollJobs() {
   if (!store.currentKB) return
   const kbId = store.currentKB.id
@@ -408,9 +452,9 @@ async function pollJobs() {
       }
     } catch { /* ignore */ }
   }
-  // When any job reaches terminal, refresh raw materials to sync status badges
+  // When any job reaches terminal, refresh wiki metadata, pages, and raw badges.
   if (anyTerminal) {
-    await store.fetchRawMaterials(kbId)
+    await store.refreshCurrentKB()
   }
   // Continue polling while there are still processing/pending raws
   const stillActive = store.rawMaterials.some(
@@ -426,6 +470,22 @@ watch(hasProcessing, (active) => {
   else if (jobPoller) { clearTimeout(jobPoller); jobPoller = null }
 }, { immediate: true })
 
+// Clear the optimistic "cancelling" flag for any row that has left the
+// 'processing' state — the backend has written the terminal status, so
+// the badge and action buttons can now reflect reality.
+watch(() => store.rawMaterials, (rows) => {
+  if (cancellingIds.value.size === 0) return
+  const next = new Set(cancellingIds.value)
+  for (const r of rows) {
+    if (r.processingStatus !== 'processing' && next.has(r.id)) {
+      next.delete(r.id)
+    }
+  }
+  if (next.size !== cancellingIds.value.size) {
+    cancellingIds.value = next
+  }
+}, { deep: true })
+
 async function handleLocalRepair(rawId: number) {
   if (!store.currentKB) return
   // For local repair, we'd need a page slug. For now, reprocess the raw material.
@@ -440,21 +500,12 @@ const scanning = ref(false)
 const scanResult = ref<{ scanned: number; added: number; skipped: number } | null>(null)
 
 // ─── Drag-over state ──────────────────────────────────────────────────────────
-// Use a counter to handle nested dragenter/dragleave without flickering.
-const isDragging = ref(false)
-let dragCounter = 0
+const { isDragging, onDragEnter, onDragLeave, onDrop: handleDrop } = useFileDrop(uploadDroppedFiles)
 
-function onDragEnter() {
-  dragCounter++
-  isDragging.value = true
-}
-
-function onDragLeave() {
-  dragCounter--
-  if (dragCounter <= 0) {
-    dragCounter = 0
-    isDragging.value = false
-  }
+async function uploadDroppedFiles(event: DragEvent) {
+  if (!event.dataTransfer?.files || !store.currentKB) return
+  const kbId = store.currentKB.id
+  await Promise.all(Array.from(event.dataTransfer.files).map(f => uploadFile(kbId, f)))
 }
 
 // ─── Optimistic upload items ──────────────────────────────────────────────────
@@ -497,7 +548,7 @@ async function uploadFile(kbId: number, file: File) {
   } catch (err: any) {
     item.status = 'error'
     item.errorMsg = err?.response?.data?.message || err?.message || t('wiki.uploadFailed', { name: file.name })
-    ElMessage.error(t('wiki.uploadFailed', { name: file.name }))
+    mcToast.error(t('wiki.uploadFailed', { name: file.name }))
   }
 }
 
@@ -514,14 +565,6 @@ async function handleFileSelect(event: Event) {
   input.value = ''
 }
 
-async function handleDrop(event: DragEvent) {
-  // Reset drag state
-  dragCounter = 0
-  isDragging.value = false
-  if (!event.dataTransfer?.files || !store.currentKB) return
-  const kbId = store.currentKB.id
-  await Promise.all(Array.from(event.dataTransfer.files).map(f => uploadFile(kbId, f)))
-}
 
 async function handleAddText() {
   if (!store.currentKB) return
@@ -556,6 +599,30 @@ async function deleteRaw(rawId: number) {
   await store.fetchRawMaterials(store.currentKB.id)
 }
 
+async function cancelRaw(rawId: number) {
+  if (!store.currentKB) return
+  const kbId = store.currentKB.id
+  // Optimistic flag — drives the spinner button and "正在取消…" badge text
+  // so the click is visibly registered even if the pipeline is currently
+  // mid-LLM call and won't reach its next abort checkpoint for several seconds.
+  cancellingIds.value.add(rawId)
+  try {
+    await wikiApi.cancelRaw(kbId, rawId)
+  } catch (e) {
+    // Roll back the optimistic state if the call itself failed (auth /
+    // network error). Without this the button would stay stuck in the
+    // cancelling state forever.
+    cancellingIds.value.delete(rawId)
+    throw e
+  }
+  // Re-fetch periodically so the row's status flips from 'processing' to
+  // 'cancelled' as soon as the pipeline observes the flag and writes its
+  // terminal status — at which point the watch below clears the flag.
+  await store.fetchRawMaterials(kbId)
+  setTimeout(() => { store.fetchRawMaterials(kbId) }, 5000)
+  setTimeout(() => { store.fetchRawMaterials(kbId) }, 15000)
+}
+
 async function downloadRaw(raw: { id: number; title?: string }) {
   if (!store.currentKB) return
   try {
@@ -576,7 +643,7 @@ async function downloadRaw(raw: { id: number; title?: string }) {
     setTimeout(() => URL.revokeObjectURL(url), 0)
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e)
-    ElMessage.error(`${t('wiki.downloadFailed')}: ${msg}`)
+    mcToast.error(`${t('wiki.downloadFailed')}: ${msg}`)
   }
 }
 
@@ -738,6 +805,12 @@ async function handleScanDir() {
 .status-badge.completed { background: rgba(90, 138, 90, 0.15); color: var(--mc-success); }
 .status-badge.partial { background: rgba(217, 119, 87, 0.15); color: var(--mc-primary); }
 .status-badge.failed { background: var(--mc-danger-bg); color: var(--mc-danger); }
+.status-badge.cancelled { background: var(--mc-bg-sunken); color: var(--mc-text-tertiary); }
+.status-badge.cancelling { background: var(--mc-bg-sunken); color: var(--mc-text-secondary); }
+
+.btn-icon.btn-icon-cancelling { cursor: default; opacity: 0.7; }
+.btn-icon.btn-icon-cancelling .spinner { animation: rmp-spin 0.9s linear infinite; }
+@keyframes rmp-spin { to { transform: rotate(360deg); } }
 
 /* Process button */
 .process-btn { width: 100%; justify-content: center; margin-top: 16px; }

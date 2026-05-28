@@ -77,8 +77,9 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
-import { ElMessage } from 'element-plus'
+import { mcToast } from '@/composables/useMcToast'
 import { skillApi } from '@/api/index'
+import { copyToClipboard } from '@/utils/clipboard'
 
 interface RequirementStatus {
   key: string
@@ -132,7 +133,7 @@ async function reload() {
     featureStatuses.value = data.featureStatuses || {}
     activeFeatures.value = Array.isArray(data.activeFeatures) ? data.activeFeatures : []
   } catch (e: any) {
-    ElMessage.error(typeof e === 'string' ? e : e?.message || t('skills.preflight.loadFailed'))
+    mcToast.error(typeof e === 'string' ? e : e?.message || t('skills.preflight.loadFailed'))
     statuses.value = []
     allMet.value = false
   } finally {
@@ -146,24 +147,10 @@ function handleClose() {
 
 async function copy(cmd: string) {
   try {
-    if (navigator.clipboard) {
-      await navigator.clipboard.writeText(cmd)
-    } else {
-      // Fallback for clipboard-API-disabled contexts (eg http://). The
-      // textarea trick is broadly supported and avoids a noisy permission
-      // failure on the production-ish workflow.
-      const ta = document.createElement('textarea')
-      ta.value = cmd
-      ta.style.position = 'fixed'
-      ta.style.left = '-9999px'
-      document.body.appendChild(ta)
-      ta.select()
-      document.execCommand('copy')
-      document.body.removeChild(ta)
-    }
-    ElMessage.success(t('common.copied'))
+    await copyToClipboard(cmd)
+    mcToast.success(t('common.copied'))
   } catch {
-    ElMessage.warning(t('common.copyFailed'))
+    mcToast.warning(t('common.copyFailed'))
   }
 }
 

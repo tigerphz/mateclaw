@@ -9,23 +9,28 @@
             <p class="mc-page-desc">{{ t('agents.desc') }}</p>
           </div>
           <div class="header-right">
-            <router-link
-              v-if="isAdminRole && backstageRunning > 0"
-              to="/backstage"
-              class="live-pill"
-              :class="{ 'live-pill--alert': backstageStuck > 0 }"
-              :title="t('backstage.attention')"
-            >
-              <span class="live-pill-dot"></span>
-              <span class="live-pill-text">
-                {{ backstageStuck > 0
-                  ? t('agents.live.needsAttention', { n: backstageStuck })
-                  : t('agents.live.atWork', { n: backstageRunning }) }}
-              </span>
-              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
-                <polyline points="9 18 15 12 9 6"/>
-              </svg>
-            </router-link>
+            <!-- Roster / Live view switch — one team, two states. Admin only.
+                 Sits on the header line, level with the New Employee button. -->
+            <div v-if="isAdminRole" class="view-switch">
+              <button
+                class="view-seg"
+                :class="{ 'is-active': view === 'roster' }"
+                @click="setView('roster')"
+              >{{ t('agents.views.roster') }}</button>
+              <button
+                class="view-seg"
+                :class="{ 'is-active': view === 'live' }"
+                @click="setView('live')"
+              >
+                <span v-if="liveRunning > 0" class="seg-pulse"></span>
+                {{ t('agents.views.live') }}
+                <span
+                  v-if="liveRunning > 0"
+                  class="seg-count"
+                  :class="{ warn: liveStuck > 0 }"
+                >{{ liveRunning }}</span>
+              </button>
+            </div>
             <button class="btn-primary" @click="openCreateModal">
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                 <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
@@ -35,6 +40,8 @@
           </div>
         </div>
 
+        <!-- Roster: the team -->
+        <template v-if="view === 'roster'">
         <div class="agents-toolbar mc-surface-card">
           <div class="filter-bar">
             <div class="search-box">
@@ -123,6 +130,10 @@
           <p>{{ t('agents.emptyDesc') }}</p>
           <button class="btn-primary" @click="openCreateModal">{{ t('agents.newAgent') }}</button>
         </div>
+        </template>
+
+        <!-- Live: what the team is doing right now -->
+        <LivePanel v-else />
       </div>
     </div>
     
@@ -198,11 +209,17 @@
             </button>
             <button v-if="editingAgent" class="modal-tab" :class="{ active: modalTab === 'skills' }" @click="modalTab = 'skills'">
               {{ t('agents.tabs.skills', 'Skills') }}
-              <span v-if="selectedSkillIds.length" class="tab-badge">{{ selectedSkillIds.length }}</span>
+              <!-- Issue #184: when the disable flag is on, suppress the
+                   stale-pick count badge and show an "off" state instead —
+                   the count would otherwise contradict the disable toggle
+                   visible in the tab content. -->
+              <span v-if="form.skillsDisabled" class="tab-badge tab-badge--off">{{ t('agents.binding.disableAllSkillsBadge') }}</span>
+              <span v-else-if="selectedSkillIds.length" class="tab-badge">{{ selectedSkillIds.length }}</span>
             </button>
             <button v-if="editingAgent" class="modal-tab" :class="{ active: modalTab === 'tools' }" @click="modalTab = 'tools'">
               {{ t('agents.tabs.tools', 'Tools') }}
-              <span v-if="selectedToolNames.length" class="tab-badge">{{ selectedToolNames.length }}</span>
+              <span v-if="form.toolsDisabled" class="tab-badge tab-badge--off">{{ t('agents.binding.disableAllToolsBadge') }}</span>
+              <span v-else-if="selectedToolNames.length" class="tab-badge">{{ selectedToolNames.length }}</span>
             </button>
             <button v-if="editingAgent" class="modal-tab" :class="{ active: modalTab === 'providers' }" @click="modalTab = 'providers'">
               {{ t('agents.tabs.providers', 'Providers') }}
@@ -259,6 +276,11 @@
                 <option value="high">{{ t('agents.thinkingLevels.high') }}</option>
                 <option value="max">{{ t('agents.thinkingLevels.max') }}</option>
               </select>
+            </div>
+            <div class="form-group full-width">
+              <label class="form-label">{{ t('agents.fields.workspaceBasePath') }}</label>
+              <input v-model="form.workspaceBasePath" class="form-input" :placeholder="t('agents.placeholders.workspaceBasePath')" />
+              <p class="form-hint">{{ t('agents.fields.workspaceBasePathHint') }}</p>
             </div>
             <!--
               Identity triad: role + goal + backstory map to H2 sections in
@@ -317,24 +339,64 @@
               <span class="binding-intro__kicker">{{ t('agents.binding.skillsKicker') }}</span>
               <p class="binding-intro__tagline">{{ t('agents.binding.skillsTagline') }}</p>
             </div>
-            <p class="binding-hint">{{ t('agents.binding.skillsHint') }}</p>
-            <div v-if="availableSkills.length === 0" class="binding-empty">{{ t('agents.binding.noSkills') }}</div>
-            <div v-else class="binding-list">
-              <label
-                v-for="skill in availableSkills"
-                :key="skill.id"
-                class="binding-item"
-                :class="{ selected: selectedSkillIds.includes(skill.id) }"
-              >
-                <input type="checkbox" :value="skill.id" v-model="selectedSkillIds" class="binding-checkbox" />
-                <span class="binding-icon"><SkillIcon :value="skill.icon" :size="20" :fallback="'🧩'" /></span>
-                <div class="binding-info">
-                  <span class="binding-name">{{ skill.name }}</span>
-                  <span v-if="skill.description" class="binding-desc">{{ skill.description?.slice(0, 80) }}</span>
-                </div>
-                <span v-if="skill.version" class="binding-version">v{{ skill.version }}</span>
+            <!-- Issue #184: explicit "no skills" toggle. Empty selection
+                 alone falls back to "inherit global default" (legacy
+                 contract), so users who want zero skills in the context
+                 need this dedicated bit. -->
+            <div class="binding-disable-row">
+              <label class="binding-disable-label">
+                <input type="checkbox" v-model="form.skillsDisabled" class="binding-disable-checkbox" />
+                <span class="binding-disable-text">
+                  <strong>{{ t('agents.binding.disableAllSkills') }}</strong>
+                  <span class="binding-disable-hint">{{ t('agents.binding.disableAllSkillsHint') }}</span>
+                </span>
               </label>
             </div>
+            <p class="binding-hint">{{ t('agents.binding.skillsHint') }}</p>
+            <div v-if="availableSkills.length === 0" class="binding-empty">{{ t('agents.binding.noSkills') }}</div>
+            <template v-else>
+              <div class="binding-search" :class="{ 'binding-search--disabled': form.skillsDisabled }">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
+                </svg>
+                <input v-model="skillBindingSearch" :placeholder="t('agents.binding.searchSkills')" :disabled="form.skillsDisabled" />
+              </div>
+              <div v-if="filteredAvailableSkills.length === 0" class="binding-empty binding-empty--compact">{{ t('agents.binding.noMatchingSkills') }}</div>
+              <div v-else class="binding-list" :class="{ 'binding-list--disabled': form.skillsDisabled }">
+                <label
+                  v-for="skill in filteredAvailableSkills"
+                  :key="skill.id"
+                  class="binding-item"
+                  :class="{
+                    selected: !form.skillsDisabled && selectedSkillIds.includes(skill.id),
+                    'binding-item--inert': form.skillsDisabled,
+                  }"
+                >
+                  <!-- Manual :checked instead of v-model: when skillsDisabled
+                       is on, the stale picks still live in selectedSkillIds
+                       (we keep them so flipping the toggle back off restores
+                       the previous selection in one click). Driving the
+                       checkbox from a derived expression lets us hide the
+                       stale checked state from the user without mutating
+                       the underlying array. The save path already clears
+                       the array on send when the flag is on. -->
+                  <input
+                    type="checkbox"
+                    :value="skill.id"
+                    :checked="!form.skillsDisabled && selectedSkillIds.includes(skill.id)"
+                    @change="onSkillToggle(skill.id, $event)"
+                    class="binding-checkbox"
+                    :disabled="form.skillsDisabled"
+                  />
+                  <span class="binding-icon"><SkillIcon :value="skill.icon" :size="20" :fallback="'🧩'" /></span>
+                  <div class="binding-info">
+                    <span class="binding-name">{{ resolveSkillName(skill) }}</span>
+                    <span v-if="skill.description" class="binding-desc">{{ skill.description?.slice(0, 80) }}</span>
+                  </div>
+                  <span v-if="skill.version" class="binding-version">v{{ skill.version }}</span>
+                </label>
+              </div>
+            </template>
           </div>
 
           <!-- Tools Tab — RFC-090 §9.2 调整 B: Advanced bypass for atomic
@@ -346,32 +408,115 @@
               <span class="binding-intro__kicker">{{ t('agents.binding.toolsKicker') }}</span>
               <p class="binding-intro__tagline">{{ t('agents.binding.toolsTagline') }}</p>
             </div>
-            <details class="advanced-tools" :open="selectedToolNames.length > 0 || advancedToolsOpen">
+            <!-- Issue #184 mirror of the skills tab: explicit opt-out so the
+                 LLM advertises zero user-pickable tools (system-level
+                 memory primitives still pass — see backend SYSTEM_LEVEL_TOOLS). -->
+            <div class="binding-disable-row">
+              <label class="binding-disable-label">
+                <input type="checkbox" v-model="form.toolsDisabled" class="binding-disable-checkbox" />
+                <span class="binding-disable-text">
+                  <strong>{{ t('agents.binding.disableAllTools') }}</strong>
+                  <span class="binding-disable-hint">{{ t('agents.binding.disableAllToolsHint') }}</span>
+                </span>
+              </label>
+            </div>
+            <!-- Issue #184: when the disable flag is on, treat the count as
+                 zero for visual affordances — auto-open / count badge / chevron
+                 should all behave as if there are no picks, matching the
+                 "saving clears bindings" contract. The underlying array is
+                 left intact so toggling the flag back off restores them. -->
+            <details class="advanced-tools" :open="(!form.toolsDisabled && selectedToolNames.length > 0) || advancedToolsOpen">
               <summary class="advanced-tools-summary" @click.prevent="advancedToolsOpen = !advancedToolsOpen">
                 <span class="advanced-tools-title">
                   {{ t('agents.binding.advancedToolsTitle') }}
-                  <span v-if="selectedToolNames.length > 0" class="advanced-tools-count">{{ selectedToolNames.length }}</span>
+                  <span v-if="!form.toolsDisabled && selectedToolNames.length > 0" class="advanced-tools-count">{{ selectedToolNames.length }}</span>
                 </span>
-                <span class="advanced-tools-chevron">{{ (advancedToolsOpen || selectedToolNames.length > 0) ? '▾' : '▸' }}</span>
+                <span class="advanced-tools-chevron">{{ (advancedToolsOpen || (!form.toolsDisabled && selectedToolNames.length > 0)) ? '▾' : '▸' }}</span>
               </summary>
               <p class="binding-hint">{{ t('agents.binding.toolsHint') }}</p>
               <p class="binding-hint advanced-tools-note">{{ t('agents.binding.advancedToolsHint') }}</p>
-              <div v-if="availableTools.length === 0" class="binding-empty">{{ t('agents.binding.noTools') }}</div>
+              <p class="binding-hint advanced-tools-note">{{ t('agents.binding.toolUnionHint') }}</p>
+              <div v-if="availableToolGroups.length > 0" class="binding-search">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
+                </svg>
+                <input v-model="toolBindingSearch" :placeholder="t('agents.binding.searchTools')" />
+              </div>
+              <!-- Render the empty state only when there is genuinely
+                   nothing to show. availableTools can be empty while
+                   availableToolGroups still contains a synthesized
+                   orphan group (saved bindings whose tools dropped out
+                   of the catalog) — that case must reach the list so
+                   the user can clean those orphans up. -->
+              <div v-if="availableToolGroups.length === 0" class="binding-empty">{{ t('agents.binding.noTools') }}</div>
+              <div v-else-if="filteredAvailableToolGroups.length === 0" class="binding-empty binding-empty--compact">{{ t('agents.binding.noMatchingTools') }}</div>
               <div v-else class="binding-list">
-                <label
-                  v-for="tool in availableTools"
-                  :key="tool.name"
-                  class="binding-item"
-                  :class="{ selected: selectedToolNames.includes(tool.name) }"
-                >
-                  <input type="checkbox" :value="tool.name" v-model="selectedToolNames" class="binding-checkbox" />
-                  <span class="binding-icon"><SkillIcon :value="tool.icon" :size="20" :fallback="'🔧'" /></span>
-                  <div class="binding-info">
-                    <span class="binding-name">{{ tool.displayName || tool.name }}</span>
-                    <span v-if="tool.description" class="binding-desc">{{ tool.description?.slice(0, 80) }}</span>
+                <template v-for="group in filteredAvailableToolGroups" :key="group.groupId">
+                  <div class="binding-group-header">
+                    <span>{{ group.label }}</span>
+                    <!-- MCP group badge reflects the agent's MCP scope:
+                         with no MCP tool ticked, every enabled MCP tool is
+                         available by default; once any MCP tool is ticked,
+                         the agent is restricted to the ticked set. To deny
+                         an MCP tool when none are ticked, users still have
+                         Security → Tool Guard. -->
+                    <span
+                      v-if="group.groupId && group.groupId.startsWith('mcp:')"
+                      class="binding-group-note"
+                      :title="anyMcpToolSelected
+                        ? t('agents.binding.mcpScopedTooltip')
+                        : t('agents.binding.mcpAutoIncludedTooltip')"
+                    >
+                      {{ anyMcpToolSelected
+                        ? t('agents.binding.mcpScopedBadge')
+                        : t('agents.binding.mcpAutoIncludedBadge') }}
+                    </span>
                   </div>
-                  <span class="binding-type-badge">{{ tool.toolType }}</span>
-                </label>
+                  <label
+                    v-for="tool in group.tools"
+                    :key="tool.rowId || `${group.groupId}#${tool.rawName}#${tool.name}`"
+                    class="binding-item"
+                    :class="{
+                      selected: !form.toolsDisabled && tool._isSelected,
+                      'binding-item--stale': tool.stale,
+                      'binding-item--unavailable': !tool.available,
+                      'binding-item--inert': form.toolsDisabled,
+                    }"
+                    :title="!tool.available
+                      ? t('agents.binding.toolUnavailableTooltip', { reason: tool.unavailableReason || '' })
+                      : (tool.stale ? t('agents.binding.toolStaleTooltip') : tool.name)"
+                  >
+                    <!-- Manual checkbox state. Two rows can share the
+                         same tool.name (hash-collision twin or
+                         duplicate-raw twin); v-model would auto-sync
+                         both, so we drive each row's checked flag from
+                         the pre-computed _isSelected derived in
+                         availableToolGroups, which considers whether
+                         this row's name is owned by a bindable twin.
+                         Issue #184: gate visual checked-state on the
+                         disable flag so stale picks don't show through
+                         when "this agent uses no user-pickable tools"
+                         is on. selectedToolNames is preserved so flipping
+                         the toggle back off restores the prior selection. -->
+                    <input
+                      type="checkbox"
+                      class="binding-checkbox"
+                      :checked="!form.toolsDisabled && tool._isSelected"
+                      :disabled="tool._isDisabled || form.toolsDisabled"
+                      @change="onToolToggle(tool.name, $event)"
+                    />
+                    <span class="binding-icon">
+                      <SkillIcon :value="tool.source === 'mcp' ? '🔌' : '🔧'" :size="20" :fallback="'🔧'" />
+                    </span>
+                    <div class="binding-info">
+                      <span class="binding-name">{{ tool.rawName || tool.name }}</span>
+                      <span v-if="tool.description" class="binding-desc">{{ tool.description?.slice(0, 80) }}</span>
+                    </div>
+                    <span v-if="tool.stale" class="binding-stale-badge">{{ t('agents.binding.toolStaleBadge') }}</span>
+                    <span v-if="!tool.available" class="binding-unavailable-badge">{{ t('agents.binding.toolUnavailableBadge') }}</span>
+                    <span v-else class="binding-type-badge">{{ tool.source }}</span>
+                  </label>
+                </template>
               </div>
             </details>
           </div>
@@ -421,14 +566,15 @@
 
 <script setup lang="ts">
 import { ref, computed, onMounted, onBeforeUnmount } from 'vue'
-import { useRouter } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
-import { ElMessage } from 'element-plus'
+import { mcToast } from '@/composables/useMcToast'
 import { mcConfirm } from '@/components/common/useConfirm'
-import { agentApi, agentBindingApi, modelApi, skillApi, toolApi, templateApi, backstageApi } from '@/api/index'
+import { agentApi, agentBindingApi, modelApi, skillApi, toolApi, templateApi, liveApi } from '@/api/index'
 import type { Agent } from '@/types/index'
 import SkillIcon from '@/components/common/SkillIcon.vue'
 import SkillIconPicker from '@/components/common/SkillIconPicker.vue'
+import LivePanel from '@/components/live/LivePanel.vue'
 import {
   emptyProfile,
   parsePrompt,
@@ -439,9 +585,13 @@ import {
   type AgentPromptProfile,
 } from '@/utils/agentPromptProfile'
 import { agentIconColor } from '@/utils/agentIconColor'
+import { filterAgentBindingItems, filterAgentToolGroups } from '@/utils/agentBindingSearch'
+import { useSkillName } from '@/composables/useSkillName'
 
 const router = useRouter()
+const route = useRoute()
 const { t } = useI18n()
+const { resolveSkillName } = useSkillName()
 const agents = ref<Agent[]>([])
 const searchText = ref('')
 const activeFilter = ref('all')
@@ -456,6 +606,150 @@ const advancedToolsOpen = ref(false)
 // Binding state
 const availableSkills = ref<any[]>([])
 const availableTools = ref<any[]>([])
+const skillBindingSearch = ref('')
+const toolBindingSearch = ref('')
+
+const filteredAvailableSkills = computed(() => filterAgentBindingItems(availableSkills.value, skillBindingSearch.value))
+
+/**
+ * Group the flat /tools/available payload by source so the picker
+ * renders one section per origin (built-in, MCP per server). Groups
+ * are stable in insertion order — built-in first because the API
+ * returns them first, then MCP groups in server discovery order.
+ *
+ * <p>For each row we also pre-compute {@code _isSelected} /
+ * {@code _isDisabled} so the template doesn't have to derive them from
+ * {@code tool.name} alone. With hash-collision and duplicate-raw rows
+ * sharing the same {@code name} as the bindable twin, naively using
+ * {@code selectedToolNames.includes(tool.name)} would mark both checked
+ * and let the user uncheck the unavailable one — the unchecked twin
+ * would silently mutate the bound name. The pre-computed flags decouple
+ * each row's UI state from any sibling row that shares its prefixed
+ * name.
+ */
+const availableToolGroups = computed(() => {
+  const groups: Record<string, { groupId: string; label: string; tools: any[] }> = {}
+  const order: string[] = []
+
+  // Names that any available row claims. Unavailable rows whose name is
+  // also held by an available row are "shadowed" — they must never look
+  // selected and must never accept a click. Unavailable rows whose name
+  // ISN'T in this set are orphans (e.g. a saved binding whose tool got
+  // removed upstream); the user must still be able to uncheck them.
+  const bindableNames = new Set<string>()
+  // Names that appear anywhere in availableTools (with either flag). Any
+  // entry in selectedToolNames whose name is not in this set is a
+  // "catalog-orphan" — saved before the upstream catalog dropped it —
+  // and needs a synthesized row so the user can uncheck it.
+  const knownNames = new Set<string>()
+  for (const t of availableTools.value) {
+    knownNames.add(t.name)
+    if (t.available) bindableNames.add(t.name)
+  }
+
+  for (const t of availableTools.value) {
+    const key = t.groupId || (t.source === 'mcp' ? `mcp:${t.providerId}` : 'builtin')
+    if (!groups[key]) {
+      const label = t.group || (t.source === 'mcp' ? `MCP · ${t.providerName ?? ''}` : t.source || 'tools')
+      groups[key] = { groupId: key, label, tools: [] }
+      order.push(key)
+    }
+
+    const inSelection = selectedToolNames.value.includes(t.name)
+    const isOrphanUnavailable = !t.available && !bindableNames.has(t.name)
+    // selected: only the bindable row owns the name; orphan unavailable
+    // rows reflect their own selection state so the user can clean them up.
+    const _isSelected = (t.available || isOrphanUnavailable) && inSelection
+    // disabled: shadowed rows are hard-disabled (let the bindable twin
+    // own the click); orphan unavailable rows allow only "uncheck"
+    // (currently-selected → enabled; not selected → disabled).
+    const _isDisabled = !t.available && !(isOrphanUnavailable && inSelection)
+    groups[key].tools.push({ ...t, _isSelected, _isDisabled, _isOrphanUnavailable: isOrphanUnavailable })
+  }
+
+  // Catalog-orphan synthesis: any name in the existing binding that
+  // /tools/available no longer returns at all. The backend save path
+  // permits removing such names ("keeps" don't validate), but without a
+  // visible row the user has no way to trigger the removal. Render them
+  // in their own group; uncheck removes them from selectedToolNames and
+  // the synthesized row vanishes on the next computed pass (the name is
+  // no longer in selectedToolNames).
+  const orphanNames = selectedToolNames.value.filter((n) => !knownNames.has(n))
+  if (orphanNames.length > 0) {
+    const orphanGroupId = 'orphan'
+    groups[orphanGroupId] = {
+      groupId: orphanGroupId,
+      label: t('agents.binding.toolOrphanGroup'),
+      tools: orphanNames.map((n) => ({
+        rowId: `orphan#${n}`,
+        source: 'orphan',
+        providerId: null,
+        providerName: null,
+        name: n,
+        rawName: n,
+        description: t('agents.binding.toolOrphanDescription'),
+        group: t('agents.binding.toolOrphanGroup'),
+        groupId: orphanGroupId,
+        stale: false,
+        available: false,
+        unavailableReason: 'NOT_IN_CATALOG',
+        // Always selected (it is, by definition, in selectedToolNames)
+        // and always uncheckable so the user can remove it.
+        _isSelected: true,
+        _isDisabled: false,
+        _isOrphanUnavailable: true,
+      })),
+    }
+    order.push(orphanGroupId)
+  }
+  return order.map((k) => groups[k])
+})
+
+const filteredAvailableToolGroups = computed(() => filterAgentToolGroups(availableToolGroups.value, toolBindingSearch.value))
+
+/**
+ * True when at least one ticked tool is an MCP tool. The backend reads
+ * this as a deliberate per-agent MCP scope: only ticked MCP tools stay
+ * in the effective allowlist. When false, every enabled MCP tool is
+ * auto-included instead. Drives the MCP group badge in the picker.
+ */
+const anyMcpToolSelected = computed(() =>
+  availableTools.value.some((tool) => tool.source === 'mcp' && selectedToolNames.value.includes(tool.name)),
+)
+
+/**
+ * Manual checkbox handler — replaces v-model on the picker row so that
+ * two rows sharing a tool name (collision/duplicate twins) don't drag
+ * each other's selection state via Vue's v-model auto-sync.
+ */
+function onToolToggle(toolName: string, event: Event) {
+  const target = event.target as HTMLInputElement
+  if (target.checked) {
+    if (!selectedToolNames.value.includes(toolName)) {
+      selectedToolNames.value.push(toolName)
+    }
+  } else {
+    selectedToolNames.value = selectedToolNames.value.filter((n) => n !== toolName)
+  }
+}
+
+/**
+ * Skill checkbox handler. Issue #184 — the row is driven by an explicit
+ * {@code :checked} expression instead of {@code v-model} so the visual
+ * checked state can be suppressed when {@code skillsDisabled} is on
+ * without dropping the picks from {@code selectedSkillIds}. Toggling
+ * the disable flag back off restores the prior selection in one click.
+ */
+function onSkillToggle(skillId: number | string, event: Event) {
+  const target = event.target as HTMLInputElement
+  if (target.checked) {
+    if (!selectedSkillIds.value.includes(skillId as number)) {
+      selectedSkillIds.value.push(skillId as number)
+    }
+  } else {
+    selectedSkillIds.value = selectedSkillIds.value.filter((id) => id !== skillId)
+  }
+}
 const selectedSkillIds = ref<number[]>([])
 const selectedToolNames = ref<string[]>([])
 // RFC-009 PR-3: per-agent provider preference order
@@ -492,6 +786,13 @@ const defaultForm = (): Partial<Agent> & { name: string; defaultThinkingLevel: s
   tags: '',
   enabled: true,
   defaultThinkingLevel: null,
+  // Agent type declares this as `string | undefined`; using `undefined` keeps
+  // the Partial<Agent> shape happy without widening the type to allow null.
+  workspaceBasePath: undefined,
+  // Issue #184 — explicit opt-out flags. Default false matches the legacy
+  // "zero rows = inherit global default" contract for newly-created agents.
+  skillsDisabled: false,
+  toolsDisabled: false,
 })
 
 const form = ref(defaultForm())
@@ -531,19 +832,28 @@ const filteredAgents = computed(() => {
   return list
 })
 
-// Live signal for the "see what's running" header pill — admin only.
+// Roster ↔ Live view switch — admin only. The running/stuck counts feed the
+// segmented control's pulse + badge so you know whether Live is worth a look.
 const isAdminRole = computed(() => (localStorage.getItem('role') || 'user') === 'admin')
-const backstageRunning = ref(0)
-const backstageStuck = ref(0)
-let backstagePollTimer: ReturnType<typeof setInterval> | null = null
+const view = ref<'roster' | 'live'>(
+  route.query.view === 'live' && isAdminRole.value ? 'live' : 'roster',
+)
+const liveRunning = ref(0)
+const liveStuck = ref(0)
+let livePollTimer: ReturnType<typeof setInterval> | null = null
 
-async function refreshBackstagePill() {
+function setView(next: 'roster' | 'live') {
+  view.value = next
+  router.replace({ query: next === 'live' ? { view: 'live' } : {} })
+}
+
+async function refreshLiveCounts() {
   if (!isAdminRole.value) return
   try {
-    const res: any = await backstageApi.snapshot()
+    const res: any = await liveApi.snapshot()
     const data = res?.data ?? res
-    backstageRunning.value = data?.summary?.running ?? 0
-    backstageStuck.value = data?.summary?.stuck ?? 0
+    liveRunning.value = data?.summary?.running ?? 0
+    liveStuck.value = data?.summary?.stuck ?? 0
   } catch {
     // Silent — stale value is preferable to a flapping number.
   }
@@ -555,13 +865,13 @@ onMounted(() => {
   // Failure is non-fatal — the dropdown just shows only "global default".
   loadAvailableModels()
   if (isAdminRole.value) {
-    refreshBackstagePill()
-    backstagePollTimer = setInterval(refreshBackstagePill, 10_000)
+    refreshLiveCounts()
+    livePollTimer = setInterval(refreshLiveCounts, 10_000)
   }
 })
 
 onBeforeUnmount(() => {
-  if (backstagePollTimer) clearInterval(backstagePollTimer)
+  if (livePollTimer) clearInterval(livePollTimer)
 })
 
 async function loadAgents() {
@@ -569,7 +879,7 @@ async function loadAgents() {
     const res: any = await agentApi.list()
     agents.value = res.data || []
   } catch {
-    ElMessage.error(t('agents.messages.loadFailed'))
+    mcToast.error(t('agents.messages.loadFailed'))
   }
 }
 
@@ -599,6 +909,8 @@ function openBlankCreateModal() {
   form.value = defaultForm()
   profileForm.value = emptyProfile()
   modalTab.value = 'basic'
+  skillBindingSearch.value = ''
+  toolBindingSearch.value = ''
   selectedSkillIds.value = []
   selectedToolNames.value = []
   selectedProviderIds.value = []
@@ -645,11 +957,11 @@ async function applyTemplate(id: string) {
   applyingTemplate.value = true
   try {
     await templateApi.apply(id)
-    ElMessage.success(t('agents.templates.applied'))
+    mcToast.success(t('agents.templates.applied'))
     showTemplateSelector.value = false
     await loadAgents()
-  } catch {
-    ElMessage.error(t('agents.messages.saveFailed'))
+  } catch (e: any) {
+    mcToast.error(e?.message || t('agents.messages.saveFailed'))
   } finally {
     applyingTemplate.value = false
   }
@@ -668,9 +980,14 @@ async function openEditModal(agent: Agent) {
     tags: agent.tags || '',
     enabled: agent.enabled,
     defaultThinkingLevel: (agent as any).defaultThinkingLevel || null,
+    workspaceBasePath: agent.workspaceBasePath || undefined,
+    skillsDisabled: agent.skillsDisabled === true,
+    toolsDisabled: agent.toolsDisabled === true,
   }
   profileForm.value = parsePrompt(agent.systemPrompt)
   modalTab.value = 'basic'
+  skillBindingSearch.value = ''
+  toolBindingSearch.value = ''
   showModal.value = true
 
   // Load available skills/tools/providers and current bindings in parallel
@@ -679,7 +996,10 @@ async function openEditModal(agent: Agent) {
       // RFC-042: /skills is now paginated; binding dropdown only needs enabled skills,
       // so listEnabled() is both semantically correct and shape-stable (returns array).
       skillApi.listEnabled(),
-      toolApi.list(),
+      // /tools/available aggregates built-in tools + every MCP-discovered
+      // tool grouped by server, with stale/available flags so the picker
+      // matches the runtime callback set exactly.
+      toolApi.listAvailable(),
       modelApi.listProviders(),
       agentBindingApi.listSkills(agent.id),
       agentBindingApi.listTools(agent.id),
@@ -709,6 +1029,8 @@ async function openEditModal(agent: Agent) {
 function closeModal() {
   showModal.value = false
   editingAgent.value = null
+  skillBindingSearch.value = ''
+  toolBindingSearch.value = ''
 }
 
 async function saveAgent() {
@@ -728,20 +1050,51 @@ async function saveAgent() {
       agentId = res.data?.id
     }
 
-    // Save bindings (only for existing agents or after create returns id)
+    // Sequential binding saves (issue #184). Two coupled concerns:
+    //
+    // 1. Disabled-flag intent must win over stale picks. The opt-out
+    //    toggles only disable the picker visually — selectedSkillIds /
+    //    selectedToolNames keep whatever was previously bound. If we sent
+    //    those stale picks to setSkills/setTools while the flag is on, the
+    //    backend's auto-clear self-heals the flag back to false (because
+    //    "non-empty save = concrete commitment"), and the user's "disable
+    //    everything" intent vanishes silently. So we clear the array here
+    //    before sending — saving [] preserves the flag, and the runtime
+    //    contract ("flag wins over rows") is honored.
+    //
+    // 2. Sequential order, not Promise.all. Parallel binding calls would
+    //    leave half-applied state on a partial failure; serial means we
+    //    know exactly which side persisted and can pull the authoritative
+    //    server state back if anything throws.
+    const skillIdsToSave = form.value.skillsDisabled ? [] : selectedSkillIds.value
+    const toolNamesToSave = form.value.toolsDisabled ? [] : selectedToolNames.value
+
     if (agentId && editingAgent.value) {
-      await Promise.all([
-        agentBindingApi.setSkills(agentId, selectedSkillIds.value),
-        agentBindingApi.setTools(agentId, selectedToolNames.value),
-        agentBindingApi.setProviderPreferences(agentId, selectedProviderIds.value),
-      ])
+      try {
+        await agentBindingApi.setSkills(agentId, skillIdsToSave)
+        await agentBindingApi.setTools(agentId, toolNamesToSave)
+        await agentBindingApi.setProviderPreferences(agentId, selectedProviderIds.value)
+      } catch (bindingError: any) {
+        mcToast.error(bindingError?.message || t('agents.messages.saveFailed'))
+        // Pull the authoritative server state back into the editing form so
+        // the user sees what actually persisted instead of stale picks.
+        try {
+          const fresh: any = await agentApi.get(agentId)
+          if (fresh?.data) {
+            await openEditModal(fresh.data)
+          }
+        } catch {
+          // Reload failure on top of binding failure: best effort, stop here.
+        }
+        return
+      }
     }
 
-    ElMessage.success(t('agents.messages.saveSuccess'))
+    mcToast.success(t('agents.messages.saveSuccess'))
     closeModal()
     await loadAgents()
-  } catch {
-    ElMessage.error(t('agents.messages.saveFailed'))
+  } catch (e: any) {
+    mcToast.error(e?.message || t('agents.messages.saveFailed'))
   }
 }
 
@@ -754,10 +1107,10 @@ async function deleteAgent(agent: Agent) {
   if (!ok) return
   try {
     await agentApi.delete(agent.id)
-    ElMessage.success(t('agents.messages.deleteSuccess'))
+    mcToast.success(t('agents.messages.deleteSuccess'))
     await loadAgents()
   } catch {
-    ElMessage.error(t('agents.messages.deleteFailed'))
+    mcToast.error(t('agents.messages.deleteFailed'))
   }
 }
 
@@ -773,10 +1126,10 @@ function goToChat(agent: Agent) {
 async function toggleAgent(agent: Agent) {
   try {
     await agentApi.update(agent.id, { ...agent, enabled: !agent.enabled })
-    ElMessage.success(t('agents.messages.toggleSuccess'))
+    mcToast.success(t('agents.messages.toggleSuccess'))
     await loadAgents()
   } catch {
-    ElMessage.error(t('agents.messages.toggleFailed'))
+    mcToast.error(t('agents.messages.toggleFailed'))
   }
 }
 </script>
@@ -784,92 +1137,87 @@ async function toggleAgent(agent: Agent) {
 <style scoped>
 .agents-page { gap: 18px; }
 
-/* ===== Backstage live pill in page header ===== */
 .header-right {
   display: flex;
   align-items: center;
   gap: 12px;
 }
 
-.live-pill {
+/* ===== Roster / Live segmented switch ===== */
+/* Lives in the header row, level with the New Employee button. */
+.view-switch {
+  display: inline-flex;
+  background: var(--mc-bg-sunken);
+  border: 1px solid var(--mc-border-light);
+  border-radius: 999px;
+  padding: 4px;
+  gap: 2px;
+}
+
+.view-seg {
   display: inline-flex;
   align-items: center;
   gap: 8px;
-  padding: 8px 14px 8px 12px;
+  padding: 6px 18px;
   border-radius: 999px;
-  background: rgba(255, 255, 255, 0.6);
-  border: 1px solid var(--mc-border-light);
+  border: none;
+  background: transparent;
   color: var(--mc-text-secondary);
-  font-size: 12.5px;
+  font-size: 13.5px;
   font-weight: 500;
-  text-decoration: none;
+  font-family: inherit;
   cursor: pointer;
-  transition: all 0.18s ease;
-  backdrop-filter: blur(8px);
+  transition: background 0.2s ease, color 0.2s ease, box-shadow 0.2s ease;
 }
 
-html.dark .live-pill {
-  background: rgba(255, 255, 255, 0.04);
-}
-
-.live-pill:hover {
-  border-color: var(--mc-border);
+.view-seg:hover {
   color: var(--mc-text-primary);
-  transform: translateY(-1px);
 }
 
-.live-pill-dot {
+.view-seg.is-active {
+  background: var(--mc-bg-elevated);
+  color: var(--mc-text-primary);
+  font-weight: 600;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
+}
+
+/* Pulsing dot — the Live segment is alive when runs are in flight. */
+.seg-pulse {
   width: 7px;
   height: 7px;
   border-radius: 50%;
-  background: hsl(155, 55%, 50%);
-  position: relative;
-  animation: live-pill-pulse 2.4s ease-in-out infinite;
+  background: hsl(140, 55%, 48%);
+  animation: seg-pulse 2.4s ease-in-out infinite;
 }
 
-.live-pill-dot::before {
-  content: '';
-  position: absolute;
-  inset: -3px;
-  border-radius: 50%;
-  background: hsla(155, 55%, 50%, 0.3);
-  animation: live-pill-halo 2.4s ease-in-out infinite;
+@keyframes seg-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 hsla(140, 55%, 50%, 0.5); }
+  50%      { box-shadow: 0 0 0 5px hsla(140, 55%, 50%, 0); }
 }
 
-@keyframes live-pill-pulse {
-  0%, 100% { opacity: 1; transform: scale(1); }
-  50%      { opacity: 0.7; transform: scale(0.85); }
+.seg-count {
+  font-family: ui-monospace, SFMono-Regular, 'JetBrains Mono', Menlo, Consolas, monospace;
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: var(--mc-bg-muted);
+  color: var(--mc-text-tertiary);
 }
 
-@keyframes live-pill-halo {
-  0%, 100% { opacity: 0; transform: scale(0.85); }
-  50%      { opacity: 1; transform: scale(1.6); }
+.view-seg.is-active .seg-count {
+  background: var(--mc-accent-soft);
+  color: var(--mc-accent);
 }
 
-.live-pill--alert {
-  background: linear-gradient(135deg, hsla(28, 90%, 60%, 0.12), hsla(20, 90%, 55%, 0.16));
-  border-color: hsla(20, 80%, 55%, 0.32);
-  color: hsl(20, 70%, 40%);
+/* Stuck runs turn the badge warm — you should look without switching. */
+.seg-count.warn {
+  background: hsla(20, 90%, 55%, 0.18);
+  color: hsl(20, 75%, 42%);
 }
 
-.live-pill--alert:hover {
-  background: linear-gradient(135deg, hsla(28, 90%, 60%, 0.2), hsla(20, 90%, 55%, 0.25));
-  color: hsl(20, 75%, 35%);
-}
-
-.live-pill--alert .live-pill-dot {
-  background: hsl(20, 80%, 55%);
-  animation-duration: 4s;
-}
-
-.live-pill--alert .live-pill-dot::before {
-  background: hsla(20, 80%, 55%, 0.32);
-  animation-duration: 4s;
-}
-
-.live-pill-text {
-  letter-spacing: -0.005em;
-  white-space: nowrap;
+html.dark .seg-count.warn {
+  color: hsl(28, 80%, 70%);
 }
 
 .btn-primary { display: flex; align-items: center; gap: 6px; padding: 10px 16px; background: linear-gradient(135deg, var(--mc-primary), var(--mc-primary-hover)); color: white; border: none; border-radius: 14px; font-size: 14px; font-weight: 600; cursor: pointer; transition: background 0.15s, transform 0.15s; box-shadow: var(--mc-shadow-soft); }
@@ -1064,6 +1412,14 @@ html.dark .live-pill {
   border-radius: 9px; background: var(--mc-primary); color: white;
   font-size: 11px; font-weight: 600;
 }
+/* Issue #184: "off" variant for the disable-all state. Neutral grey instead
+   of brand orange because the badge represents a constraint, not a count. */
+.tab-badge--off {
+  min-width: auto; padding: 0 8px;
+  background: var(--mc-bg-sunken, rgba(0,0,0,0.08));
+  color: var(--mc-text-tertiary);
+  border: 1px solid var(--mc-border-light);
+}
 
 /* Binding Tab */
 .binding-tab { min-height: 200px; }
@@ -1095,6 +1451,70 @@ html.dark .live-pill {
   margin: 0;
 }
 .binding-empty { padding: 40px; text-align: center; color: var(--mc-text-tertiary); font-size: 14px; }
+.binding-empty--compact { padding: 24px 12px; }
+/* Issue #184 — opt-out row that sits above the picker list. */
+.binding-disable-row {
+  margin: 0 0 12px;
+  padding: 12px 14px;
+  border: 1px dashed var(--mc-border);
+  border-radius: 8px;
+  background: var(--mc-bg-sunken);
+}
+.binding-disable-label {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  cursor: pointer;
+}
+.binding-disable-checkbox {
+  flex-shrink: 0;
+  accent-color: var(--mc-primary);
+  width: 16px;
+  height: 16px;
+  margin-top: 2px;
+}
+.binding-disable-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 13px;
+  color: var(--mc-text-primary);
+  line-height: 1.4;
+}
+.binding-disable-text strong { font-weight: 600; }
+.binding-disable-hint {
+  font-size: 12px;
+  color: var(--mc-text-tertiary);
+  line-height: 1.5;
+}
+/* When the opt-out is on, the picker list is still visible (so the user
+   can see what they're disabling) but rendered inert — no hover affordance,
+   greyed-out interactions. */
+.binding-search--disabled,
+.binding-list--disabled { opacity: 0.45; pointer-events: none; }
+.binding-item--inert { cursor: not-allowed; }
+.binding-search {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 10px;
+  padding: 8px 10px;
+  border: 1px solid var(--mc-border);
+  border-radius: 8px;
+  background: var(--mc-bg-sunken);
+  color: var(--mc-text-tertiary);
+}
+.binding-search svg { flex-shrink: 0; }
+.binding-search input {
+  width: 100%;
+  min-width: 0;
+  border: 0;
+  outline: none;
+  background: transparent;
+  color: var(--mc-text-primary);
+  font-size: 13px;
+}
+.binding-search input::placeholder { color: var(--mc-text-tertiary); }
 .binding-list { display: flex; flex-direction: column; gap: 6px; }
 .binding-item {
   display: flex; align-items: center; gap: 10px; padding: 10px 12px;
@@ -1258,6 +1678,19 @@ html.dark .live-pill {
 .advanced-tools-count { padding: 1px 8px; background: var(--mc-primary-bg); color: var(--mc-primary); border-radius: 999px; font-size: 11px; font-weight: 700; }
 .advanced-tools-chevron { color: var(--mc-text-tertiary); font-size: 12px; }
 .advanced-tools-note { font-style: italic; color: var(--mc-text-tertiary); margin-top: 4px; }
+
+/* MCP group header: inline "auto-available" tag next to the label so users
+   know enabled MCP tools work without being ticked. */
+.binding-group-header { display: flex; align-items: center; gap: 8px; }
+.binding-group-note {
+  font-size: 11px;
+  font-weight: 500;
+  padding: 2px 8px;
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--mc-primary) 12%, transparent);
+  color: var(--mc-primary);
+  cursor: help;
+}
 
 /* Icon picker trigger — replaces the old free-text icon input. Tile shape
  * mirrors SkillMarket's identity-icon-row so the create/edit affordance
