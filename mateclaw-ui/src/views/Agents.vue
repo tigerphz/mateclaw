@@ -12,28 +12,18 @@
             <!-- Roster / Live view switch — one team, two states. Admin only.
                  Sits on the header line, level with the New Employee button. -->
             <div v-if="isAdminRole" class="view-switch">
-              <button
-                class="view-seg"
-                :class="{ 'is-active': view === 'roster' }"
-                @click="setView('roster')"
-              >{{ t('agents.views.roster') }}</button>
-              <button
-                class="view-seg"
-                :class="{ 'is-active': view === 'live' }"
-                @click="setView('live')"
-              >
+              <button class="view-seg" :class="{ 'is-active': view === 'roster' }" @click="setView('roster')">{{
+                t('agents.views.roster') }}</button>
+              <button class="view-seg" :class="{ 'is-active': view === 'live' }" @click="setView('live')">
                 <span v-if="liveRunning > 0" class="seg-pulse"></span>
                 {{ t('agents.views.live') }}
-                <span
-                  v-if="liveRunning > 0"
-                  class="seg-count"
-                  :class="{ warn: liveStuck > 0 }"
-                >{{ liveRunning }}</span>
+                <span v-if="liveRunning > 0" class="seg-count" :class="{ warn: liveStuck > 0 }">{{ liveRunning }}</span>
               </button>
             </div>
             <button class="btn-primary" @click="openCreateModal">
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
+                <line x1="12" y1="5" x2="12" y2="19" />
+                <line x1="5" y1="12" x2="19" y2="12" />
               </svg>
               {{ t('agents.newAgent') }}
             </button>
@@ -42,101 +32,99 @@
 
         <!-- Roster: the team -->
         <template v-if="view === 'roster'">
-        <div class="agents-toolbar mc-surface-card">
-          <div class="filter-bar">
-            <div class="search-box">
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
-              </svg>
-              <input v-model="searchText" :placeholder="t('agents.search')" class="search-input" />
-            </div>
-            <div class="filter-tabs">
-              <button v-for="tab in filterTabs" :key="tab.value" class="filter-tab"
-                :class="{ active: activeFilter === tab.value }" @click="activeFilter = tab.value">
-                {{ t(tab.key) }}
-              </button>
+          <div class="agents-toolbar mc-surface-card">
+            <div class="filter-bar">
+              <div class="search-box">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <circle cx="11" cy="11" r="8" />
+                  <line x1="21" y1="21" x2="16.65" y2="16.65" />
+                </svg>
+                <input v-model="searchText" :placeholder="t('agents.search')" class="search-input" />
+              </div>
+              <div class="filter-tabs">
+                <button v-for="tab in filterTabs" :key="tab.value" class="filter-tab"
+                  :class="{ active: activeFilter === tab.value }" @click="activeFilter = tab.value">
+                  {{ t(tab.key) }}
+                </button>
+              </div>
             </div>
           </div>
-        </div>
 
-        <!-- Agent card grid -->
-        <div class="agent-grid" v-if="filteredAgents.length > 0">
-          <div
-            v-for="agent in filteredAgents"
-            :key="agent.id"
-            class="agent-card mc-surface-card"
-            :class="{ 'agent-card--disabled': !agent.enabled }"
-          >
-            <!--
+          <!-- Agent card grid -->
+          <div class="agent-grid" v-if="filteredAgents.length > 0">
+            <div v-for="agent in filteredAgents" :key="agent.id" class="agent-card mc-surface-card"
+              :class="{ 'agent-card--disabled': !agent.enabled }">
+              <!--
               Employee-card layout: avatar, name, one-line tagline, primary
               chat action, and a hover-revealed overflow row. Anything that
               isn't identity-or-action lives behind the overflow row to keep
               the card readable at a glance.
             -->
-            <div class="agent-card__top">
-              <span
-                class="agent-card__avatar"
-                :class="{ 'agent-card__avatar--off': !agent.enabled }"
-                :style="{ color: agentIconColor(agent.icon) }"
-              >
-                <SkillIcon :value="agent.icon" :size="40" :fallback="'🧑‍💼'" />
-              </span>
-              <div class="agent-card__identity">
-                <h3 class="agent-card__name">{{ agent.name }}</h3>
-                <p class="agent-card__tagline">
-                  {{ agentTagline(agent) || t('agents.messages.noTagline') }}
-                </p>
+              <div class="agent-card__top">
+                <span class="agent-card__avatar" :class="{ 'agent-card__avatar--off': !agent.enabled }"
+                  :style="{ color: agentIconColor(agent.icon) }">
+                  <SkillIcon :value="agent.icon" :size="40" :fallback="'🧑‍💼'" />
+                </span>
+                <div class="agent-card__identity">
+                  <h3 class="agent-card__name">{{ agent.name }}</h3>
+                  <p class="agent-card__tagline">
+                    {{ agentTagline(agent) || t('agents.messages.noTagline') }}
+                  </p>
+                </div>
               </div>
-            </div>
 
-            <div class="agent-card__action-row">
-              <button class="agent-card__primary" @click="goToChat(agent)">
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                  <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
-                </svg>
-                {{ t('agents.actions.chat') }}
-              </button>
-              <div class="agent-card__overflow">
-                <label class="toggle-switch toggle-switch--sm" :title="t('agents.fields.enabled')">
-                  <input type="checkbox" :checked="agent.enabled" @change="toggleAgent(agent)" />
-                  <span class="toggle-slider"></span>
-                </label>
-                <button class="action-btn" :title="t('agents.tabs.context')" @click="goToAgentContextFor(agent)">
-                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                    <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/>
+              <div class="agent-card__action-row">
+                <button class="agent-card__primary" @click="goToChat(agent)">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                    stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
                   </svg>
+                  {{ t('agents.actions.chat') }}
                 </button>
-                <button class="action-btn" :title="t('agents.actions.edit')" @click="openEditModal(agent)">
-                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                    <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
-                    <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
-                  </svg>
-                </button>
-                <button class="action-btn danger" :title="t('agents.actions.delete')" @click="deleteAgent(agent)">
-                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                    <polyline points="3 6 5 6 21 6"/>
-                    <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/>
-                  </svg>
-                </button>
+                <div class="agent-card__overflow">
+                  <label class="toggle-switch toggle-switch--sm" :title="t('agents.fields.enabled')">
+                    <input type="checkbox" :checked="agent.enabled" @change="toggleAgent(agent)" />
+                    <span class="toggle-slider"></span>
+                  </label>
+                  <button class="action-btn" :title="t('agents.tabs.context')" @click="goToAgentContextFor(agent)">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                      <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+                      <polyline points="14 2 14 8 20 8" />
+                      <line x1="16" y1="13" x2="8" y2="13" />
+                      <line x1="16" y1="17" x2="8" y2="17" />
+                    </svg>
+                  </button>
+                  <button class="action-btn" :title="t('agents.actions.edit')" @click="openEditModal(agent)">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                      <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7" />
+                      <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z" />
+                    </svg>
+                  </button>
+                  <button class="action-btn danger" :title="t('agents.actions.delete')" @click="deleteAgent(agent)">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                      <polyline points="3 6 5 6 21 6" />
+                      <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2" />
+                    </svg>
+                  </button>
+                </div>
               </div>
             </div>
           </div>
-        </div>
 
-        <!-- Empty state -->
-        <div v-else class="empty-state mc-surface-card">
-          <div class="empty-icon">🤖</div>
-          <h3>{{ t('agents.emptyTitle') }}</h3>
-          <p>{{ t('agents.emptyDesc') }}</p>
-          <button class="btn-primary" @click="openCreateModal">{{ t('agents.newAgent') }}</button>
-        </div>
+          <!-- Empty state -->
+          <div v-else class="empty-state mc-surface-card">
+            <div class="empty-icon">🤖</div>
+            <h3>{{ t('agents.emptyTitle') }}</h3>
+            <p>{{ t('agents.emptyDesc') }}</p>
+            <button class="btn-primary" @click="openCreateModal">{{ t('agents.newAgent') }}</button>
+          </div>
         </template>
 
         <!-- Live: what the team is doing right now -->
         <LivePanel v-else />
       </div>
     </div>
-    
+
 
     <!-- Template Selector Modal -->
     <div v-if="showTemplateSelector" class="modal-overlay">
@@ -145,29 +133,28 @@
           <h2>{{ t('agents.templates.title') }}</h2>
           <button class="modal-close" @click="showTemplateSelector = false">
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+              <line x1="18" y1="6" x2="6" y2="18" />
+              <line x1="6" y1="6" x2="18" y2="18" />
             </svg>
           </button>
         </div>
         <div class="modal-body">
           <p class="template-desc">{{ t('agents.templates.desc') }}</p>
           <div class="template-grid">
-            <div
-              v-for="tpl in templates"
-              :key="tpl.id"
-              class="template-card mc-surface-card"
-              :class="{ applying: applyingTemplate }"
-              @click="!applyingTemplate && applyTemplate(tpl.id)"
-            >
+            <div v-for="tpl in templates" :key="tpl.id" class="template-card mc-surface-card"
+              :class="{ applying: applyingTemplate }" @click="!applyingTemplate && applyTemplate(tpl.id)">
               <div class="template-icon" :style="{ color: agentIconColor(tpl.icon) }">
                 <SkillIcon :value="tpl.icon" :size="28" :fallback="'🧑‍💼'" />
               </div>
               <div class="template-info">
                 <h4 class="template-name">{{ $i18n.locale === 'zh-CN' && tpl.nameZh ? tpl.nameZh : tpl.name }}</h4>
-                <p class="template-detail">{{ $i18n.locale === 'zh-CN' && tpl.descriptionZh ? tpl.descriptionZh : tpl.description }}</p>
+                <p class="template-detail">{{ $i18n.locale === 'zh-CN' && tpl.descriptionZh ? tpl.descriptionZh :
+                  tpl.description }}</p>
               </div>
               <div class="template-tags">
-                <span v-for="tag in (tpl.tags || '').split(',').filter(Boolean)" :key="tag" class="tag-chip">{{ tag.trim() }}</span>
+                <span v-for="tag in (tpl.tags || '').split(',').filter(Boolean)" :key="tag" class="tag-chip">{{
+                  tag.trim()
+                  }}</span>
               </div>
             </div>
           </div>
@@ -175,7 +162,8 @@
         <div class="modal-footer">
           <button class="btn-secondary" @click="openBlankCreateModal">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
+              <line x1="12" y1="5" x2="12" y2="19" />
+              <line x1="5" y1="12" x2="19" y2="12" />
             </svg>
             {{ t('agents.templates.skip') }}
           </button>
@@ -184,11 +172,8 @@
     </div>
 
     <!-- Shared icon picker — opened from the Basic tab's [Pick icon] button. -->
-    <SkillIconPicker
-      v-model:visible="iconPickerVisible"
-      :model-value="form.icon"
-      @apply="(v: string) => (form.icon = v)"
-    />
+    <SkillIconPicker v-model:visible="iconPickerVisible" :model-value="form.icon"
+      @apply="(v: string) => (form.icon = v)" />
 
     <!-- Create/Edit Modal -->
     <div v-if="showModal" class="modal-overlay">
@@ -197,7 +182,8 @@
           <h2>{{ editingAgent ? t('agents.modal.editTitle') : t('agents.modal.newTitle') }}</h2>
           <button class="modal-close" @click="closeModal">
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+              <line x1="18" y1="6" x2="6" y2="18" />
+              <line x1="6" y1="6" x2="18" y2="18" />
             </svg>
           </button>
         </div>
@@ -207,21 +193,28 @@
             <button class="modal-tab" :class="{ active: modalTab === 'basic' }" @click="modalTab = 'basic'">
               {{ t('agents.tabs.basic', 'Basic') }}
             </button>
-            <button v-if="editingAgent" class="modal-tab" :class="{ active: modalTab === 'skills' }" @click="modalTab = 'skills'">
+            <button v-if="editingAgent" class="modal-tab" :class="{ active: modalTab === 'skills' }"
+              @click="modalTab = 'skills'">
               {{ t('agents.tabs.skills', 'Skills') }}
               <!-- Issue #184: when the disable flag is on, suppress the
                    stale-pick count badge and show an "off" state instead —
                    the count would otherwise contradict the disable toggle
                    visible in the tab content. -->
-              <span v-if="form.skillsDisabled" class="tab-badge tab-badge--off">{{ t('agents.binding.disableAllSkillsBadge') }}</span>
+              <span v-if="form.skillsDisabled" class="tab-badge tab-badge--off">{{
+                t('agents.binding.disableAllSkillsBadge')
+                }}</span>
               <span v-else-if="selectedSkillIds.length" class="tab-badge">{{ selectedSkillIds.length }}</span>
             </button>
-            <button v-if="editingAgent" class="modal-tab" :class="{ active: modalTab === 'tools' }" @click="modalTab = 'tools'">
+            <button v-if="editingAgent" class="modal-tab" :class="{ active: modalTab === 'tools' }"
+              @click="modalTab = 'tools'">
               {{ t('agents.tabs.tools', 'Tools') }}
-              <span v-if="form.toolsDisabled" class="tab-badge tab-badge--off">{{ t('agents.binding.disableAllToolsBadge') }}</span>
+              <span v-if="form.toolsDisabled" class="tab-badge tab-badge--off">{{
+                t('agents.binding.disableAllToolsBadge')
+                }}</span>
               <span v-else-if="selectedToolNames.length" class="tab-badge">{{ selectedToolNames.length }}</span>
             </button>
-            <button v-if="editingAgent" class="modal-tab" :class="{ active: modalTab === 'providers' }" @click="modalTab = 'providers'">
+            <button v-if="editingAgent" class="modal-tab" :class="{ active: modalTab === 'providers' }"
+              @click="modalTab = 'providers'">
               {{ t('agents.tabs.providers', 'Providers') }}
               <span v-if="selectedProviderIds.length" class="tab-badge">{{ selectedProviderIds.length }}</span>
             </button>
@@ -279,7 +272,8 @@
             </div>
             <div class="form-group full-width">
               <label class="form-label">{{ t('agents.fields.workspaceBasePath') }}</label>
-              <input v-model="form.workspaceBasePath" class="form-input" :placeholder="t('agents.placeholders.workspaceBasePath')" />
+              <input v-model="form.workspaceBasePath" class="form-input"
+                :placeholder="t('agents.placeholders.workspaceBasePath')" />
               <p class="form-hint">{{ t('agents.fields.workspaceBasePathHint') }}</p>
             </div>
             <!--
@@ -304,19 +298,22 @@
             </div>
             <div class="form-group full-width">
               <label class="form-label">{{ t('agents.fields.backstory') }}</label>
-              <textarea v-model="profileForm.backstory" class="form-textarea" rows="3" :placeholder="t('agents.placeholders.backstory')"></textarea>
+              <textarea v-model="profileForm.backstory" class="form-textarea" rows="3"
+                :placeholder="t('agents.placeholders.backstory')"></textarea>
               <p class="form-hint">{{ t('agents.fields.backstoryHint') }}</p>
             </div>
             <div class="form-group full-width">
               <label class="form-label">{{ t('agents.fields.description') }}</label>
-              <input v-model="form.description" class="form-input" :placeholder="t('agents.placeholders.description')" />
+              <input v-model="form.description" class="form-input"
+                :placeholder="t('agents.placeholders.description')" />
             </div>
             <div class="form-group full-width">
               <details class="advanced-prompt">
                 <summary class="advanced-prompt__summary">
                   {{ t('agents.fields.extraInstructions') }}
                 </summary>
-                <textarea v-model="profileForm.extra" class="form-textarea" rows="4" :placeholder="t('agents.placeholders.extraInstructions')"></textarea>
+                <textarea v-model="profileForm.extra" class="form-textarea" rows="4"
+                  :placeholder="t('agents.placeholders.extraInstructions')"></textarea>
                 <p class="form-hint">{{ t('agents.fields.extraInstructionsHint') }}</p>
               </details>
             </div>
@@ -357,21 +354,19 @@
             <template v-else>
               <div class="binding-search" :class="{ 'binding-search--disabled': form.skillsDisabled }">
                 <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                  <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
+                  <circle cx="11" cy="11" r="8" />
+                  <line x1="21" y1="21" x2="16.65" y2="16.65" />
                 </svg>
-                <input v-model="skillBindingSearch" :placeholder="t('agents.binding.searchSkills')" :disabled="form.skillsDisabled" />
+                <input v-model="skillBindingSearch" :placeholder="t('agents.binding.searchSkills')"
+                  :disabled="form.skillsDisabled" />
               </div>
-              <div v-if="filteredAvailableSkills.length === 0" class="binding-empty binding-empty--compact">{{ t('agents.binding.noMatchingSkills') }}</div>
+              <div v-if="filteredAvailableSkills.length === 0" class="binding-empty binding-empty--compact">{{
+                t('agents.binding.noMatchingSkills') }}</div>
               <div v-else class="binding-list" :class="{ 'binding-list--disabled': form.skillsDisabled }">
-                <label
-                  v-for="skill in filteredAvailableSkills"
-                  :key="skill.id"
-                  class="binding-item"
-                  :class="{
-                    selected: !form.skillsDisabled && selectedSkillIds.includes(skill.id),
-                    'binding-item--inert': form.skillsDisabled,
-                  }"
-                >
+                <label v-for="skill in filteredAvailableSkills" :key="skill.id" class="binding-item" :class="{
+                  selected: !form.skillsDisabled && selectedSkillIds.includes(skill.id),
+                  'binding-item--inert': form.skillsDisabled,
+                }">
                   <!-- Manual :checked instead of v-model: when skillsDisabled
                        is on, the stale picks still live in selectedSkillIds
                        (we keep them so flipping the toggle back off restores
@@ -380,15 +375,13 @@
                        stale checked state from the user without mutating
                        the underlying array. The save path already clears
                        the array on send when the flag is on. -->
-                  <input
-                    type="checkbox"
-                    :value="skill.id"
+                  <input type="checkbox" :value="skill.id"
                     :checked="!form.skillsDisabled && selectedSkillIds.includes(skill.id)"
-                    @change="onSkillToggle(skill.id, $event)"
-                    class="binding-checkbox"
-                    :disabled="form.skillsDisabled"
-                  />
-                  <span class="binding-icon"><SkillIcon :value="skill.icon" :size="20" :fallback="'🧩'" /></span>
+                    @change="onSkillToggle(skill.id, $event)" class="binding-checkbox"
+                    :disabled="form.skillsDisabled" />
+                  <span class="binding-icon">
+                    <SkillIcon :value="skill.icon" :size="20" :fallback="'🧩'" />
+                  </span>
                   <div class="binding-info">
                     <span class="binding-name">{{ resolveSkillName(skill) }}</span>
                     <span v-if="skill.description" class="binding-desc">{{ skill.description?.slice(0, 80) }}</span>
@@ -425,20 +418,24 @@
                  should all behave as if there are no picks, matching the
                  "saving clears bindings" contract. The underlying array is
                  left intact so toggling the flag back off restores them. -->
-            <details class="advanced-tools" :open="(!form.toolsDisabled && selectedToolNames.length > 0) || advancedToolsOpen">
+            <details class="advanced-tools"
+              :open="(!form.toolsDisabled && selectedToolNames.length > 0) || advancedToolsOpen">
               <summary class="advanced-tools-summary" @click.prevent="advancedToolsOpen = !advancedToolsOpen">
                 <span class="advanced-tools-title">
                   {{ t('agents.binding.advancedToolsTitle') }}
-                  <span v-if="!form.toolsDisabled && selectedToolNames.length > 0" class="advanced-tools-count">{{ selectedToolNames.length }}</span>
+                  <span v-if="!form.toolsDisabled && selectedToolNames.length > 0" class="advanced-tools-count">{{
+                    selectedToolNames.length }}</span>
                 </span>
-                <span class="advanced-tools-chevron">{{ (advancedToolsOpen || (!form.toolsDisabled && selectedToolNames.length > 0)) ? '▾' : '▸' }}</span>
+                <span class="advanced-tools-chevron">{{ (advancedToolsOpen || (!form.toolsDisabled &&
+                  selectedToolNames.length > 0)) ? '▾' : '▸' }}</span>
               </summary>
               <p class="binding-hint">{{ t('agents.binding.toolsHint') }}</p>
               <p class="binding-hint advanced-tools-note">{{ t('agents.binding.advancedToolsHint') }}</p>
               <p class="binding-hint advanced-tools-note">{{ t('agents.binding.toolUnionHint') }}</p>
               <div v-if="availableToolGroups.length > 0" class="binding-search">
                 <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                  <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
+                  <circle cx="11" cy="11" r="8" />
+                  <line x1="21" y1="21" x2="16.65" y2="16.65" />
                 </svg>
                 <input v-model="toolBindingSearch" :placeholder="t('agents.binding.searchTools')" />
               </div>
@@ -449,7 +446,8 @@
                    of the catalog) — that case must reach the list so
                    the user can clean those orphans up. -->
               <div v-if="availableToolGroups.length === 0" class="binding-empty">{{ t('agents.binding.noTools') }}</div>
-              <div v-else-if="filteredAvailableToolGroups.length === 0" class="binding-empty binding-empty--compact">{{ t('agents.binding.noMatchingTools') }}</div>
+              <div v-else-if="filteredAvailableToolGroups.length === 0" class="binding-empty binding-empty--compact">{{
+                t('agents.binding.noMatchingTools') }}</div>
               <div v-else class="binding-list">
                 <template v-for="group in filteredAvailableToolGroups" :key="group.groupId">
                   <div class="binding-group-header">
@@ -460,32 +458,23 @@
                          the agent is restricted to the ticked set. To deny
                          an MCP tool when none are ticked, users still have
                          Security → Tool Guard. -->
-                    <span
-                      v-if="group.groupId && group.groupId.startsWith('mcp:')"
-                      class="binding-group-note"
-                      :title="anyMcpToolSelected
-                        ? t('agents.binding.mcpScopedTooltip')
-                        : t('agents.binding.mcpAutoIncludedTooltip')"
-                    >
+                    <span v-if="group.groupId && group.groupId.startsWith('mcp:')" class="binding-group-note" :title="anyMcpToolSelected
+                      ? t('agents.binding.mcpScopedTooltip')
+                      : t('agents.binding.mcpAutoIncludedTooltip')">
                       {{ anyMcpToolSelected
                         ? t('agents.binding.mcpScopedBadge')
                         : t('agents.binding.mcpAutoIncludedBadge') }}
                     </span>
                   </div>
-                  <label
-                    v-for="tool in group.tools"
-                    :key="tool.rowId || `${group.groupId}#${tool.rawName}#${tool.name}`"
-                    class="binding-item"
-                    :class="{
+                  <label v-for="tool in group.tools"
+                    :key="tool.rowId || `${group.groupId}#${tool.rawName}#${tool.name}`" class="binding-item" :class="{
                       selected: !form.toolsDisabled && tool._isSelected,
                       'binding-item--stale': tool.stale,
                       'binding-item--unavailable': !tool.available,
                       'binding-item--inert': form.toolsDisabled,
-                    }"
-                    :title="!tool.available
+                    }" :title="!tool.available
                       ? t('agents.binding.toolUnavailableTooltip', { reason: tool.unavailableReason || '' })
-                      : (tool.stale ? t('agents.binding.toolStaleTooltip') : tool.name)"
-                  >
+                      : (tool.stale ? t('agents.binding.toolStaleTooltip') : tool.name)">
                     <!-- Manual checkbox state. Two rows can share the
                          same tool.name (hash-collision twin or
                          duplicate-raw twin); v-model would auto-sync
@@ -498,13 +487,8 @@
                          when "this agent uses no user-pickable tools"
                          is on. selectedToolNames is preserved so flipping
                          the toggle back off restores the prior selection. -->
-                    <input
-                      type="checkbox"
-                      class="binding-checkbox"
-                      :checked="!form.toolsDisabled && tool._isSelected"
-                      :disabled="tool._isDisabled || form.toolsDisabled"
-                      @change="onToolToggle(tool.name, $event)"
-                    />
+                    <input type="checkbox" class="binding-checkbox" :checked="!form.toolsDisabled && tool._isSelected"
+                      :disabled="tool._isDisabled || form.toolsDisabled" @change="onToolToggle(tool.name, $event)" />
                     <span class="binding-icon">
                       <SkillIcon :value="tool.source === 'mcp' ? '🔌' : '🔧'" :size="20" :fallback="'🔧'" />
                     </span>
@@ -513,7 +497,8 @@
                       <span v-if="tool.description" class="binding-desc">{{ tool.description?.slice(0, 80) }}</span>
                     </div>
                     <span v-if="tool.stale" class="binding-stale-badge">{{ t('agents.binding.toolStaleBadge') }}</span>
-                    <span v-if="!tool.available" class="binding-unavailable-badge">{{ t('agents.binding.toolUnavailableBadge') }}</span>
+                    <span v-if="!tool.available" class="binding-unavailable-badge">{{
+                      t('agents.binding.toolUnavailableBadge') }}</span>
                     <span v-else class="binding-type-badge">{{ tool.source }}</span>
                   </label>
                 </template>
@@ -526,16 +511,13 @@
             <p class="binding-hint">{{ t('agents.binding.providersHint') }}</p>
             <!-- Picked: ordered list with up/down/remove controls -->
             <div v-if="selectedProviderIds.length" class="provider-pref-list">
-              <div
-                v-for="(pid, idx) in selectedProviderIds"
-                :key="pid"
-                class="provider-pref-item"
-              >
+              <div v-for="(pid, idx) in selectedProviderIds" :key="pid" class="provider-pref-item">
                 <span class="provider-pref-rank">{{ idx + 1 }}</span>
                 <span class="provider-pref-name">{{ providerNameById(pid) }}</span>
                 <span class="provider-pref-id">{{ pid }}</span>
                 <button class="provider-pref-btn" :disabled="idx === 0" @click="moveProvider(idx, -1)">↑</button>
-                <button class="provider-pref-btn" :disabled="idx === selectedProviderIds.length - 1" @click="moveProvider(idx, 1)">↓</button>
+                <button class="provider-pref-btn" :disabled="idx === selectedProviderIds.length - 1"
+                  @click="moveProvider(idx, 1)">↓</button>
                 <button class="provider-pref-btn danger" @click="removeProvider(idx)">✕</button>
               </div>
             </div>
@@ -544,12 +526,9 @@
             <!-- Unpicked: click to append -->
             <div v-if="unpickedProviders.length" class="provider-pref-pool">
               <p class="binding-hint" style="margin-top: 14px">{{ t('agents.binding.providersAddHint') }}</p>
-              <button
-                v-for="p in unpickedProviders"
-                :key="p.id"
-                class="provider-pref-add-btn"
-                @click="addProvider(p.id)"
-              >+ {{ p.name }}</button>
+              <button v-for="p in unpickedProviders" :key="p.id" class="provider-pref-add-btn"
+                @click="addProvider(p.id)">+
+                {{ p.name }}</button>
             </div>
           </div>
         </div>
@@ -940,7 +919,7 @@ function moveProvider(idx: number, dir: -1 | 1) {
   const next = idx + dir
   if (next < 0 || next >= selectedProviderIds.value.length) return
   const arr = selectedProviderIds.value
-  ;[arr[idx], arr[next]] = [arr[next], arr[idx]]
+    ;[arr[idx], arr[next]] = [arr[next], arr[idx]]
 }
 
 async function loadTemplates() {
@@ -1135,7 +1114,9 @@ async function toggleAgent(agent: Agent) {
 </script>
 
 <style scoped>
-.agents-page { gap: 18px; }
+.agents-page {
+  gap: 18px;
+}
 
 .header-right {
   display: flex;
@@ -1191,8 +1172,15 @@ async function toggleAgent(agent: Agent) {
 }
 
 @keyframes seg-pulse {
-  0%, 100% { box-shadow: 0 0 0 0 hsla(140, 55%, 50%, 0.5); }
-  50%      { box-shadow: 0 0 0 5px hsla(140, 55%, 50%, 0); }
+
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 hsla(140, 55%, 50%, 0.5);
+  }
+
+  50% {
+    box-shadow: 0 0 0 5px hsla(140, 55%, 50%, 0);
+  }
 }
 
 .seg-count {
@@ -1220,27 +1208,117 @@ html.dark .seg-count.warn {
   color: hsl(28, 80%, 70%);
 }
 
-.btn-primary { display: flex; align-items: center; gap: 6px; padding: 10px 16px; background: linear-gradient(135deg, var(--mc-primary), var(--mc-primary-hover)); color: white; border: none; border-radius: 14px; font-size: 14px; font-weight: 600; cursor: pointer; transition: background 0.15s, transform 0.15s; box-shadow: var(--mc-shadow-soft); }
-.btn-primary:hover { background: var(--mc-primary-hover); }
-.btn-primary:disabled { background: var(--mc-border); cursor: not-allowed; }
-.btn-secondary { padding: 8px 16px; background: var(--mc-bg-elevated); color: var(--mc-text-primary); border: 1px solid var(--mc-border); border-radius: 12px; font-size: 14px; cursor: pointer; }
-.btn-secondary:hover { background: var(--mc-bg-sunken); }
+.btn-primary {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 10px 16px;
+  background: linear-gradient(135deg, var(--mc-primary), var(--mc-primary-hover));
+  color: white;
+  border: none;
+  border-radius: 14px;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s, transform 0.15s;
+  box-shadow: var(--mc-shadow-soft);
+}
 
-.agents-toolbar { padding: 18px; }
-.filter-bar { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
-.search-box { display: flex; align-items: center; gap: 8px; background: var(--mc-bg-muted); border: 1px solid var(--mc-border); border-radius: 14px; padding: 10px 12px; flex: 1; max-width: 360px; }
-.search-box svg { color: var(--mc-text-tertiary); flex-shrink: 0; }
-.search-input { border: none; outline: none; font-size: 14px; color: var(--mc-text-primary); flex: 1; background: transparent; }
-.filter-tabs { display: flex; gap: 6px; flex-wrap: wrap; }
-.filter-tab { padding: 8px 14px; border: 1px solid var(--mc-border); background: var(--mc-bg-muted); border-radius: 999px; font-size: 13px; color: var(--mc-text-secondary); cursor: pointer; transition: all 0.15s; font-weight: 600; }
-.filter-tab:hover { background: var(--mc-bg-sunken); }
-.filter-tab.active { background: var(--mc-primary-bg); border-color: var(--mc-primary); color: var(--mc-primary); font-weight: 500; }
+.btn-primary:hover {
+  background: var(--mc-primary-hover);
+}
+
+.btn-primary:disabled {
+  background: var(--mc-border);
+  cursor: not-allowed;
+}
+
+.btn-secondary {
+  padding: 8px 16px;
+  background: var(--mc-bg-elevated);
+  color: var(--mc-text-primary);
+  border: 1px solid var(--mc-border);
+  border-radius: 12px;
+  font-size: 14px;
+  cursor: pointer;
+}
+
+.btn-secondary:hover {
+  background: var(--mc-bg-sunken);
+}
+
+.agents-toolbar {
+  padding: 18px;
+}
+
+.filter-bar {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+
+.search-box {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: var(--mc-bg-muted);
+  border: 1px solid var(--mc-border);
+  border-radius: 14px;
+  padding: 10px 12px;
+  flex: 1;
+  max-width: 360px;
+}
+
+.search-box svg {
+  color: var(--mc-text-tertiary);
+  flex-shrink: 0;
+}
+
+.search-input {
+  border: none;
+  outline: none;
+  font-size: 14px;
+  color: var(--mc-text-primary);
+  flex: 1;
+  background: transparent;
+}
+
+.filter-tabs {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.filter-tab {
+  padding: 8px 14px;
+  border: 1px solid var(--mc-border);
+  background: var(--mc-bg-muted);
+  border-radius: 999px;
+  font-size: 13px;
+  color: var(--mc-text-secondary);
+  cursor: pointer;
+  transition: all 0.15s;
+  font-weight: 600;
+}
+
+.filter-tab:hover {
+  background: var(--mc-bg-sunken);
+}
+
+.filter-tab.active {
+  background: var(--mc-primary-bg);
+  border-color: var(--mc-primary);
+  color: var(--mc-primary);
+  font-weight: 500;
+}
 
 /* Agent Card Grid */
 .agent-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
   gap: 16px;
+  margin-top: 18px;
 }
 
 .agent-card {
@@ -1343,6 +1421,7 @@ html.dark .seg-count.warn {
   cursor: pointer;
   transition: all 0.15s;
 }
+
 .agent-card__primary:hover {
   border-color: var(--mc-primary);
   color: var(--mc-primary);
@@ -1356,74 +1435,274 @@ html.dark .seg-count.warn {
   opacity: 0;
   transition: opacity 0.18s;
 }
+
 .agent-card:hover .agent-card__overflow,
 .agent-card:focus-within .agent-card__overflow {
   opacity: 1;
 }
 
-.toggle-switch--sm { width: 32px; height: 18px; }
-.toggle-switch--sm .toggle-slider::before { width: 12px; height: 12px; }
-.toggle-switch--sm input:checked + .toggle-slider::before { transform: translateX(14px); }
+.toggle-switch--sm {
+  width: 32px;
+  height: 18px;
+}
 
-.tag { padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 500; }
-.tag-item { background: var(--mc-bg-sunken); color: var(--mc-text-secondary); }
-.text-muted { color: var(--mc-text-tertiary); }
+.toggle-switch--sm .toggle-slider::before {
+  width: 12px;
+  height: 12px;
+}
 
-.toggle-switch { position: relative; display: inline-block; width: 36px; height: 20px; cursor: pointer; flex-shrink: 0; }
-.toggle-switch input { opacity: 0; width: 0; height: 0; }
-.toggle-slider { position: absolute; inset: 0; background: var(--mc-border); border-radius: 20px; transition: 0.2s; }
-.toggle-slider::before { content: ''; position: absolute; width: 14px; height: 14px; left: 3px; top: 3px; background: var(--mc-bg-elevated); border-radius: 50%; transition: 0.2s; }
-.toggle-switch input:checked + .toggle-slider { background: var(--mc-primary); }
-.toggle-switch input:checked + .toggle-slider::before { transform: translateX(16px); }
+.toggle-switch--sm input:checked+.toggle-slider::before {
+  transform: translateX(14px);
+}
 
-.action-btns { display: flex; gap: 4px; }
-.action-btn { width: 30px; height: 30px; border: 1px solid var(--mc-border); background: var(--mc-bg-elevated); border-radius: 6px; display: flex; align-items: center; justify-content: center; cursor: pointer; color: var(--mc-text-secondary); transition: all 0.15s; }
-.action-btn:hover { background: var(--mc-bg-sunken); color: var(--mc-text-primary); }
-.action-btn.danger:hover { background: var(--mc-danger-bg); border-color: var(--mc-danger); color: var(--mc-danger); }
+.tag {
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-size: 11px;
+  font-weight: 500;
+}
+
+.tag-item {
+  background: var(--mc-bg-sunken);
+  color: var(--mc-text-secondary);
+}
+
+.text-muted {
+  color: var(--mc-text-tertiary);
+}
+
+.toggle-switch {
+  position: relative;
+  display: inline-block;
+  width: 36px;
+  height: 20px;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.toggle-switch input {
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+
+.toggle-slider {
+  position: absolute;
+  inset: 0;
+  background: var(--mc-border);
+  border-radius: 20px;
+  transition: 0.2s;
+}
+
+.toggle-slider::before {
+  content: '';
+  position: absolute;
+  width: 14px;
+  height: 14px;
+  left: 3px;
+  top: 3px;
+  background: var(--mc-bg-elevated);
+  border-radius: 50%;
+  transition: 0.2s;
+}
+
+.toggle-switch input:checked+.toggle-slider {
+  background: var(--mc-primary);
+}
+
+.toggle-switch input:checked+.toggle-slider::before {
+  transform: translateX(16px);
+}
+
+.action-btns {
+  display: flex;
+  gap: 4px;
+}
+
+.action-btn {
+  width: 30px;
+  height: 30px;
+  border: 1px solid var(--mc-border);
+  background: var(--mc-bg-elevated);
+  border-radius: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  color: var(--mc-text-secondary);
+  transition: all 0.15s;
+}
+
+.action-btn:hover {
+  background: var(--mc-bg-sunken);
+  color: var(--mc-text-primary);
+}
+
+.action-btn.danger:hover {
+  background: var(--mc-danger-bg);
+  border-color: var(--mc-danger);
+  color: var(--mc-danger);
+}
 
 /* Empty state */
-.empty-state { display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 80px 20px; text-align: center; }
-.empty-icon { font-size: 48px; margin-bottom: 16px; }
-.empty-state h3 { font-size: 18px; font-weight: 600; color: var(--mc-text-primary); margin: 0 0 8px; }
-.empty-state p { font-size: 14px; color: var(--mc-text-tertiary); margin: 0 0 24px; }
+.empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 80px 20px;
+  text-align: center;
+}
+
+.empty-icon {
+  font-size: 48px;
+  margin-bottom: 16px;
+}
+
+.empty-state h3 {
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--mc-text-primary);
+  margin: 0 0 8px;
+}
+
+.empty-state p {
+  font-size: 14px;
+  color: var(--mc-text-tertiary);
+  margin: 0 0 24px;
+}
 
 /* Modal */
-.modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.4); display: flex; align-items: center; justify-content: center; z-index: 1000; padding: 20px; }
-.modal { background: var(--mc-bg-elevated); border: 1px solid var(--mc-border); border-radius: 16px; width: 100%; max-width: 600px; max-height: 90vh; display: flex; flex-direction: column; box-shadow: 0 20px 60px rgba(0,0,0,0.15); }
-.modal-header { display: flex; align-items: center; justify-content: space-between; padding: 20px 24px; border-bottom: 1px solid var(--mc-border-light); }
-.modal-header h2 { font-size: 18px; font-weight: 600; color: var(--mc-text-primary); margin: 0; }
-.modal-close { width: 32px; height: 32px; border: none; background: none; cursor: pointer; color: var(--mc-text-tertiary); display: flex; align-items: center; justify-content: center; border-radius: 6px; }
-.modal-close:hover { background: var(--mc-bg-sunken); color: var(--mc-text-primary); }
-.modal-body { flex: 1; overflow-y: auto; padding: 20px 24px; }
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.4);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+  padding: 20px;
+}
+
+.modal {
+  background: var(--mc-bg-elevated);
+  border: 1px solid var(--mc-border);
+  border-radius: 16px;
+  width: 100%;
+  max-width: 600px;
+  max-height: 90vh;
+  display: flex;
+  flex-direction: column;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.15);
+}
+
+.modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 20px 24px;
+  border-bottom: 1px solid var(--mc-border-light);
+}
+
+.modal-header h2 {
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--mc-text-primary);
+  margin: 0;
+}
+
+.modal-close {
+  width: 32px;
+  height: 32px;
+  border: none;
+  background: none;
+  cursor: pointer;
+  color: var(--mc-text-tertiary);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 6px;
+}
+
+.modal-close:hover {
+  background: var(--mc-bg-sunken);
+  color: var(--mc-text-primary);
+}
+
+.modal-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 20px 24px;
+}
 
 /* Modal Tabs */
-.modal-tabs { display: flex; gap: 4px; margin-bottom: 20px; border-bottom: 1px solid var(--mc-border-light); padding-bottom: 0; }
+.modal-tabs {
+  display: flex;
+  gap: 4px;
+  margin-bottom: 20px;
+  border-bottom: 1px solid var(--mc-border-light);
+  padding-bottom: 0;
+}
+
 .modal-tab {
-  padding: 8px 16px; border: none; background: none; cursor: pointer;
-  font-size: 13px; font-weight: 500; color: var(--mc-text-tertiary);
-  border-bottom: 2px solid transparent; margin-bottom: -1px; transition: all 0.15s;
-  display: inline-flex; align-items: center; gap: 6px;
+  padding: 8px 16px;
+  border: none;
+  background: none;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--mc-text-tertiary);
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+  transition: all 0.15s;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
 }
-.modal-tab:hover { color: var(--mc-text-primary); }
-.modal-tab.active { color: var(--mc-primary); border-bottom-color: var(--mc-primary); }
+
+.modal-tab:hover {
+  color: var(--mc-text-primary);
+}
+
+.modal-tab.active {
+  color: var(--mc-primary);
+  border-bottom-color: var(--mc-primary);
+}
+
 .tab-badge {
-  display: inline-flex; align-items: center; justify-content: center;
-  min-width: 18px; height: 18px; padding: 0 5px;
-  border-radius: 9px; background: var(--mc-primary); color: white;
-  font-size: 11px; font-weight: 600;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: 9px;
+  background: var(--mc-primary);
+  color: white;
+  font-size: 11px;
+  font-weight: 600;
 }
+
 /* Issue #184: "off" variant for the disable-all state. Neutral grey instead
    of brand orange because the badge represents a constraint, not a count. */
 .tab-badge--off {
-  min-width: auto; padding: 0 8px;
-  background: var(--mc-bg-sunken, rgba(0,0,0,0.08));
+  min-width: auto;
+  padding: 0 8px;
+  background: var(--mc-bg-sunken, rgba(0, 0, 0, 0.08));
   color: var(--mc-text-tertiary);
   border: 1px solid var(--mc-border-light);
 }
 
 /* Binding Tab */
-.binding-tab { min-height: 200px; }
-.binding-hint { font-size: 13px; color: var(--mc-text-tertiary); margin: 0 0 16px; }
+.binding-tab {
+  min-height: 200px;
+}
+
+.binding-hint {
+  font-size: 13px;
+  color: var(--mc-text-tertiary);
+  margin: 0 0 16px;
+}
 
 /* Tools/Skills semantic intro — names what the user is about to bind so the
    distinction between "atomic tool" and "trained workflow" is unmissable. */
@@ -1437,6 +1716,7 @@ html.dark .seg-count.warn {
   border-left: 3px solid var(--mc-primary);
   border-radius: 8px;
 }
+
 .binding-intro__kicker {
   font-size: 11px;
   font-weight: 700;
@@ -1444,14 +1724,25 @@ html.dark .seg-count.warn {
   text-transform: uppercase;
   letter-spacing: 0.06em;
 }
+
 .binding-intro__tagline {
   font-size: 13px;
   color: var(--mc-text-secondary);
   line-height: 1.5;
   margin: 0;
 }
-.binding-empty { padding: 40px; text-align: center; color: var(--mc-text-tertiary); font-size: 14px; }
-.binding-empty--compact { padding: 24px 12px; }
+
+.binding-empty {
+  padding: 40px;
+  text-align: center;
+  color: var(--mc-text-tertiary);
+  font-size: 14px;
+}
+
+.binding-empty--compact {
+  padding: 24px 12px;
+}
+
 /* Issue #184 — opt-out row that sits above the picker list. */
 .binding-disable-row {
   margin: 0 0 12px;
@@ -1460,12 +1751,14 @@ html.dark .seg-count.warn {
   border-radius: 8px;
   background: var(--mc-bg-sunken);
 }
+
 .binding-disable-label {
   display: flex;
   align-items: flex-start;
   gap: 10px;
   cursor: pointer;
 }
+
 .binding-disable-checkbox {
   flex-shrink: 0;
   accent-color: var(--mc-primary);
@@ -1473,6 +1766,7 @@ html.dark .seg-count.warn {
   height: 16px;
   margin-top: 2px;
 }
+
 .binding-disable-text {
   display: flex;
   flex-direction: column;
@@ -1481,18 +1775,30 @@ html.dark .seg-count.warn {
   color: var(--mc-text-primary);
   line-height: 1.4;
 }
-.binding-disable-text strong { font-weight: 600; }
+
+.binding-disable-text strong {
+  font-weight: 600;
+}
+
 .binding-disable-hint {
   font-size: 12px;
   color: var(--mc-text-tertiary);
   line-height: 1.5;
 }
+
 /* When the opt-out is on, the picker list is still visible (so the user
    can see what they're disabling) but rendered inert — no hover affordance,
    greyed-out interactions. */
 .binding-search--disabled,
-.binding-list--disabled { opacity: 0.45; pointer-events: none; }
-.binding-item--inert { cursor: not-allowed; }
+.binding-list--disabled {
+  opacity: 0.45;
+  pointer-events: none;
+}
+
+.binding-item--inert {
+  cursor: not-allowed;
+}
+
 .binding-search {
   display: flex;
   align-items: center;
@@ -1504,7 +1810,11 @@ html.dark .seg-count.warn {
   background: var(--mc-bg-sunken);
   color: var(--mc-text-tertiary);
 }
-.binding-search svg { flex-shrink: 0; }
+
+.binding-search svg {
+  flex-shrink: 0;
+}
+
 .binding-search input {
   width: 100%;
   min-width: 0;
@@ -1514,65 +1824,232 @@ html.dark .seg-count.warn {
   color: var(--mc-text-primary);
   font-size: 13px;
 }
-.binding-search input::placeholder { color: var(--mc-text-tertiary); }
-.binding-list { display: flex; flex-direction: column; gap: 6px; }
-.binding-item {
-  display: flex; align-items: center; gap: 10px; padding: 10px 12px;
-  border: 1px solid var(--mc-border-light); border-radius: 8px;
-  cursor: pointer; transition: all 0.15s; background: var(--mc-bg);
+
+.binding-search input::placeholder {
+  color: var(--mc-text-tertiary);
 }
-.binding-item:hover { border-color: var(--mc-primary-light, rgba(217,119,87,0.3)); background: var(--mc-bg-elevated); }
-.binding-item.selected { border-color: var(--mc-primary); background: rgba(217,119,87,0.04); }
-.binding-checkbox { flex-shrink: 0; accent-color: var(--mc-primary); width: 16px; height: 16px; }
-.binding-icon { font-size: 20px; flex-shrink: 0; }
-.binding-info { flex: 1; display: flex; flex-direction: column; gap: 2px; min-width: 0; }
-.binding-name { font-size: 14px; font-weight: 500; color: var(--mc-text-primary); }
-.binding-desc { font-size: 12px; color: var(--mc-text-tertiary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.binding-version { font-size: 11px; color: var(--mc-text-tertiary); flex-shrink: 0; }
+
+.binding-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.binding-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--mc-border-light);
+  border-radius: 8px;
+  cursor: pointer;
+  transition: all 0.15s;
+  background: var(--mc-bg);
+}
+
+.binding-item:hover {
+  border-color: var(--mc-primary-light, rgba(217, 119, 87, 0.3));
+  background: var(--mc-bg-elevated);
+}
+
+.binding-item.selected {
+  border-color: var(--mc-primary);
+  background: rgba(217, 119, 87, 0.04);
+}
+
+.binding-checkbox {
+  flex-shrink: 0;
+  accent-color: var(--mc-primary);
+  width: 16px;
+  height: 16px;
+}
+
+.binding-icon {
+  font-size: 20px;
+  flex-shrink: 0;
+}
+
+.binding-info {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.binding-name {
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--mc-text-primary);
+}
+
+.binding-desc {
+  font-size: 12px;
+  color: var(--mc-text-tertiary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.binding-version {
+  font-size: 11px;
+  color: var(--mc-text-tertiary);
+  flex-shrink: 0;
+}
+
 .binding-type-badge {
-  font-size: 10px; padding: 2px 6px; border-radius: 4px; flex-shrink: 0;
-  background: var(--mc-bg-sunken); color: var(--mc-text-tertiary); text-transform: uppercase;
+  font-size: 10px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  flex-shrink: 0;
+  background: var(--mc-bg-sunken);
+  color: var(--mc-text-tertiary);
+  text-transform: uppercase;
 }
 
 /* Provider preference list (RFC-009 PR-3) */
-.provider-pref-list { display: flex; flex-direction: column; gap: 6px; }
+.provider-pref-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
 .provider-pref-item {
-  display: flex; align-items: center; gap: 10px; padding: 8px 12px;
-  border: 1px solid var(--mc-border-light); border-radius: 8px; background: var(--mc-bg-elevated);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  border: 1px solid var(--mc-border-light);
+  border-radius: 8px;
+  background: var(--mc-bg-elevated);
 }
+
 .provider-pref-rank {
-  width: 22px; height: 22px; border-radius: 50%;
-  display: inline-flex; align-items: center; justify-content: center;
-  background: var(--mc-primary); color: white; font-size: 11px; font-weight: 700; flex-shrink: 0;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--mc-primary);
+  color: white;
+  font-size: 11px;
+  font-weight: 700;
+  flex-shrink: 0;
 }
-.provider-pref-name { font-size: 14px; color: var(--mc-text-primary); flex: 1; }
-.provider-pref-id { font-size: 12px; color: var(--mc-text-tertiary); font-family: ui-monospace, monospace; }
+
+.provider-pref-name {
+  font-size: 14px;
+  color: var(--mc-text-primary);
+  flex: 1;
+}
+
+.provider-pref-id {
+  font-size: 12px;
+  color: var(--mc-text-tertiary);
+  font-family: ui-monospace, monospace;
+}
+
 .provider-pref-btn {
-  border: 1px solid var(--mc-border-light); background: var(--mc-bg);
-  width: 26px; height: 26px; border-radius: 6px; cursor: pointer;
-  font-size: 12px; color: var(--mc-text-secondary);
-}
-.provider-pref-btn:disabled { opacity: 0.35; cursor: not-allowed; }
-.provider-pref-btn:not(:disabled):hover { border-color: var(--mc-primary); color: var(--mc-primary); }
-.provider-pref-btn.danger:not(:disabled):hover { border-color: var(--mc-danger); color: var(--mc-danger); }
-.provider-pref-pool { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
-.provider-pref-pool .binding-hint { width: 100%; }
-.provider-pref-add-btn {
-  border: 1px dashed var(--mc-border); background: transparent;
-  padding: 4px 10px; border-radius: 6px; font-size: 12px; cursor: pointer;
+  border: 1px solid var(--mc-border-light);
+  background: var(--mc-bg);
+  width: 26px;
+  height: 26px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 12px;
   color: var(--mc-text-secondary);
 }
-.provider-pref-add-btn:hover { border-color: var(--mc-primary); color: var(--mc-primary); border-style: solid; }
+
+.provider-pref-btn:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+
+.provider-pref-btn:not(:disabled):hover {
+  border-color: var(--mc-primary);
+  color: var(--mc-primary);
+}
+
+.provider-pref-btn.danger:not(:disabled):hover {
+  border-color: var(--mc-danger);
+  color: var(--mc-danger);
+}
+
+.provider-pref-pool {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.provider-pref-pool .binding-hint {
+  width: 100%;
+}
+
+.provider-pref-add-btn {
+  border: 1px dashed var(--mc-border);
+  background: transparent;
+  padding: 4px 10px;
+  border-radius: 6px;
+  font-size: 12px;
+  cursor: pointer;
+  color: var(--mc-text-secondary);
+}
+
+.provider-pref-add-btn:hover {
+  border-color: var(--mc-primary);
+  color: var(--mc-primary);
+  border-style: solid;
+}
 
 /* minmax(0, 1fr) prevents nowrap children (e.g. the tagline preview)
    from forcing the grid track wider than the modal body. */
-.form-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 16px; }
-.form-group { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
-.form-group.full-width { grid-column: 1 / -1; }
-.form-label { font-size: 13px; font-weight: 500; color: var(--mc-text-secondary); }
-.form-input, .form-textarea { padding: 8px 12px; border: 1px solid var(--mc-border); border-radius: 8px; font-size: 14px; color: var(--mc-text-primary); outline: none; transition: border-color 0.15s; background: var(--mc-bg-sunken); }
-.form-input:focus, .form-textarea:focus { border-color: var(--mc-primary); box-shadow: 0 0 0 2px rgba(217,119,87,0.1); }
-.form-textarea { resize: vertical; font-family: inherit; }
+.form-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 16px;
+}
+
+.form-group {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.form-group.full-width {
+  grid-column: 1 / -1;
+}
+
+.form-label {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--mc-text-secondary);
+}
+
+.form-input,
+.form-textarea {
+  padding: 8px 12px;
+  border: 1px solid var(--mc-border);
+  border-radius: 8px;
+  font-size: 14px;
+  color: var(--mc-text-primary);
+  outline: none;
+  transition: border-color 0.15s;
+  background: var(--mc-bg-sunken);
+}
+
+.form-input:focus,
+.form-textarea:focus {
+  border-color: var(--mc-primary);
+  box-shadow: 0 0 0 2px rgba(217, 119, 87, 0.1);
+}
+
+.form-textarea {
+  resize: vertical;
+  font-family: inherit;
+}
 
 /* Inline guidance below an input. Used for the role/goal/backstory triad
    so the constraint (one short line, etc.) is visible while typing. */
@@ -1586,9 +2063,11 @@ html.dark .seg-count.warn {
   gap: 6px;
   align-items: baseline;
 }
+
 .form-hint__label {
   color: var(--mc-text-tertiary);
 }
+
 .form-hint__value {
   color: var(--mc-text-secondary);
   font-weight: 600;
@@ -1598,12 +2077,14 @@ html.dark .seg-count.warn {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
 .form-hint__counter {
   font-variant-numeric: tabular-nums;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 11px;
   color: var(--mc-text-tertiary);
 }
+
 .form-hint--warn .form-hint__value,
 .form-hint--warn .form-hint__counter {
   color: hsl(20, 78%, 48%);
@@ -1611,8 +2092,16 @@ html.dark .seg-count.warn {
 
 /* Collapsible advanced-instructions block — the everyday user fills the
    triad and never opens this; power users can append free-form additions. */
-.advanced-prompt { border: 1px dashed var(--mc-border); border-radius: 10px; padding: 0; }
-.advanced-prompt[open] { padding: 12px 14px; }
+.advanced-prompt {
+  border: 1px dashed var(--mc-border);
+  border-radius: 10px;
+  padding: 0;
+}
+
+.advanced-prompt[open] {
+  padding: 12px 14px;
+}
+
 .advanced-prompt__summary {
   list-style: none;
   cursor: pointer;
@@ -1622,7 +2111,11 @@ html.dark .seg-count.warn {
   color: var(--mc-text-secondary);
   user-select: none;
 }
-.advanced-prompt__summary::-webkit-details-marker { display: none; }
+
+.advanced-prompt__summary::-webkit-details-marker {
+  display: none;
+}
+
 .advanced-prompt__summary::before {
   content: '▸';
   display: inline-block;
@@ -1631,9 +2124,24 @@ html.dark .seg-count.warn {
   font-size: 11px;
   transition: transform 0.15s;
 }
-.advanced-prompt[open] > .advanced-prompt__summary { padding: 0 0 8px; border-bottom: 1px solid var(--mc-border-light); margin-bottom: 8px; }
-.advanced-prompt[open] > .advanced-prompt__summary::before { transform: rotate(90deg); }
-.modal-footer { display: flex; justify-content: flex-end; gap: 10px; padding: 16px 24px; border-top: 1px solid var(--mc-border-light); }
+
+.advanced-prompt[open]>.advanced-prompt__summary {
+  padding: 0 0 8px;
+  border-bottom: 1px solid var(--mc-border-light);
+  margin-bottom: 8px;
+}
+
+.advanced-prompt[open]>.advanced-prompt__summary::before {
+  transform: rotate(90deg);
+}
+
+.modal-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  padding: 16px 24px;
+  border-top: 1px solid var(--mc-border-light);
+}
 
 @media (max-width: 900px) {
   .filter-bar {
@@ -1647,41 +2155,160 @@ html.dark .seg-count.warn {
 }
 
 /* Template Selector */
-.template-modal { max-width: 640px; }
-.template-desc { font-size: 14px; color: var(--mc-text-secondary); margin: 0 0 18px; }
+.template-modal {
+  max-width: 640px;
+}
 
-.template-grid { display: flex; flex-direction: column; gap: 10px; }
+.template-desc {
+  font-size: 14px;
+  color: var(--mc-text-secondary);
+  margin: 0 0 18px;
+}
+
+.template-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
 
 .template-card {
-  display: flex; align-items: flex-start; gap: 14px; padding: 16px; cursor: pointer;
-  border: 1px solid var(--mc-border); border-radius: 12px; transition: all 0.15s;
+  display: flex;
+  align-items: flex-start;
+  gap: 14px;
+  padding: 16px;
+  cursor: pointer;
+  border: 1px solid var(--mc-border);
+  border-radius: 12px;
+  transition: all 0.15s;
 }
-.template-card:hover { border-color: var(--mc-primary); background: var(--mc-primary-bg); }
-.template-card.applying { opacity: 0.5; pointer-events: none; }
 
-.template-icon { font-size: 28px; width: 44px; height: 44px; display: flex; align-items: center; justify-content: center; background: var(--mc-bg-muted); border-radius: 10px; flex-shrink: 0; }
+.template-card:hover {
+  border-color: var(--mc-primary);
+  background: var(--mc-primary-bg);
+}
 
-.template-info { flex: 1; min-width: 0; }
-.template-name { font-size: 15px; font-weight: 600; color: var(--mc-text-primary); margin: 0 0 4px; }
-.template-detail { font-size: 13px; color: var(--mc-text-secondary); margin: 0; line-height: 1.5; }
+.template-card.applying {
+  opacity: 0.5;
+  pointer-events: none;
+}
 
-.template-tags { display: flex; flex-wrap: wrap; gap: 4px; align-self: flex-start; margin-top: 2px; }
-.tag-chip { font-size: 11px; padding: 2px 8px; background: var(--mc-bg-sunken); color: var(--mc-text-tertiary); border-radius: 999px; white-space: nowrap; }
+.template-icon {
+  font-size: 28px;
+  width: 44px;
+  height: 44px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--mc-bg-muted);
+  border-radius: 10px;
+  flex-shrink: 0;
+}
+
+.template-info {
+  flex: 1;
+  min-width: 0;
+}
+
+.template-name {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--mc-text-primary);
+  margin: 0 0 4px;
+}
+
+.template-detail {
+  font-size: 13px;
+  color: var(--mc-text-secondary);
+  margin: 0;
+  line-height: 1.5;
+}
+
+.template-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  align-self: flex-start;
+  margin-top: 2px;
+}
+
+.tag-chip {
+  font-size: 11px;
+  padding: 2px 8px;
+  background: var(--mc-bg-sunken);
+  color: var(--mc-text-tertiary);
+  border-radius: 999px;
+  white-space: nowrap;
+}
 
 /* RFC-090 §9.2 调整 B — Advanced Tools picker (collapsed by default) */
-.advanced-tools { border: 1px dashed var(--mc-border); border-radius: 12px; padding: 0; }
-.advanced-tools[open] { padding: 12px 14px; }
-.advanced-tools-summary { list-style: none; cursor: pointer; padding: 12px 14px; display: flex; align-items: center; justify-content: space-between; gap: 8px; user-select: none; color: var(--mc-text-secondary); font-size: 13px; font-weight: 600; }
-.advanced-tools-summary::-webkit-details-marker { display: none; }
-.advanced-tools[open] > .advanced-tools-summary { padding: 0 0 8px; border-bottom: 1px solid var(--mc-border-light); margin-bottom: 8px; }
-.advanced-tools-title { display: inline-flex; align-items: center; gap: 8px; }
-.advanced-tools-count { padding: 1px 8px; background: var(--mc-primary-bg); color: var(--mc-primary); border-radius: 999px; font-size: 11px; font-weight: 700; }
-.advanced-tools-chevron { color: var(--mc-text-tertiary); font-size: 12px; }
-.advanced-tools-note { font-style: italic; color: var(--mc-text-tertiary); margin-top: 4px; }
+.advanced-tools {
+  border: 1px dashed var(--mc-border);
+  border-radius: 12px;
+  padding: 0;
+}
+
+.advanced-tools[open] {
+  padding: 12px 14px;
+}
+
+.advanced-tools-summary {
+  list-style: none;
+  cursor: pointer;
+  padding: 12px 14px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  user-select: none;
+  color: var(--mc-text-secondary);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.advanced-tools-summary::-webkit-details-marker {
+  display: none;
+}
+
+.advanced-tools[open]>.advanced-tools-summary {
+  padding: 0 0 8px;
+  border-bottom: 1px solid var(--mc-border-light);
+  margin-bottom: 8px;
+}
+
+.advanced-tools-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.advanced-tools-count {
+  padding: 1px 8px;
+  background: var(--mc-primary-bg);
+  color: var(--mc-primary);
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.advanced-tools-chevron {
+  color: var(--mc-text-tertiary);
+  font-size: 12px;
+}
+
+.advanced-tools-note {
+  font-style: italic;
+  color: var(--mc-text-tertiary);
+  margin-top: 4px;
+}
 
 /* MCP group header: inline "auto-available" tag next to the label so users
    know enabled MCP tools work without being ticked. */
-.binding-group-header { display: flex; align-items: center; gap: 8px; }
+.binding-group-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
 .binding-group-note {
   font-size: 11px;
   font-weight: 500;
@@ -1708,10 +2335,21 @@ html.dark .seg-count.warn {
   transition: border-color 0.15s, background 0.15s;
   width: 100%;
 }
-.icon-picker-trigger:hover { border-color: var(--mc-primary); background: var(--mc-bg-elevated); }
-.icon-picker-trigger:focus-visible { outline: none; border-color: var(--mc-primary); box-shadow: 0 0 0 2px rgba(217,119,87,0.15); }
+
+.icon-picker-trigger:hover {
+  border-color: var(--mc-primary);
+  background: var(--mc-bg-elevated);
+}
+
+.icon-picker-trigger:focus-visible {
+  outline: none;
+  border-color: var(--mc-primary);
+  box-shadow: 0 0 0 2px rgba(217, 119, 87, 0.15);
+}
+
 .icon-picker-trigger__label {
-  flex: 1; min-width: 0;
+  flex: 1;
+  min-width: 0;
   font-size: 13px;
   color: var(--mc-text-primary);
   font-family: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace;
@@ -1719,6 +2357,7 @@ html.dark .seg-count.warn {
   overflow: hidden;
   text-overflow: ellipsis;
 }
+
 .icon-picker-trigger__action {
   flex-shrink: 0;
   font-size: 11px;

@@ -7,249 +7,176 @@
           <div v-if="isMobile && convPanelOpen" class="conv-backdrop" @click="convPanelOpen = false"></div>
         </Transition>
 
-    <!-- 会话侧边栏 -->
-    <ConversationSidebar
-      :conversations="conversations"
-      :current-conversation-id="currentConversationId"
-      :agents="agents"
-      :selected-agent-id="selectedAgentId"
-      :collapsed="convPanelCollapsed"
-      :mobile-open="convPanelOpen"
-      :is-mobile="isMobile"
-      @select="selectConversation"
-      @new-chat="newConversation"
-      @agent-picked="onAgentPicked"
-      @toggle-collapse="toggleConvPanel"
-      @refresh="loadConversations"
-      @deleted="onConversationsDeleted"
-    />
+        <!-- 会话侧边栏 -->
+        <ConversationSidebar :conversations="conversations" :current-conversation-id="currentConversationId"
+          :agents="agents" :selected-agent-id="selectedAgentId" :collapsed="convPanelCollapsed"
+          :mobile-open="convPanelOpen" :is-mobile="isMobile" @select="selectConversation" @new-chat="newConversation"
+          @agent-picked="onAgentPicked" @toggle-collapse="toggleConvPanel" @refresh="loadConversations"
+          @deleted="onConversationsDeleted" />
 
-    <!-- 主聊天区域 -->
-    <div
-      class="chat-area"
-      @dragenter.prevent="onDragEnter"
-      @dragover.prevent
-      @dragleave="onDragLeave"
-      @drop.prevent="onDrop"
-    >
-      <!-- 拖拽上传遮罩 -->
-      <Transition name="fade">
-        <div v-if="isDragging" class="drop-overlay">
-          <div class="drop-overlay__content">
-            <el-icon><UploadFilled /></el-icon>
-            <span>{{ $t('chat.dropToUpload') }}</span>
-          </div>
-        </div>
-      </Transition>
-      <!-- 头部 -->
-      <div class="chat-header">
-        <div class="chat-header-left">
-          <button v-if="isMobile" class="conv-toggle-btn" @click="convPanelOpen = !convPanelOpen" :title="$t('chat.conversations')">
-            <el-icon><ChatDotRound /></el-icon>
-          </button>
-          <div class="chat-stage-copy" v-if="currentAgent">
-            <div class="chat-stage-kicker">{{ $t('nav.chat') }}</div>
-            <!--
+        <!-- 主聊天区域 -->
+        <div class="chat-area" @dragenter.prevent="onDragEnter" @dragover.prevent @dragleave="onDragLeave"
+          @drop.prevent="onDrop">
+          <!-- 拖拽上传遮罩 -->
+          <Transition name="fade">
+            <div v-if="isDragging" class="drop-overlay">
+              <div class="drop-overlay__content">
+                <el-icon>
+                  <UploadFilled />
+                </el-icon>
+                <span>{{ $t('chat.dropToUpload') }}</span>
+              </div>
+            </div>
+          </Transition>
+          <!-- 头部 -->
+          <div class="chat-header">
+            <div class="chat-header-left">
+              <button v-if="isMobile" class="conv-toggle-btn" @click="convPanelOpen = !convPanelOpen"
+                :title="$t('chat.conversations')">
+                <el-icon>
+                  <ChatDotRound />
+                </el-icon>
+              </button>
+              <div class="chat-stage-copy" v-if="currentAgent">
+                <div class="chat-stage-kicker">{{ $t('nav.chat') }}</div>
+                <!--
               Header reads as "who is this employee" — name + tagline.
               The runtime mode (ReAct / Plan-Execute) is technical jargon
               to end users and lives in the badge tooltip instead, so the
               header doesn't get polluted.
             -->
-            <div
-              class="agent-badge"
-              :title="`${currentAgent.name}${currentAgentRuntimeMode ? ' · ' + currentAgentRuntimeMode : ''}`"
-            >
-              <span class="agent-badge-icon" :style="{ color: agentIconColor(currentAgent.icon) }"><SkillIcon :value="currentAgent.icon" :size="22" :fallback="'🤖'" /></span>
-              <div class="agent-badge-text">
-                <span class="agent-badge-name">{{ currentAgent.name }}</span>
+                <div class="agent-badge"
+                  :title="`${currentAgent.name}${currentAgentRuntimeMode ? ' · ' + currentAgentRuntimeMode : ''}`">
+                  <span class="agent-badge-icon" :style="{ color: agentIconColor(currentAgent.icon) }">
+                    <SkillIcon :value="currentAgent.icon" :size="22" :fallback="'🤖'" />
+                  </span>
+                  <div class="agent-badge-text">
+                    <span class="agent-badge-name">{{ currentAgent.name }}</span>
+                  </div>
+                  <span class="status-dot" :class="connectionStatusClass" :title="connectionStatusLabel"></span>
+                </div>
               </div>
-              <span class="status-dot" :class="connectionStatusClass" :title="connectionStatusLabel"></span>
+              <div v-else class="no-agent-hint">{{ $t('chat.selectAgent') }}</div>
             </div>
-          </div>
-          <div v-else class="no-agent-hint">{{ $t('chat.selectAgent') }}</div>
-        </div>
-        <div class="chat-header-right">
-          <!-- Model selector — Issue #81 v2 R3: always pass full providers + show-all-states
+            <div class="chat-header-right">
+              <!-- Model selector — Issue #81 v2 R3: always pass full providers + show-all-states
                so unhealthy rows render as dimmed entries with status chips and a Fix
                button instead of disappearing entirely. -->
-          <ModelSelector
-            :providers="providers"
-            :active-value="activeModelValue"
-            :active-label="activeModelLabel"
-            :saving="modelSaving"
-            :show-all-states="true"
-            @select="selectModel"
-            @navigate-fix="onModelSelectorFix"
-          />
-          <!-- Overflow menu -->
-          <div class="header-overflow-wrap">
-            <button ref="headerBtnRef" class="header-btn" @click="headerMenuOpen = !headerMenuOpen" :title="$t('common.more')">
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><circle cx="12" cy="5" r="1.5"/><circle cx="12" cy="12" r="1.5"/><circle cx="12" cy="19" r="1.5"/></svg>
-            </button>
-            <DropdownMenu
-              :open="headerMenuOpen"
-              :anchor="headerBtnRef"
-              :items="headerMenuItems"
-              @select="onHeaderMenuSelect"
-              @close="headerMenuOpen = false"
-            >
-              <template #item-icon="{ item }">
-                <el-icon v-if="item.key === 'config'"><Setting /></el-icon>
-                <el-icon v-else-if="item.key === 'clear'"><Delete /></el-icon>
-              </template>
-            </DropdownMenu>
-          </div>
-        </div>
-      </div>
-
-      <!-- 使用组件化的 MessageList -->
-      <MessageList
-        ref="messageListRef"
-        :messages="messages"
-        :loading="isGenerating"
-        :assistant-icon="currentAgent?.icon || '🤖'"
-        :user-icon="userInitial"
-        :title="blockingPrompt ? modelPromptText.title : $t('app.title')"
-        :subtitle="blockingPrompt ? modelPromptText.desc : $t('chat.subtitle')"
-        :suggestions="blockingPrompt ? [] : suggestions"
-        @regenerate="handleRegenerate"
-        @suggestion-click="sendSuggestion"
-        @toggle-thinking="handleToggleThinking"
-        @approve="handleApprove"
-        @approve-always="handleApproveAlways"
-        @deny="handleDeny"
-      >
-        <!-- Issue #81 v2 R2: blocking-only popup. Recoverable cases use the
-             non-blocking <RecoverableModelBanner> below instead. -->
-        <template v-if="blockingPrompt" #empty>
-          <div class="model-prompt">
-            <div class="model-prompt-title">{{ modelPromptText.title }}</div>
-            <div class="model-prompt-desc">{{ modelPromptText.desc }}</div>
-            <div class="model-prompt-actions">
-              <button class="btn-primary" @click="handlePrimaryAction">
-                {{ primaryActionLabel }}
-              </button>
-              <button
-                v-if="bestSwitchTarget"
-                class="btn-secondary"
-                @click="switchToBestTarget"
-              >
-                {{ $t('chat.promptAction.switchToModel', { name: bestSwitchTarget.label }) }}
-              </button>
+              <ModelSelector :providers="providers" :active-value="activeModelValue" :active-label="activeModelLabel"
+                :saving="modelSaving" :show-all-states="true" @select="selectModel"
+                @navigate-fix="onModelSelectorFix" />
+              <!-- Overflow menu -->
+              <div class="header-overflow-wrap">
+                <button ref="headerBtnRef" class="header-btn" @click="headerMenuOpen = !headerMenuOpen"
+                  :title="$t('common.more')">
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+                    <circle cx="12" cy="5" r="1.5" />
+                    <circle cx="12" cy="12" r="1.5" />
+                    <circle cx="12" cy="19" r="1.5" />
+                  </svg>
+                </button>
+                <DropdownMenu :open="headerMenuOpen" :anchor="headerBtnRef" :items="headerMenuItems"
+                  @select="onHeaderMenuSelect" @close="headerMenuOpen = false">
+                  <template #item-icon="{ item }">
+                    <el-icon v-if="item.key === 'config'">
+                      <Setting />
+                    </el-icon>
+                    <el-icon v-else-if="item.key === 'clear'">
+                      <Delete />
+                    </el-icon>
+                  </template>
+                </DropdownMenu>
+              </div>
             </div>
           </div>
-        </template>
-      </MessageList>
 
-      <!-- Issue #81: non-blocking banner — active provider is unhealthy but the
+          <!-- 使用组件化的 MessageList -->
+          <MessageList ref="messageListRef" :messages="messages" :loading="isGenerating"
+            :assistant-icon="currentAgent?.icon || '🤖'" :user-icon="userInitial"
+            :title="blockingPrompt ? modelPromptText.title : $t('app.title')"
+            :subtitle="blockingPrompt ? modelPromptText.desc : $t('chat.subtitle')"
+            :suggestions="blockingPrompt ? [] : suggestions" @regenerate="handleRegenerate"
+            @suggestion-click="sendSuggestion" @toggle-thinking="handleToggleThinking" @approve="handleApprove"
+            @approve-always="handleApproveAlways" @deny="handleDeny">
+            <!-- Issue #81 v2 R2: blocking-only popup. Recoverable cases use the
+             non-blocking <RecoverableModelBanner> below instead. -->
+            <template v-if="blockingPrompt" #empty>
+              <div class="model-prompt">
+                <div class="model-prompt-title">{{ modelPromptText.title }}</div>
+                <div class="model-prompt-desc">{{ modelPromptText.desc }}</div>
+                <div class="model-prompt-actions">
+                  <button class="btn-primary" @click="handlePrimaryAction">
+                    {{ primaryActionLabel }}
+                  </button>
+                  <button v-if="bestSwitchTarget" class="btn-secondary" @click="switchToBestTarget">
+                    {{ $t('chat.promptAction.switchToModel', { name: bestSwitchTarget.label }) }}
+                  </button>
+                </div>
+              </div>
+            </template>
+          </MessageList>
+
+          <!-- Issue #81: non-blocking banner — active provider is unhealthy but the
            backend fallback chain has a LIVE provider to take over. -->
-      <RecoverableModelBanner
-        v-if="recoverablePrompt && activeProvider && bestFallbackName"
-        :provider-name="activeProvider.name"
-        :fallback-name="bestFallbackName"
-        @dismiss="recoverableDismissed = true"
-      />
+          <RecoverableModelBanner v-if="recoverablePrompt && activeProvider && bestFallbackName"
+            :provider-name="activeProvider.name" :fallback-name="bestFallbackName"
+            @dismiss="recoverableDismissed = true" />
 
-      <!-- Cron job in-flight placeholder — visible while T2 hasn't committed
+          <!-- Cron job in-flight placeholder — visible while T2 hasn't committed
            the assistant message yet. Populated by pollActivity → /cron-jobs/active-runs. -->
-      <div v-if="activeCronRuns.length > 0" class="cron-running-bar">
-        <div v-for="run in activeCronRuns" :key="run.runId" class="cron-running-item">
-          <span class="cron-running-spinner">🌀</span>
-          <span class="cron-running-text">
-            <strong>{{ run.jobName || $t('chat.cronRunning.fallbackName') }}</strong>
-            <span class="cron-running-meta">
-              · {{ $t('chat.cronRunning.executing') }}
-              <template v-if="run.startedAt"> · {{ elapsedLabel(run.startedAt) }}</template>
-            </span>
-          </span>
-        </div>
-      </div>
+          <div v-if="activeCronRuns.length > 0" class="cron-running-bar">
+            <div v-for="run in activeCronRuns" :key="run.runId" class="cron-running-item">
+              <span class="cron-running-spinner">🌀</span>
+              <span class="cron-running-text">
+                <strong>{{ run.jobName || $t('chat.cronRunning.fallbackName') }}</strong>
+                <span class="cron-running-meta">
+                  · {{ $t('chat.cronRunning.executing') }}
+                  <template v-if="run.startedAt"> · {{ elapsedLabel(run.startedAt) }}</template>
+                </span>
+              </span>
+            </div>
+          </div>
 
-      <!-- Terminal-state announcement after a goal completed or exhausted
+          <!-- Terminal-state announcement after a goal completed or exhausted
            in this conversation. Auto-dismisses when the user clicks × or
            starts a new goal. -->
-      <GoalSystemLine
-        v-if="goalTerminalForCurrent && currentConversationId"
-        :variant="goalTerminalForCurrent.status"
-        :title="goalSystemLineTitle"
-        :detail="goalSystemLineDetail"
-        class="goal-system-line-slot"
-        @click.stop="onGoalSystemLineDismiss"
-      />
+          <GoalSystemLine v-if="goalTerminalForCurrent && currentConversationId"
+            :variant="goalTerminalForCurrent.status" :title="goalSystemLineTitle" :detail="goalSystemLineDetail"
+            class="goal-system-line-slot" @click.stop="onGoalSystemLineDismiss" />
 
-      <!-- Inline "set a goal?" invitation shown after the first assistant
+          <!-- Inline "set a goal?" invitation shown after the first assistant
            reply when the conversation has no active goal and the user
            hasn't dismissed it for this conv. -->
-      <GoalSetInlinePrompt
-        v-if="showGoalSetPrompt"
-        :conversation-id="currentConversationId"
-        :agent-id="String(selectedAgentId)"
-        :workspace-id="String(currentWorkspaceId || '1')"
-        :suggested-title="goalSuggestedTitle"
-        class="goal-set-prompt-slot"
-        @dismiss="onGoalPromptDismiss"
-      />
+          <GoalSetInlinePrompt v-if="showGoalSetPrompt" :conversation-id="currentConversationId"
+            :agent-id="String(selectedAgentId)" :workspace-id="String(currentWorkspaceId || '1')"
+            :suggested-title="goalSuggestedTitle" class="goal-set-prompt-slot" @dismiss="onGoalPromptDismiss" />
 
-      <!-- 流式处理 Loading 栏（消息和输入框之间） -->
-      <StreamLoadingBar
-        :is-loading="isGenerating && !blockingPrompt"
-        :tool-count="toolCallCount"
-        :completion-tokens="currentGeneratingTokens"
-        :prompt-tokens="currentPromptTokens"
-        :phase="streamPhase"
-        :phase-info="phaseInfo"
-        :running-tool-name="currentRunningToolName"
-        :has-queued="hasQueued"
-        :lifecycle-stage="lifecycleStage"
-        :compact-status="compactStatus"
-      />
+          <!-- 流式处理 Loading 栏（消息和输入框之间） -->
+          <StreamLoadingBar :is-loading="isGenerating && !blockingPrompt" :tool-count="toolCallCount"
+            :completion-tokens="currentGeneratingTokens" :prompt-tokens="currentPromptTokens" :phase="streamPhase"
+            :phase-info="phaseInfo" :running-tool-name="currentRunningToolName" :has-queued="hasQueued"
+            :lifecycle-stage="lifecycleStage" :compact-status="compactStatus" />
 
-      <!-- Multimodal routing hint: shown when pending attachments require a
+          <!-- Multimodal routing hint: shown when pending attachments require a
            modality the primary model lacks. -->
-      <MultimodalRoutingHint
-        :attachments="pendingAttachments"
-        :capabilities="agentCapabilities"
-      />
+          <MultimodalRoutingHint :attachments="pendingAttachments" :capabilities="agentCapabilities" />
 
-      <!-- 使用组件化的 ChatInput -->
-      <ChatInput
-        ref="chatInputRef"
-        v-model="inputText"
-        :loading="isGenerating && !hasPendingApproval"
-        :disabled="blockingPrompt || !currentAgent"
-        :placeholder="$t('chat.messagePlaceholder')"
-        :hint="currentRuntimeModel"
-        :attachments="pendingAttachments"
-        :uploading="uploadingAttachment"
-        :max-length="10240"
-        :pending-approval="activePendingApproval"
-        :stream-phase="streamPhase"
-        :queued-message="queuedMessage"
-        :queue-size="queueSize"
-        @submit="handleSendMessage"
-        @stop="handleStopStream"
-        @cancel-queued="handleCancelQueued"
-        @file-select="handleFileSelect"
-        @attachment-remove="removeAttachment"
-        @approve="handleApprove"
-        @approve-always="handleApproveAlways"
-        @deny="handleDeny"
-        :enable-talk-mode="!!selectedAgentId"
-        :thinking-enabled="thinkingEnabled"
-        :thinking-supported="currentModelSupportsThinking"
-        @toggle-thinking="thinkingEnabled = !thinkingEnabled"
-        @talk="showTalkMode = true"
-      />
-    </div>
+          <!-- 使用组件化的 ChatInput -->
+          <ChatInput ref="chatInputRef" v-model="inputText" :loading="isGenerating && !hasPendingApproval"
+            :disabled="blockingPrompt || !currentAgent" :placeholder="$t('chat.messagePlaceholder')"
+            :hint="currentRuntimeModel" :attachments="pendingAttachments" :uploading="uploadingAttachment"
+            :max-length="10240" :pending-approval="activePendingApproval" :stream-phase="streamPhase"
+            :queued-message="queuedMessage" :queue-size="queueSize" @submit="handleSendMessage" @stop="handleStopStream"
+            @cancel-queued="handleCancelQueued" @file-select="handleFileSelect" @attachment-remove="removeAttachment"
+            @approve="handleApprove" @approve-always="handleApproveAlways" @deny="handleDeny"
+            :enable-talk-mode="!!selectedAgentId" :thinking-enabled="thinkingEnabled"
+            :thinking-supported="currentModelSupportsThinking" @toggle-thinking="thinkingEnabled = !thinkingEnabled"
+            @talk="showTalkMode = true" />
+        </div>
 
         <!-- Talk Mode 覆盖层 -->
-        <TalkMode
-          v-if="showTalkMode"
-          :visible="showTalkMode"
-          :agent-id="selectedAgentId"
-          :conversation-id="currentConversationId"
-          @close="showTalkMode = false"
-        />
+        <TalkMode v-if="showTalkMode" :visible="showTalkMode" :agent-id="selectedAgentId"
+          :conversation-id="currentConversationId" @close="showTalkMode = false" />
       </div>
     </div>
   </div>
@@ -475,8 +402,8 @@ function selectModel(value: string) {
         }
         if (currentConversationId.value !== cid) return
         const stillShowingFailedPick =
-            activeModels.value?.activeLlm?.providerId === providerId
-            && activeModels.value?.activeLlm?.model === model
+          activeModels.value?.activeLlm?.providerId === providerId
+          && activeModels.value?.activeLlm?.model === model
         if (!stillShowingFailedPick) return
         activeModels.value = prevActive
       })
@@ -693,8 +620,8 @@ const {
       //    bubble and the failed assistant placeholder, leaving no trace of
       //    the attempt in the chat window.
       if (meta.reason !== 'awaiting_approval'
-          && meta.reason !== 'interrupted'
-          && meta.reason !== 'error') {
+        && meta.reason !== 'interrupted'
+        && meta.reason !== 'error') {
         await refreshCurrentConversationMessages(meta.conversationId)
       }
     }
@@ -828,11 +755,11 @@ const modelPromptKind = computed<ModelPromptKind>(() => {
   if (!p) return 'no-active'
   switch (p.liveness) {
     case 'UNCONFIGURED': return 'unconfigured'
-    case 'REMOVED':      return 'removed'
-    case 'COOLDOWN':     return 'cooldown'
-    case 'UNPROBED':     return 'unprobed'
-    case 'LIVE':         return 'no-models'
-    default:             return 'no-active'
+    case 'REMOVED': return 'removed'
+    case 'COOLDOWN': return 'cooldown'
+    case 'UNPROBED': return 'unprobed'
+    case 'LIVE': return 'no-models'
+    default: return 'no-active'
   }
 })
 
@@ -850,17 +777,17 @@ const modelPromptText = computed<{ title: string; desc: string }>(() => {
     case 'unconfigured':
       return {
         title: t('chat.prompt.unconfigured.title', { name: p?.name || '' }),
-        desc:  t('chat.prompt.unconfigured.desc', { fields: p?.missingFields || '', hint: hintText.value }),
+        desc: t('chat.prompt.unconfigured.desc', { fields: p?.missingFields || '', hint: hintText.value }),
       }
     case 'removed':
       return {
         title: t('chat.prompt.removed.title', { name: p?.name || '' }),
-        desc:  p?.unavailableReason || t('chat.prompt.removed.descFallback'),
+        desc: p?.unavailableReason || t('chat.prompt.removed.descFallback'),
       }
     case 'cooldown':
       return {
         title: t('chat.prompt.cooldown.title', { name: p?.name || '' }),
-        desc:  t('chat.prompt.cooldown.desc', {
+        desc: t('chat.prompt.cooldown.desc', {
           seconds: Math.max(1, Math.ceil((p?.cooldownRemainingMs || 0) / 1000)),
         }),
       }
@@ -869,7 +796,7 @@ const modelPromptText = computed<{ title: string; desc: string }>(() => {
     case 'no-models':
       return {
         title: t('chat.prompt.noModels.title', { name: p?.name || '' }),
-        desc:  t('chat.prompt.noModels.desc'),
+        desc: t('chat.prompt.noModels.desc'),
       }
   }
 })
@@ -877,15 +804,15 @@ const modelPromptText = computed<{ title: string; desc: string }>(() => {
 const primaryActionLabel = computed(() => {
   const action = activeProvider.value?.suggestedAction || 'configure_required_fields'
   switch (action) {
-    case 'fill_base_url':              return t('chat.promptAction.fillBaseUrl')
-    case 'fill_api_key':               return t('chat.promptAction.fillApiKey')
-    case 'start_oauth':                return t('chat.promptAction.startOAuth')
-    case 'test_connection':            return t('chat.promptAction.testConnection')
-    case 'pull_model':                 return t('chat.promptAction.pullModel')
-    case 'wait_cooldown':              return t('chat.promptAction.waitCooldown')
-    case 'reprobe':                    return t('chat.promptAction.reprobe')
+    case 'fill_base_url': return t('chat.promptAction.fillBaseUrl')
+    case 'fill_api_key': return t('chat.promptAction.fillApiKey')
+    case 'start_oauth': return t('chat.promptAction.startOAuth')
+    case 'test_connection': return t('chat.promptAction.testConnection')
+    case 'pull_model': return t('chat.promptAction.pullModel')
+    case 'wait_cooldown': return t('chat.promptAction.waitCooldown')
+    case 'reprobe': return t('chat.promptAction.reprobe')
     case 'configure_required_fields':
-    default:                           return t('chat.goToModelSettings')
+    default: return t('chat.goToModelSettings')
   }
 })
 
@@ -1533,11 +1460,11 @@ async function selectConversation(conv: Conversation) {
           const lastAssistant = assistantMessages[assistantMessages.length - 1]
           if (lastAssistant) {
             console.warn('[hydrate] pendingId %s has no owning message — falling back to last assistant', pa.pendingId)
-            ;(lastAssistant as any).metadata = {
-              ...(lastAssistant as any).metadata,
-              currentPhase: 'awaiting_approval',
-              pendingApproval: enriched,
-            }
+              ; (lastAssistant as any).metadata = {
+                ...(lastAssistant as any).metadata,
+                currentPhase: 'awaiting_approval',
+                pendingApproval: enriched,
+              }
           }
         }
       }
@@ -1551,8 +1478,8 @@ async function selectConversation(conv: Conversation) {
         const meta = (m as any).metadata
         const local = meta?.pendingApproval
         if (local?.status === 'pending_approval'
-            && local.pendingId
-            && !serverIds.has(local.pendingId)) {
+          && local.pendingId
+          && !serverIds.has(local.pendingId)) {
           (m as any).metadata = {
             ...meta,
             pendingApproval: { ...local, status: 'expired' },
@@ -1704,7 +1631,7 @@ async function handleSendMessage(content: string) {
 
     // 乐观更新审批状态
     const decision = trimmed === '/approve' ? 'approved' : 'denied'
-    ;(pendingMsg as any).metadata.pendingApproval.status = decision
+      ; (pendingMsg as any).metadata.pendingApproval.status = decision
 
     inputText.value = ''
     chatInputRef.value?.clear?.()
@@ -1718,8 +1645,8 @@ async function handleSendMessage(content: string) {
       })
     } catch (e: any) {
       console.error('Approval stream failed:', e)
-      // 回滚乐观更新
-      ;(pendingMsg as any).metadata.pendingApproval.status = 'pending_approval'
+        // 回滚乐观更新
+        ; (pendingMsg as any).metadata.pendingApproval.status = 'pending_approval'
       mcToast.error(e?.message || 'Approval failed')
     }
     return
@@ -1954,7 +1881,7 @@ function buildOutgoingParts(text: string, attachments: ChatAttachment[]): Messag
     const ct = attachment.contentType || ''
     const partType: MessageContentPart['type'] = ct.startsWith('video/') ? 'video'
       : ct.startsWith('image/') ? 'image'
-      : 'file'
+        : 'file'
     parts.push({
       type: partType,
       fileUrl: attachment.url,
@@ -2130,22 +2057,37 @@ function handleCodeCopy(e: MouseEvent) {
   color: var(--mc-text-primary);
   font-size: 13px;
 }
+
 .cron-running-item {
   display: flex;
   align-items: center;
   gap: 10px;
 }
+
 .cron-running-spinner {
   display: inline-block;
   font-size: 16px;
   animation: cron-spin 1.6s linear infinite;
 }
+
 @keyframes cron-spin {
-  from { transform: rotate(0deg); }
-  to { transform: rotate(360deg); }
+  from {
+    transform: rotate(0deg);
+  }
+
+  to {
+    transform: rotate(360deg);
+  }
 }
-.cron-running-text { line-height: 1.4; }
-.cron-running-meta { color: var(--mc-text-secondary); margin-left: 4px; }
+
+.cron-running-text {
+  line-height: 1.4;
+}
+
+.cron-running-meta {
+  color: var(--mc-text-secondary);
+  margin-left: 4px;
+}
 
 .chat-console-shell {
   background: transparent;
@@ -2165,6 +2107,7 @@ function handleCodeCopy(e: MouseEvent) {
   height: 100%;
   overflow: hidden;
   min-height: 0;
+  padding: 10px 10px 0 10px;
 }
 
 .chat-area {
@@ -2289,13 +2232,41 @@ function handleCodeCopy(e: MouseEvent) {
 
 
 .status-dot {
-  width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; margin-left: 2px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  margin-left: 2px;
   transition: background 0.3s;
 }
-.status-idle { background: #34d399; box-shadow: 0 0 4px rgba(52, 211, 153, 0.5); }
-.status-streaming { background: #fbbf24; box-shadow: 0 0 4px rgba(251, 191, 36, 0.5); animation: pulse-dot 1.2s infinite; }
-.status-error { background: #f87171; box-shadow: 0 0 4px rgba(248, 113, 113, 0.5); }
-@keyframes pulse-dot { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+
+.status-idle {
+  background: #34d399;
+  box-shadow: 0 0 4px rgba(52, 211, 153, 0.5);
+}
+
+.status-streaming {
+  background: #fbbf24;
+  box-shadow: 0 0 4px rgba(251, 191, 36, 0.5);
+  animation: pulse-dot 1.2s infinite;
+}
+
+.status-error {
+  background: #f87171;
+  box-shadow: 0 0 4px rgba(248, 113, 113, 0.5);
+}
+
+@keyframes pulse-dot {
+
+  0%,
+  100% {
+    opacity: 1;
+  }
+
+  50% {
+    opacity: 0.4;
+  }
+}
 
 .no-agent-hint {
   font-size: 13px;
@@ -2501,5 +2472,4 @@ function handleCodeCopy(e: MouseEvent) {
     height: 28px;
   }
 }
-
 </style>
