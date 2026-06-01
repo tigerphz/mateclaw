@@ -1,6 +1,6 @@
 <template>
   <div class="mc-page-shell">
-    <div class="mc-page-frame">
+    <div class="mc-page-frame" style="display: inline-table;">
       <div class="mc-page-inner skills-page">
         <div class="mc-page-header">
           <div>
