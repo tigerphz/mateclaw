@@ -4,7 +4,8 @@ import tailwindcss from '@tailwindcss/vite'
 import { visualizer } from 'rollup-plugin-visualizer'
 import { resolve } from 'path'
 
-export default defineConfig({
+export default defineConfig(({ mode }) => ({
+  base: mode === 'production' ? '/bomclaw/' : '/',
   plugins: [
     vue({
       template: {
@@ -53,6 +54,9 @@ export default defineConfig({
       '/api': {
         target: 'http://localhost:18088',
         changeOrigin: true,
+        pathRewrite: {
+          ["^" + '/bomclaw']: "",
+        },
         // ws:true forwards WebSocket Upgrade requests through to the backend.
         // Without it Vite serves the GET /api/v1/talk/ws as a regular HTTP
         // proxy, the Upgrade header gets dropped, and the WS handshake
@@ -69,6 +73,9 @@ export default defineConfig({
       '/skill-assets': {
         target: 'http://localhost:18088',
         changeOrigin: true,
+        pathRewrite: {
+          ["^" + '/bomclaw']: "",
+        },
       },
     },
   },
@@ -104,4 +111,4 @@ export default defineConfig({
       },
     },
   },
-})
+}))
