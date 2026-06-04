@@ -1290,7 +1290,7 @@ watch(() => workspaceStore.currentWorkspaceId, () => {
   min-width: 0;
   position: relative;
   z-index: 1;
-  padding: 14px 14px 14px 18px;
+  padding: 14px;
 }
 
 /* ===== 移动端元素（桌面端隐藏） ===== */
