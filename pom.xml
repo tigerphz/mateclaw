@@ -467,31 +467,58 @@
     </pluginRepositories>
 
     <!-- Optional profile for faster Maven resolution from mainland China. -->
+<!--    <profiles>-->
+<!--        <profile>-->
+<!--            <id>aliyun-first</id>-->
+<!--            <repositories>-->
+<!--                <repository>-->
+<!--                    <id>aliyun-public-first</id>-->
+<!--                    <url>https://maven.aliyun.com/repository/public</url>-->
+<!--                    <releases><enabled>true</enabled></releases>-->
+<!--                    <snapshots><enabled>false</enabled></snapshots>-->
+<!--                </repository>-->
+<!--                <repository>-->
+<!--                    <id>aliyun-spring-first</id>-->
+<!--                    <url>https://maven.aliyun.com/repository/spring</url>-->
+<!--                    <releases><enabled>true</enabled></releases>-->
+<!--                    <snapshots><enabled>false</enabled></snapshots>-->
+<!--                </repository>-->
+<!--            </repositories>-->
+<!--            <pluginRepositories>-->
+<!--                <pluginRepository>-->
+<!--                    <id>aliyun-public-first</id>-->
+<!--                    <url>https://maven.aliyun.com/repository/public</url>-->
+<!--                    <releases><enabled>true</enabled></releases>-->
+<!--                    <snapshots><enabled>false</enabled></snapshots>-->
+<!--                </pluginRepository>-->
+<!--            </pluginRepositories>-->
+<!--        </profile>-->
+<!--    </profiles>-->
+
     <profiles>
         <profile>
-            <id>aliyun-first</id>
-            <repositories>
-                <repository>
-                    <id>aliyun-public-first</id>
-                    <url>https://maven.aliyun.com/repository/public</url>
-                    <releases><enabled>true</enabled></releases>
-                    <snapshots><enabled>false</enabled></snapshots>
-                </repository>
-                <repository>
-                    <id>aliyun-spring-first</id>
-                    <url>https://maven.aliyun.com/repository/spring</url>
-                    <releases><enabled>true</enabled></releases>
-                    <snapshots><enabled>false</enabled></snapshots>
-                </repository>
-            </repositories>
-            <pluginRepositories>
-                <pluginRepository>
-                    <id>aliyun-public-first</id>
-                    <url>https://maven.aliyun.com/repository/public</url>
-                    <releases><enabled>true</enabled></releases>
-                    <snapshots><enabled>false</enabled></snapshots>
-                </pluginRepository>
-            </pluginRepositories>
+            <!-- 本地开发环境 -->
+            <id>dev</id>
+            <properties>
+                <profileActive>dev</profileActive>
+            </properties>
+            <activation>
+                <activeByDefault>true</activeByDefault>
+            </activation>
+        </profile>
+        <profile>
+            <!-- 测试环境 -->
+            <id>test</id>
+            <properties>
+                <profileActive>test</profileActive>
+            </properties>
+        </profile>
+        <profile>
+            <!-- 生产环境 -->
+            <id>prod</id>
+            <properties>
+                <profileActive>prod</profileActive>
+            </properties>
         </profile>
     </profiles>
 </project>
