@@ -1,6 +1,6 @@
 export default {
   app: {
-    title: 'MateClaw - AI Assistant',
+    title: 'BomClaw - AI Assistant',
   },
   common: {
     save: 'Save',

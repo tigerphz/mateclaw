@@ -1,6 +1,6 @@
 export default {
   app: {
-    title: 'MateClaw - AI 助手',
+    title: 'BomClaw - AI 助手',
   },
   common: {
     save: '保存',
