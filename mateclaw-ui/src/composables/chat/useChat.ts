@@ -155,8 +155,11 @@ export interface SendMessageOptions {
 }
 
 export function useChat(options: UseChatOptions): UseChatReturn {
-  const { baseUrl, token, onStreamEnd } = options
+  let { baseUrl, token, onStreamEnd } = options
   const thinkingLevelRef = options.thinkingLevel
+
+  const API_PREFIX = import.meta.env.PROD ? '/api-bomclaw' : ''
+  baseUrl = `${baseUrl}${API_PREFIX}`
 
   /**
    * Authenticated fetch wrapper — reads the token from localStorage (consistent with useStream / http.ts).

@@ -2,6 +2,7 @@ package vip.mate.config;
 
 import lombok.extern.slf4j.Slf4j;
 import org.flywaydb.core.Flyway;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnBean;
 import org.springframework.boot.autoconfigure.flyway.FlywayMigrationInitializer;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -22,6 +23,7 @@ import org.springframework.context.annotation.Configuration;
 public class FlywayRepairConfig {
 
     @Bean
+    @ConditionalOnBean(Flyway.class)
     public FlywayMigrationInitializer flywayInitializer(Flyway flyway) {
         return new FlywayMigrationInitializer(flyway, f -> {
             log.info("[Flyway] Running repair before migrate (auto-fix failed/changed migrations)...");

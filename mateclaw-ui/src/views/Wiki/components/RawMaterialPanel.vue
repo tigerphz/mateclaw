@@ -326,8 +326,9 @@ function applyProgressEvent(payload: any) {
 function openSse(kbId: number) {
   closeSse()
   activeKbId = kbId
+  const API_PREFIX = import.meta.env.PROD ? '/api-bomclaw' : ''
   // Vite proxies /api to the backend, so EventSource can use a relative URL.
-  const es = new EventSource(`/api/v1/wiki/knowledge-bases/${kbId}/progress`)
+  const es = new EventSource(`${API_PREFIX}/api/v1/wiki/knowledge-bases/${kbId}/progress`)
   sse = es
 
   es.addEventListener('raw.started', (ev: MessageEvent) => {

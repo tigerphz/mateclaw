@@ -141,7 +141,7 @@ mateclaw:
       mode: ${MATECLAW_TOOLS_DISCLOSURE_MODE:progressive}
   skill:
     workspace:
-      root: ${user.home}/.mateclaw/skills
+      root: ./.mateclaw/skills
       auto-init: true
       delete-policy: archive
     disclosure:
@@ -168,7 +168,7 @@ mateclaw:
       http-retries: 3
   plugin:
     enabled: true
-    user-dir: ${user.home}/.mateclaw/plugins
+    user-dir: ./.mateclaw/plugins
   # RFC-017: 声明式 Hook 系统
   hooks:
     enabled: true

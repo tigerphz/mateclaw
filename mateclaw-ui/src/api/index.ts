@@ -9,9 +9,11 @@ import type {
   GrantScope,
 } from '@/types'
 
+const API_PREFIX = import.meta.env.PROD ? '/api-bomclaw' : ''
+
 // Axios 实例
 export const http = axios.create({
-  baseURL: '/api/v1',
+  baseURL: `${API_PREFIX}/api/v1`,
   timeout: 30000,
 })
 
@@ -68,7 +70,7 @@ http.interceptors.response.use(
     // stripped the body and made 422-class errors look like "no response"
     // on the publish/compile flows.
     const wrapped = new Error(err.response?.data?.msg || err.message || 'Request failed')
-    ;(wrapped as Error & { response?: unknown }).response = err.response
+      ; (wrapped as Error & { response?: unknown }).response = err.response
     return Promise.reject(wrapped)
   }
 )
@@ -146,7 +148,7 @@ export const chatApi = {
     if (token) {
       headers.Authorization = `Bearer ${token}`
     }
-    return fetch('/api/v1/chat/stream', {
+    return fetch(`${API_PREFIX}/api/v1/chat/stream`, {
       method: 'POST',
       headers,
       body: JSON.stringify(data),
@@ -672,7 +674,7 @@ export const agentContextApi = {
     const headers: Record<string, string> = {}
     if (token) headers.Authorization = `Bearer ${token}`
     if (workspaceId) headers['X-Workspace-Id'] = workspaceId
-    const url = `/api/v1/agents/${agentId}/workspace/memory/export`
+    const url = `${API_PREFIX}/api/v1/agents/${agentId}/workspace/memory/export`
     const response = await fetch(url, { headers })
     if (!response.ok) {
       // Try to parse the standard R<T> error envelope for a useful message.

@@ -62,6 +62,8 @@ async function sendMessage() {
   sent.value = true
   streaming.value = true
 
+  const API_PREFIX = import.meta.env.PROD ? '/api-bomclaw' : ''
+
   try {
     const headers: Record<string, string> = {
       Accept: 'text/event-stream',
@@ -73,7 +75,7 @@ async function sendMessage() {
       headers.Authorization = `Bearer ${token}`
     }
 
-    const res = await fetch('/api/v1/chat/stream', {
+    const res = await fetch(`${API_PREFIX}/api/v1/chat/stream`, {
       method: 'POST',
       headers,
       body: JSON.stringify({

@@ -643,7 +643,9 @@ const webhookUrl = computed(() => {
   const host = window.location.hostname
   const port = window.location.port
   const portSuffix = port ? `:${port}` : ''
-  return `${proto}//${host}${portSuffix}/api/v1/channels/webhook/${form.value.channelType}`
+
+  const API_PREFIX = import.meta.env.PROD ? '/api-bomclaw' : ''
+  return `${proto}//${host}${portSuffix}${API_PREFIX}/api/v1/channels/webhook/${form.value.channelType}`
 })
 
 const feishuPermissionUrl = computed(() => {

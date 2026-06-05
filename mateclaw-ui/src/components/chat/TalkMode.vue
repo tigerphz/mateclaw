@@ -142,7 +142,9 @@ onBeforeUnmount(() => {
 function connectWebSocket() {
   const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:'
   const token = localStorage.getItem('token')
-  const wsUrl = `${protocol}//${location.host}/api/v1/talk/ws${token ? '?token=' + token : ''}`
+  
+  const API_PREFIX = import.meta.env.PROD ? '/api-bomclaw' : ''
+  const wsUrl = `${protocol}//${location.host}${API_PREFIX}/api/v1/talk/ws${token ? '?token=' + token : ''}`
 
   state.value = 'connecting'
   ws = new WebSocket(wsUrl)

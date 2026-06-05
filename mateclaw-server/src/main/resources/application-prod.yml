@@ -19,6 +19,7 @@ spring:
     password: ${DB_PASSWORD:Toptea!Q3e}
 
   flyway:
+    enabled: false
     locations:
       - classpath:db/migration/mysql
 
