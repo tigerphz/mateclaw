@@ -15,8 +15,8 @@ const ICON_CHANNELS = ['web', 'feishu', 'dingtalk', 'telegram', 'discord', 'weco
 
 export function channelIconUrl(source?: string): string {
   const key = source || 'web'
-  if (ICON_CHANNELS.includes(key)) return `/icons/channels/${key}.svg`
-  return '/icons/channels/web.svg'
+  if (ICON_CHANNELS.includes(key)) return `./icons/channels/${key}.svg`
+  return './icons/channels/web.svg'
 }
 
 export function sourceLabel(source?: string): string {
