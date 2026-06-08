@@ -2829,7 +2829,7 @@ export default {
       password: 'Enter password',
     },
     signIn: 'Sign In',
-    hint: 'Default: <code>admin</code> / <code>admin123</code>',
+    hint: '',
     failed: 'Login failed. Please check your credentials.',
   },
   enterprise: {

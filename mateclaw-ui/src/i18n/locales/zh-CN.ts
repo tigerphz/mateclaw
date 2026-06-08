@@ -2841,7 +2841,7 @@ export default {
       password: '请输入密码',
     },
     signIn: '登录',
-    hint: '默认账号: <code>admin</code> / <code>admin123</code>',
+    hint: '',
     failed: '登录失败，请检查账号密码',
   },
   enterprise: {
