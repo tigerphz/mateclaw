@@ -3,7 +3,7 @@
     <div class="login-center">
       <div class="login-logo">
         <img src="/logo/mateclaw_logo_s.png" alt="MateClaw" class="logo-image" />
-        <h1 class="logo-title">Bomc<span class="logo-title-highlight">Claw</span></h1>
+        <h1 class="logo-title">Bom<span class="logo-title-highlight">Claw</span></h1>
       </div>
 
       <form class="login-form" @submit.prevent="handleLogin">
