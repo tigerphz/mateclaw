@@ -3,40 +3,29 @@
     <div class="login-center">
       <div class="login-logo">
         <img src="/logo/mateclaw_logo_s.png" alt="MateClaw" class="logo-image" />
-        <h1 class="logo-title">Mate<span class="logo-title-highlight">Claw</span></h1>
+        <h1 class="logo-title">Bomc<span class="logo-title-highlight">Claw</span></h1>
       </div>
 
       <form class="login-form" @submit.prevent="handleLogin">
         <div class="input-wrap">
-          <input
-            v-model="form.username"
-            type="text"
-            class="form-input"
-            :placeholder="t('login.placeholders.username')"
-            :aria-label="t('login.fields.username')"
-            autocomplete="username"
-            required
-          />
+          <input v-model="form.username" type="text" class="form-input" :placeholder="t('login.placeholders.username')"
+            :aria-label="t('login.fields.username')" autocomplete="username" required />
         </div>
 
         <div class="input-wrap">
-          <input
-            v-model="form.password"
-            :type="showPassword ? 'text' : 'password'"
-            class="form-input form-input--has-eye"
-            :placeholder="t('login.placeholders.password')"
-            :aria-label="t('login.fields.password')"
-            autocomplete="current-password"
-            required
-          />
+          <input v-model="form.password" :type="showPassword ? 'text' : 'password'"
+            class="form-input form-input--has-eye" :placeholder="t('login.placeholders.password')"
+            :aria-label="t('login.fields.password')" autocomplete="current-password" required />
           <button type="button" class="eye-btn" @click="showPassword = !showPassword">
-            <svg v-if="!showPassword" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/>
-              <circle cx="12" cy="12" r="3"/>
+            <svg v-if="!showPassword" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+              stroke-width="2">
+              <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" />
+              <circle cx="12" cy="12" r="3" />
             </svg>
             <svg v-else width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/>
-              <line x1="1" y1="1" x2="23" y2="23"/>
+              <path
+                d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24" />
+              <line x1="1" y1="1" x2="23" y2="23" />
             </svg>
           </button>
         </div>
@@ -260,12 +249,25 @@ html.dark .login-page {
   animation: bounce 1.2s infinite;
 }
 
-.loading-dots span:nth-child(2) { animation-delay: 0.2s; }
-.loading-dots span:nth-child(3) { animation-delay: 0.4s; }
+.loading-dots span:nth-child(2) {
+  animation-delay: 0.2s;
+}
+
+.loading-dots span:nth-child(3) {
+  animation-delay: 0.4s;
+}
 
 @keyframes bounce {
-  0%, 60%, 100% { transform: translateY(0); }
-  30% { transform: translateY(-5px); }
+
+  0%,
+  60%,
+  100% {
+    transform: translateY(0);
+  }
+
+  30% {
+    transform: translateY(-5px);
+  }
 }
 
 /* Hint */
@@ -287,10 +289,13 @@ html.dark .login-page {
 
 /* Breathing animation */
 @keyframes breathe {
-  0%, 100% {
+
+  0%,
+  100% {
     transform: scale(1);
     filter: drop-shadow(0 6px 20px rgba(217, 119, 87, 0.3));
   }
+
   50% {
     transform: scale(1.06);
     filter: drop-shadow(0 8px 28px rgba(217, 119, 87, 0.45));
@@ -303,6 +308,7 @@ html.dark .login-page {
     opacity: 0;
     transform: translateY(12px);
   }
+
   to {
     opacity: 1;
     transform: translateY(0);
