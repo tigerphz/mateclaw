@@ -809,6 +809,14 @@ public class ChannelMessageRouter {
                     // for any Web SSE viewer of the same conversationId.
                     StringBuilder replyAccumulator = new StringBuilder();
                     final String channelType = adapter.getChannelType();
+                    // Channel-level toggle for relaying per-stage narration as
+                    // standalone messages mid-run. Shares the key the streaming
+                    // progress path uses so operators have one knob per channel.
+                    // Disabled → narration is dropped from the IM channel (it is
+                    // never part of the final reply either way; web observers
+                    // still see it via the live broadcast).
+                    final boolean relayNarration = channelConfigBoolean(
+                            channelEntity, "stream_progress", true);
                     // Token usage + model attribution: capture _usage_final event emitted at stream end
                     final int[] usage = {0, 0, 0, 0, 0}; // [prompt, completion, cacheRead, cacheWrite, reasoning]
                     final String[] modelInfo = {null, null}; // [runtimeModel, runtimeProvider]
@@ -829,6 +837,26 @@ public class ChannelMessageRouter {
                                         if (provider != null) modelInfo[1] = provider.toString();
                                     }
                                     mirrorPlanEventToTracker(conversationId, delta, channelType);
+                                } else if (delta.segmentOnly()) {
+                                    // Per-stage narration ("Let me look that up…"), emitted as
+                                    // one complete delta per agent loop iteration. Relay it
+                                    // immediately as its own outgoing message so the user sees
+                                    // progress mid-run, and keep it out of the reply accumulator:
+                                    // concatenated narrations read as a wall of text in the
+                                    // final reply, and persisting them feeds the next turn's
+                                    // LLM history an unanswered chain of stated intents that
+                                    // replay mistakes for unfinished work (issue #120).
+                                    String narration = delta.content() != null ? delta.content().trim() : "";
+                                    if (relayNarration && !narration.isEmpty() && replyTarget != null) {
+                                        try {
+                                            adapter.renderAndSend(replyTarget, narration);
+                                        } catch (Exception sendErr) {
+                                            // A failed progress send must not abort the agent
+                                            // run — the final reply still goes out below.
+                                            log.warn("[{}] Narration relay failed (non-fatal): {}",
+                                                    channelType, sendErr.getMessage());
+                                        }
+                                    }
                                 } else if (delta.content() != null) {
                                     // Match the legacy agentService.chat() behavior: include
                                     // persistOnly deltas too. DirectAnswerNode-routed answers
@@ -982,7 +1010,12 @@ public class ChannelMessageRouter {
             case STATUS -> buildStatusReply(channelEntity, conversationId);
         };
         if (replyTarget != null && reply != null) {
-            adapter.sendMessage(replyTarget, reply);
+            // renderAndSend (not sendMessage) so adapters that pre-post a
+            // "thinking..." placeholder on inbound (WeCom reply_stream)
+            // consume it here: the confirmation overwrites the placeholder
+            // bubble in place and the keepalive refresher is stopped.
+            // Plain sendMessage would leave the placeholder dangling forever.
+            adapter.renderAndSend(replyTarget, reply);
         }
         log.info("[{}] Magic command handled: {} conversationId={}, sender={}",
                 adapter.getChannelType(), command.type(), conversationId,
@@ -1698,6 +1731,18 @@ public class ChannelMessageRouter {
 
         // 4. auto 模式：仅当用户通过语音输入时回语音
         return "auto".equals(voiceMode) && "voice".equals(message.getInputMode());
+    }
+
+    /**
+     * Boolean lookup on the channel's configJson. Accepts Boolean or String
+     * values, mirroring the adapter-side config parsing rules, so the router
+     * and the adapters read the same key identically.
+     */
+    private boolean channelConfigBoolean(ChannelEntity channelEntity, String key, boolean defaultValue) {
+        Object value = parseChannelConfig(channelEntity.getConfigJson()).get(key);
+        if (value instanceof Boolean b) return b;
+        if (value instanceof String s && !s.isBlank()) return Boolean.parseBoolean(s.trim());
+        return defaultValue;
     }
 
     /**
