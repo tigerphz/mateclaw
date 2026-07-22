@@ -22,7 +22,7 @@ import java.time.LocalDateTime;
 @TableName("mate_wiki_transformation")
 public class WikiTransformationEntity {
 
-    @TableId(type = IdType.AUTO)
+    @TableId(type = IdType.ASSIGN_ID)
     private Long id;
 
     /**
@@ -83,6 +83,15 @@ public class WikiTransformationEntity {
      * a lightweight required-fields check after parsing.
      */
     private String outputSchema;
+
+    /**
+     * Optional target pageType for output that lands as a wiki page
+     * ({@code outputTarget == 'page'}). Normalised against the KB's pageType
+     * profile at save time; {@code null}/blank falls back to the profile's
+     * {@code fallbackType}, so transformation output is always a first-class
+     * member of the KB classification rather than a hard-coded type.
+     */
+    private String targetPageType;
 
     @TableField(fill = FieldFill.INSERT)
     private LocalDateTime createTime;

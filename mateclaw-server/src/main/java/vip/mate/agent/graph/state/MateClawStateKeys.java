@@ -30,6 +30,16 @@ public final class MateClawStateKeys {
     public static final String CURRENT_ITERATION = "current_iteration";
     public static final String MAX_ITERATIONS = "max_iterations";
 
+    /**
+     * Iterations refunded this run because a reasoning round did no real work —
+     * its whole tool batch was progressive-disclosure setup ({@code load_skill}
+     * / {@code enable_tool}). ObservationNode skips the iteration increment for
+     * such rounds so a tight budget isn't eaten by the load-then-use two-step;
+     * this counter bounds the refunds so a model that only ever loads skills
+     * still terminates. Implicitly 0 at run start. REPLACE strategy.
+     */
+    public static final String ITERATION_REFUND_COUNT = "iteration_refund_count";
+
     // ===== 工具调用（REPLACE 策略）=====
     public static final String TOOL_CALLS = "tool_calls";
     public static final String TOOL_RESULTS = "tool_results";
@@ -145,6 +155,12 @@ public final class MateClawStateKeys {
     // ===== Token Usage 累计（REPLACE 策略，节点内累加后写回）=====
     public static final String PROMPT_TOKENS = "prompt_tokens";
     public static final String COMPLETION_TOKENS = "completion_tokens";
+    /** Prompt cache 命中 tokens 累计（provider 未上报时保持 0） */
+    public static final String CACHE_READ_TOKENS = "cache_read_tokens";
+    /** Prompt cache 写入 tokens 累计（provider 未上报时保持 0） */
+    public static final String CACHE_WRITE_TOKENS = "cache_write_tokens";
+    /** 思考（reasoning）tokens 累计（provider 未上报时保持 0） */
+    public static final String REASONING_TOKENS = "reasoning_tokens";
 
     // ===== 运行时模型快照（REPLACE 策略，buildInitialState 注入）=====
     public static final String RUNTIME_MODEL_NAME = "runtime_model_name";
@@ -228,6 +244,22 @@ public final class MateClawStateKeys {
      */
     public static final String GOAL_ACCOUNTED_LLM_CALL_COUNT = "goal_accounted_llm_call_count";
 
+    /**
+     * Number of "hard continuations" already performed in THIS graph run — a
+     * hard continuation is a goal follow-up that re-enters the ReAct loop with
+     * a FRESH iteration budget (CURRENT_ITERATION reset to 0) after a turn that
+     * ended in {@link FinishReason#MAX_ITERATIONS_REACHED}. Unlike a normal
+     * follow-up (which shares the run's single iteration budget), a hard
+     * continuation grants the goal a brand-new ReAct segment so a task too big
+     * for one budget can keep going autonomously instead of stalling until the
+     * user sends another message. Because each such segment costs up to a full
+     * {@code maxIterations} worth of node visits, it is bounded by a dedicated,
+     * tighter cap ({@code mateclaw.goal.max-hard-continuations-per-run}, clamped
+     * to {@link vip.mate.goal.config.GoalProperties#MAX_HARD_CONTINUATIONS_CEILING})
+     * and sized into the graph recursion ceiling. Implicitly 0 at run start.
+     */
+    public static final String GOAL_HARD_CONTINUATION_COUNT = "goal_hard_continuation_count";
+
     /** Graph-node identifier for the GoalEvaluationNode. */
     public static final String GOAL_EVALUATION_NODE = "goal_evaluation";
 
@@ -270,4 +302,29 @@ public final class MateClawStateKeys {
      * {@link #LOADED_SKILLS}).
      */
     public static final String ENABLED_EXTENSION_TOOLS = "enabled_extension_tools";
+
+    // ===== Tool-call loop guard (REPLACE strategy) =====
+
+    /**
+     * Per-run counters for the tool-call loop guard: repeated identical-argument
+     * failures, per-tool failure totals, and consecutive no-progress results
+     * from idempotent read-only tools. Stored as a {@code Map<String, Object>}
+     * keyed by detector-prefixed signatures; ObservationNode reads the prior
+     * map and writes back the updated one each observation round
+     * (read-merge-write under REPLACE). Implicitly empty at run start, so the
+     * counters reset naturally between graph runs.
+     * <p>
+     * MUST be registered in both KeyStrategyFactory blocks (see
+     * {@link #LOADED_SKILLS}).
+     */
+    public static final String TOOL_LOOP_STATS = "tool_loop_stats";
+
+    /**
+     * True once the one-shot post-mutation verification reminder has been
+     * injected into an observation this run. The reminder asks the model to
+     * verify a successful file mutation (run tests / re-read the file) before
+     * declaring the task complete; injecting it at most once per run keeps
+     * multi-file tasks from being spammed. REPLACE strategy.
+     */
+    public static final String MUTATION_REMINDER_INJECTED = "mutation_reminder_injected";
 }

@@ -8,6 +8,8 @@ import org.junit.jupiter.api.condition.DisabledOnOs;
 import org.junit.jupiter.api.condition.OS;
 import vip.mate.tool.builtin.ToolExecutionContext;
 
+import java.nio.file.Path;
+
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
@@ -26,8 +28,16 @@ class WorkspacePathGuardShellTest {
     private static final String WORKSPACE = "/tmp/ws-guard-shell-test";
     private static final String SKILL_ROOT = "/tmp/ws-guard-skill-root";
 
+    // The global fallback sandbox root is process-wide mutable static state that
+    // another test (or the app context, in a full-suite run) may have set. Save
+    // and restore it so the "no workspace configured" cases here are deterministic
+    // rather than depending on whatever the previous test left behind.
+    private Path savedDefaultRoot;
+
     @BeforeEach
     void setup() {
+        savedDefaultRoot = WorkspacePathGuard.getDefaultRoot();
+        WorkspacePathGuard.setDefaultRoot(null);
         ToolExecutionContext.set("conv-test", "test-user", WORKSPACE);
     }
 
@@ -35,6 +45,7 @@ class WorkspacePathGuardShellTest {
     void teardown() {
         ToolExecutionContext.clear();
         WorkspacePathGuard.setSkillRoot(null);
+        WorkspacePathGuard.setDefaultRoot(savedDefaultRoot == null ? null : savedDefaultRoot.toString());
     }
 
     // ==================== No-op when sandbox absent ====================
@@ -298,6 +309,41 @@ class WorkspacePathGuardShellTest {
                 WorkspacePathGuard.validateShellCommand("cat /etc/passwd"));
         assertThrows(IllegalArgumentException.class, () ->
                 WorkspacePathGuard.validateShellCommand("echo evil > /tmp/leak.txt"));
+    }
+
+    // ==================== Filesystem-root tokens ====================
+
+    @Test
+    @DisplayName("Destructive command targeting the filesystem root (`rm -rf //`, `/.`, `/..`) → rejected")
+    void destructiveFilesystemRoot_blocked() {
+        // "//", "/." and "/.." all normalize to "/" — a delete aimed there must
+        // not be skipped by the root-token false-positive allowance.
+        assertThrows(IllegalArgumentException.class, () ->
+                WorkspacePathGuard.validateShellCommand("rm -rf //"));
+        assertThrows(IllegalArgumentException.class, () ->
+                WorkspacePathGuard.validateShellCommand("rm -rf /."));
+        assertThrows(IllegalArgumentException.class, () ->
+                WorkspacePathGuard.validateShellCommand("rm -rf /.."));
+    }
+
+    @Test
+    @DisplayName("sed empty replacement (s/pattern//) is not misread as a filesystem-root path")
+    void sedEmptyReplacement_pass() {
+        // The trailing "// inside the sed script produces a token that
+        // normalizes to "/" — allowed because the command is non-destructive.
+        assertDoesNotThrow(() ->
+                WorkspacePathGuard.validateShellCommand("sed 's/\"text\": \"//' data.json"));
+    }
+
+    @Test
+    @DisplayName("Compound command mixing a destructive verb with a root-normalizing token fails closed")
+    void destructiveMixedWithRootToken_blocked() {
+        // The destructive flag is command-wide by design: a compound command
+        // that both deletes and carries a "/"-normalizing token is refused,
+        // trading a rare false positive for never skipping `rm ... //`.
+        assertThrows(IllegalArgumentException.class, () ->
+                WorkspacePathGuard.validateShellCommand(
+                        "rm -f old.log && sed 's/\"x\": \"//' data.json"));
     }
 
     // ==================== Device-node negative cases ====================

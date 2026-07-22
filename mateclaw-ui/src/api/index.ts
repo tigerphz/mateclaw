@@ -1,5 +1,6 @@
 import axios from 'axios'
 import { handleAuthFailure, updateTokenFromHeader } from '@/utils/auth'
+import { WIKI_UPLOAD_TIMEOUT_MS } from '@/utils/wikiUpload'
 import type {
   ApprovalGrant,
   ApprovalGrantPage,
@@ -9,11 +10,20 @@ import type {
   GrantScope,
 } from '@/types'
 
-const API_PREFIX = import.meta.env.PROD ? '/api-bomclaw' : ''
+/**
+ * URL-encode a conversation id before interpolating it into a path. Some ids
+ * contain characters that the browser interprets as URL structural — notably
+ * `#`, which webchat emits as a hash marker when the visitorId+sessionId pair
+ * exceeds the conversation_id column width (see WebChatController#deriveConversationId:
+ * `webchat:<key8>:#<sha256[0..40]>`). Without encoding, everything after the
+ * `#` is treated as a fragment and never reaches the server, producing 405 on
+ * `@DeleteMapping` fallbacks and 403 from the owner check.
+ */
+const encId = (id: string) => encodeURIComponent(id)
 
 // Axios 实例
 export const http = axios.create({
-  baseURL: `${API_PREFIX}/api/v1`,
+  baseURL: '/api/v1',
   timeout: 30000,
 })
 
@@ -70,7 +80,7 @@ http.interceptors.response.use(
     // stripped the body and made 422-class errors look like "no response"
     // on the publish/compile flows.
     const wrapped = new Error(err.response?.data?.msg || err.message || 'Request failed')
-      ; (wrapped as Error & { response?: unknown }).response = err.response
+    ;(wrapped as Error & { response?: unknown }).response = err.response
     return Promise.reject(wrapped)
   }
 )
@@ -101,6 +111,20 @@ export const authApi = {
     http.put(`/auth/users/${id}/password`, null, { params: { oldPassword, newPassword } }),
 }
 
+// ==================== SSO ====================
+export const ssoApi = {
+  /** List enabled SSO providers (for rendering login buttons) */
+  providers: () => http.get('/auth/sso/providers'),
+  /** Get the authorize URL + state for a provider */
+  authorize: (provider: string) => http.get(`/auth/sso/${provider}/authorize`),
+  /** Exchange OAuth2 code for JWT */
+  callback: (provider: string, code: string, state: string) =>
+    http.post(`/auth/sso/${provider}/callback`, { code, state }),
+  /** Bind an SSO identity to an existing account (link-only mode) */
+  bind: (bindToken: string, username: string, password: string) =>
+    http.post('/auth/sso/bind', { bindToken, username, password }),
+}
+
 // ==================== Agent ====================
 export const agentApi = {
   /**
@@ -111,6 +135,8 @@ export const agentApi = {
   list: (params?: { enabled?: boolean }) => http.get('/agents', { params }),
   get: (id: string | number) => http.get(`/agents/${id}`),
   create: (data: any) => http.post('/agents', data),
+  /** Generate a reviewable employee draft from a one-sentence requirement (no persistence). */
+  generate: (requirement: string) => http.post('/agents/generate', { requirement }),
   update: (id: string | number, data: any) => http.put(`/agents/${id}`, data),
   delete: (id: string | number) => http.delete(`/agents/${id}`),
   chat: (id: string | number, data: any) => http.post(`/agents/${id}/chat`, data),
@@ -148,7 +174,7 @@ export const chatApi = {
     if (token) {
       headers.Authorization = `Bearer ${token}`
     }
-    return fetch(`${API_PREFIX}/api/v1/chat/stream`, {
+    return fetch('/api/v1/chat/stream', {
       method: 'POST',
       headers,
       body: JSON.stringify(data),
@@ -156,12 +182,19 @@ export const chatApi = {
     })
   },
   stop: (conversationId: string) =>
-    http.post<{ stopped: boolean }>(`/chat/${conversationId}/stop`),
+    http.post<{ stopped: boolean }>(`/chat/${encId(conversationId)}/stop`),
   getPendingApprovals: (conversationId: string) =>
-    http.get(`/chat/${conversationId}/pending-approvals`),
+    http.get(`/chat/${encId(conversationId)}/pending-approvals`),
 }
 
 // ==================== Conversation ====================
+// Content calendar (read-only) — produced 公众号 / 小红书 pieces + lifecycle status.
+export const contentItemApi = {
+  list: (params?: { page?: number; size?: number; platform?: string; status?: string }) =>
+    http.get('/content-items', { params }),
+  summary: () => http.get('/content-items/summary'),
+}
+
 export const conversationApi = {
   list: () => http.get('/conversations'),
   /**
@@ -172,17 +205,17 @@ export const conversationApi = {
   page: (params: { page?: number; size?: number; keyword?: string }) =>
     http.get('/conversations/page', { params }),
   listMessages: (conversationId: string, params?: { beforeId?: number; limit?: number }) =>
-    http.get(`/conversations/${conversationId}/messages`, { params }),
+    http.get(`/conversations/${encId(conversationId)}/messages`, { params }),
   getStatus: (conversationId: string) =>
-    http.get(`/conversations/${conversationId}/status`),
+    http.get(`/conversations/${encId(conversationId)}/status`),
   delete: (conversationId: string) =>
-    http.delete(`/conversations/${conversationId}`),
+    http.delete(`/conversations/${encId(conversationId)}`),
   clearMessages: (conversationId: string) =>
-    http.delete(`/conversations/${conversationId}/messages`),
+    http.delete(`/conversations/${encId(conversationId)}/messages`),
   rename: (conversationId: string, title: string) =>
-    http.put(`/conversations/${conversationId}/title`, { title }),
+    http.put(`/conversations/${encId(conversationId)}/title`, { title }),
   setPinned: (conversationId: string, pinned: boolean) =>
-    http.put(`/conversations/${conversationId}/pin`, { pinned }),
+    http.put(`/conversations/${encId(conversationId)}/pin`, { pinned }),
   /**
    * Pin this conversation to a specific (provider, model). Closes issue
    * #183 — lets the admin UI switch model for IM-channel conversations
@@ -190,7 +223,7 @@ export const conversationApi = {
    * not just for the Web channel. Both params required and non-empty.
    */
   setModel: (conversationId: string, modelProvider: string, modelName: string) =>
-    http.put(`/conversations/${conversationId}/model`, { modelProvider, modelName }),
+    http.put(`/conversations/${encId(conversationId)}/model`, { modelProvider, modelName }),
   batchDelete: (conversationIds: string[]) =>
     http.post('/conversations/batch-delete', { conversationIds }),
 }
@@ -269,6 +302,9 @@ export const skillApi = {
     http.post('/skills/curator/activate', null, { params: { activate } }),
   curatorPause: () => http.post('/skills/curator/pause'),
   curatorResume: () => http.post('/skills/curator/resume'),
+  /** Enable or disable the consolidation (merge near-duplicate skills) pass. */
+  curatorConsolidate: (enabled: boolean) =>
+    http.post('/skills/curator/consolidate', null, { params: { enabled } }),
   /** List recent curator run report ids. */
   curatorReports: () => http.get('/skills/curator/reports'),
   /** Read one curator run report (parsed run.json). */
@@ -362,6 +398,7 @@ export const liveApi = {
 export interface NotificationSummary {
   pendingApprovals: number
   stuckAgents: number
+  failedWikiJobs: number
   failedCrons: number
   downChannels: number
   downMcps: number
@@ -511,6 +548,8 @@ export const mcpApi = {
 // ==================== Plan ====================
 export const planApi = {
   listByAgent: (agentId: string) => http.get(`/plans?agentId=${agentId}`),
+  /** Cross-agent recent plans for the team / swimlane board. */
+  listAll: (limit = 100) => http.get('/plans', { params: { limit } }),
   get: (id: string | number) => http.get(`/plans/${id}`),
 }
 
@@ -644,6 +683,7 @@ export const settingsApi = {
   // sidestep JS Number precision loss on 19-digit Snowflake IDs.
   updateSidecar: (data: { defaultVisionModelId: number | string | null; defaultVideoModelId: number | string | null }) =>
     http.put('/settings/sidecar', data),
+  getSearchProviders: () => http.get('/settings/search-providers'),
 }
 
 // ==================== Global outbound proxy ====================
@@ -682,7 +722,7 @@ export const agentContextApi = {
     const headers: Record<string, string> = {}
     if (token) headers.Authorization = `Bearer ${token}`
     if (workspaceId) headers['X-Workspace-Id'] = workspaceId
-    const url = `${API_PREFIX}/api/v1/agents/${agentId}/workspace/memory/export`
+    const url = `/api/v1/agents/${agentId}/workspace/memory/export`
     const response = await fetch(url, { headers })
     if (!response.ok) {
       // Try to parse the standard R<T> error envelope for a useful message.
@@ -752,6 +792,22 @@ export const cronJobApi = {
 }
 
 // ==================== Wiki Knowledge Base ====================
+// One row in the cross-KB failure center. ids are strings (global Long→String
+// Jackson config) to avoid Snowflake precision loss.
+export interface WikiFailureItem {
+  rawId: string
+  kbId: string
+  kbName: string
+  workspaceId: string | null
+  title: string
+  processingStatus: string
+  errorCode: string | null
+  errorMessage: string | null
+  warningCode: string | null
+  warningMessage: string | null
+  updateTime: string | null
+}
+
 export const wikiApi = {
   // Knowledge Base
   listKBs: () => http.get('/wiki/knowledge-bases'),
@@ -772,13 +828,20 @@ export const wikiApi = {
     http.put(`/wiki/knowledge-bases/${id}/source-directory`, { path }),
   scanDirectory: (id: number) => http.post(`/wiki/knowledge-bases/${id}/scan`),
 
+  // Centralized cross-KB failure center (admin only)
+  listFailures: (limit = 100) => http.get<{ data: WikiFailureItem[] }>(`/wiki/admin/failures?limit=${limit}`),
+
   // Raw Materials
-  listRaw: (kbId: number) => http.get(`/wiki/knowledge-bases/${kbId}/raw`),
+  listRaw: (
+    kbId: number,
+    filters?: { status?: string; sourceType?: string; keyword?: string; startTime?: string; endTime?: string },
+  ) => http.get(`/wiki/knowledge-bases/${kbId}/raw`, filters ? { params: filters } : undefined),
   addRawText: (kbId: number, data: { title: string; content: string }) =>
     http.post(`/wiki/knowledge-bases/${kbId}/raw/text`, data),
   uploadRaw: (kbId: number, formData: FormData, onProgress?: (pct: number) => void) =>
     http.post(`/wiki/knowledge-bases/${kbId}/raw/upload`, formData, {
       headers: { 'Content-Type': 'multipart/form-data' },
+      timeout: WIKI_UPLOAD_TIMEOUT_MS,
       onUploadProgress: onProgress
         ? (e) => { if (e.total) onProgress(Math.round((e.loaded / e.total) * 100)) }
         : undefined,
@@ -789,6 +852,16 @@ export const wikiApi = {
     http.post(`/wiki/knowledge-bases/${kbId}/raw/${rawId}/reprocess`),
   cancelRaw: (kbId: number, rawId: number) =>
     http.post(`/wiki/knowledge-bases/${kbId}/raw/${rawId}/cancel`),
+  // Batch reprocess/delete. Select by explicit `ids` (Snowflake strings — never
+  // coerce to number) or by a `status` selector (e.g. retry all failed).
+  batchReprocessRaw: (
+    kbId: number,
+    body: { ids?: (string | number)[]; status?: string; force?: boolean },
+  ) => http.post(`/wiki/knowledge-bases/${kbId}/raw/batch/reprocess`, body),
+  batchDeleteRaw: (
+    kbId: number,
+    body: { ids?: (string | number)[]; status?: string },
+  ) => http.post(`/wiki/knowledge-bases/${kbId}/raw/batch/delete`, body),
   downloadRaw: (kbId: number, rawId: number) =>
     http.get<Blob>(`/wiki/knowledge-bases/${kbId}/raw/${rawId}/download`, {
       responseType: 'blob',
@@ -848,6 +921,16 @@ export const wikiApi = {
   getPageCitations: (kbId: number | string, pageId: number | string) =>
     http.get(`/wiki/kb/${kbId}/pages/${pageId}/citations`),
 
+  // Entity-level knowledge graph
+  listEntities: (kbId: number | string, params?: { type?: string; limit?: number }) =>
+    http.get(`/wiki/kb/${kbId}/entities`, { params }),
+  getEntityGraph: (kbId: number | string, limit = 150) =>
+    http.get(`/wiki/kb/${kbId}/entity-graph`, { params: { limit } }),
+  getEntityEgo: (kbId: number | string, entityId: number | string, limit = 50) =>
+    http.get(`/wiki/kb/${kbId}/entities/${entityId}/graph`, { params: { limit } }),
+  extractEntities: (kbId: number | string, force = false) =>
+    http.post(`/wiki/kb/${kbId}/entities/extract`, null, { params: { force } }),
+
   // RFC-030: Jobs
   getWikiJobs: (kbId: number, rawId: number) =>
     http.get(`/wiki/kb/${kbId}/jobs`, { params: { rawId } }),
@@ -881,6 +964,7 @@ export const wikiApi = {
     outputTarget?: 'none' | 'page'
     outputFormat?: 'markdown' | 'json'
     outputSchema?: string | null
+    targetPageType?: string | null
   }) =>
     http.post('/wiki/transformations', data),
   updateTransformation: (id: number, data: {
@@ -893,6 +977,7 @@ export const wikiApi = {
     outputTarget?: 'none' | 'page'
     outputFormat?: 'markdown' | 'json'
     outputSchema?: string | null
+    targetPageType?: string | null
   }) =>
     http.put(`/wiki/transformations/${id}`, data),
   deleteTransformation: (id: number) =>
@@ -923,6 +1008,8 @@ export const wikiApi = {
     http.post(`/wiki/knowledge-bases/${kbId}/page-type-profile/validate`, { config }),
   resetPageTypeProfile: (kbId: string | number) =>
     http.post(`/wiki/knowledge-bases/${kbId}/page-type-profile/reset-default`),
+  reclassifyKB: (kbId: string | number, modelId?: string | number | null) =>
+    http.post(`/wiki/knowledge-bases/${kbId}/reclassify`, modelId != null ? { modelId } : {}),
 
   // ---- Agent pageType permissions (REQ-3) ----
   listPageTypePermissions: (kbId: string | number, agentId: string | number) =>
@@ -944,6 +1031,8 @@ export const wikiApi = {
     http.get(`/wiki/knowledge-bases/${kbId}/source-watcher`),
   triggerSourceWatcher: (kbId: string | number) =>
     http.post(`/wiki/knowledge-bases/${kbId}/source-watcher/scan`),
+  setWatcherEnabled: (kbId: string | number, enabled: boolean) =>
+    http.put(`/wiki/knowledge-bases/${kbId}/source-watcher/enabled`, { enabled }),
 
   // ---- Pipelines (REQ-5) ----
   listPipelines: (kbId: string | number) =>
@@ -985,11 +1074,16 @@ export const agentBindingApi = {
   unbindSkill: (agentId: string | number, skillId: number) => http.delete(`/agents/${agentId}/skills/${skillId}`),
   listTools: (agentId: string | number) => http.get(`/agents/${agentId}/tools`),
   setTools: (agentId: string | number, toolNames: string[]) => http.put(`/agents/${agentId}/tools`, toolNames),
-  // RFC-009 PR-3: per-agent provider preference order. Empty list = use global chain order.
+  // Per-agent preferred-model chain (provider + model). Empty list = use the
+  // global chain order. modelId null = the provider's default model; the same
+  // provider may appear multiple times with different models. modelId is a
+  // string to preserve Snowflake precision.
   listProviderPreferences: (agentId: string | number) =>
     http.get(`/agents/${agentId}/provider-preferences`),
-  setProviderPreferences: (agentId: string | number, providerIds: string[]) =>
-    http.put(`/agents/${agentId}/provider-preferences`, providerIds),
+  setProviderPreferences: (
+    agentId: string | number,
+    preferences: Array<{ providerId: string; modelId: string | null }>,
+  ) => http.put(`/agents/${agentId}/provider-preferences`, preferences),
   // Per-agent knowledge base access scope. Empty array = unrestricted
   // (agent can reach every KB in its workspace). IDs are kept as strings
   // for the Snowflake-precision contract.
@@ -1005,6 +1099,28 @@ export const dashboardApi = {
   agentRanking: (days = 7, topN = 10) => http.get('/dashboard/agent-ranking', { params: { days, topN } }),
   cronJobRuns: (cronJobId: string | number, limit = 20) => http.get(`/dashboard/cron-runs/${cronJobId}`, { params: { limit } }),
   recentRuns: (limit = 20) => http.get('/dashboard/cron-runs', { params: { limit } }),
+}
+
+// ==================== Operational Data Export ====================
+export const operationalApi = {
+  generate: (startDate: string, endDate: string) =>
+    http.post('/operational-data/generate', null, { params: { startDate, endDate } }),
+  progress: (taskId: string) =>
+    http.get('/operational-data/progress', { params: { taskId } }),
+  /** Download file — uses native fetch to avoid axios R<T> interceptor */
+  download: async (taskId: string, token: string): Promise<void> => {
+    const jwt = localStorage.getItem('token')
+    const resp = await fetch(`/api/v1/operational-data/download?taskId=${taskId}&token=${token}`, {
+      headers: { Authorization: jwt ? `Bearer ${jwt}` : '' },
+    })
+    if (!resp.ok) throw new Error(`Download failed: ${resp.status}`)
+    const blob = await resp.blob()
+    const a = document.createElement('a')
+    a.href = URL.createObjectURL(blob)
+    a.download = `ops_data.zip`
+    a.click()
+    URL.revokeObjectURL(a.href)
+  },
 }
 
 // ==================== Plugins ====================
@@ -1361,7 +1477,7 @@ export const goalApi = {
   }) => http.post<Goal>('/goals', data),
 
   findActive: (conversationId: string) =>
-    http.get<Goal | null>(`/goals/by-conversation/${conversationId}`),
+    http.get<Goal | null>(`/goals/by-conversation/${encId(conversationId)}`),
 
   get: (id: string) => http.get<Goal>(`/goals/${id}`),
 
@@ -1421,4 +1537,29 @@ export const approvalApi = {
     conversationId?: string
     limit?: number
   }) => http.get<ResolutionLog[]>('/approval/resolutions', { params }),
+}
+
+// ==================== 内置帮助文档 ====================
+
+export interface DocMeta {
+  slug: string
+  title: string
+  /** Group label (e.g. 开始 / 使用 / 扩展), mirroring the docs site sidebar sections. */
+  group: string
+}
+
+export interface DocContent {
+  slug: string
+  title: string
+  content: string
+}
+
+export const docsApi = {
+  /** 列出某语言下的全部帮助文档（slug + 标题）。 */
+  list: (lang: string) =>
+    http.get<DocMeta[]>('/docs', { params: { lang } }),
+
+  /** 读取单篇文档正文（已剥离 frontmatter）。 */
+  content: (lang: string, slug: string) =>
+    http.get<DocContent>('/docs/content', { params: { lang, slug } }),
 }

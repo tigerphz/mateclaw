@@ -115,6 +115,20 @@ Tool Guard 是守门员。超时是**每个工具独立**的（这样一个慢�
 
 此外还有 [多模态创作](./multimodal) 的音乐生成工具 `MusicGenerateTool`。以及 [LLM Wiki](./wiki) 的 14 个 Wiki 工具：`wiki_read_page`、`wiki_read_many`、`wiki_list_pages`、`wiki_search_pages`、`wiki_semantic_search`、`wiki_compile_page`、`wiki_trace_source`、`wiki_create_page`、`wiki_delete_page`、`wiki_archive_page`、`wiki_unarchive_page`、`wiki_related_pages`、`wiki_explain_relation`、`wiki_enrich_page`。
 
+### 内容工作室工具（1.8.0+）
+
+七个内置工具支撑 [内容工作室](./content-studio) 场景（公众号 / 小红书图文创作与发布）：
+
+| 工具 | 做什么 | 危险 |
+|------|--------|------|
+| `wechat_article_extract` | 把 `mp.weixin.qq.com` 文章清洗成 `{标题, 作者, 时间, 正文, 图片}`（SSRF 限该 host） | — |
+| `gzh_package` | 打包公众号图文（内联 HTML + 封面）；跑合规扫描 + 落台账 | — |
+| `gzh_publish` | 把文章推进微信**草稿箱**（`draft`）；可选 `publish` 走审批 | ⚠️ |
+| `xhs_package` | 打包小红书笔记；硬校验 ≥3 张竖版卡片；扫 + 记 | — |
+| `xhs_publish` | 尽力而为的浏览器辅助上传（走审批） | ⚠️ |
+| `content_item` | 内容日历：`check_recent`（选题指纹去重）、`record`、`mark_published` | — |
+| `compliance_scan` | 服务端词库扫描（极限词 / 诱导词 / 承诺收益词）；可选 `extraBannedWords` | — |
+
 ### DateTimeTool
 
 返回给定时区的当前日期时间。没有意外。
@@ -188,7 +202,9 @@ v1.2.0 时这个工具只能"文生图"。v1.3.0 起新增 `image` / `images` �
 
 ### BrowserUseTool
 
-驱动一个无头浏览器。每次调用都过 Tool Guard。
+驱动一个浏览器。每次调用都过 Tool Guard。
+
+**按引用交互（1.8.0+）。** 工具把页面读成一份紧凑的**无障碍树快照**，每个可交互元素拿到一个稳定的 `ref` 句柄，点击 / 输入 / 选择都针对 **`ref` 指向的元素**而非截图坐标——一次操作能挺过页面重排而不落空。使用**真实**浏览器会话时加上**隐私护栏**，并保留一个受控的 CDP（Chrome DevTools Protocol）逃生舱应对安全路径够不着的场景（按需启用，非默认）。
 
 ### DelegateAgentTool —— Agent 之间委托
 
@@ -314,10 +330,8 @@ curl http://localhost:18088/api/v1/tools \
   -H "Authorization: Bearer YOUR_JWT_TOKEN"
 
 # 启用 / 禁用
-curl -X PUT http://localhost:18088/api/v1/tools/1 \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer YOUR_JWT_TOKEN" \
-  -d '{"enabled": false}'
+curl -X PUT "http://localhost:18088/api/v1/tools/1/toggle?enabled=false" \
+  -H "Authorization: Bearer YOUR_JWT_TOKEN"
 
 # 设置内置或渠道工具的披露分级
 curl -X PUT http://localhost:18088/api/v1/tools/1/disclosure-tier \

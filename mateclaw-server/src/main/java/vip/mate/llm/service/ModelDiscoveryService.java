@@ -11,6 +11,7 @@ import org.springframework.stereotype.Service;
 import org.springframework.util.StringUtils;
 import org.springframework.web.client.RestClient;
 import vip.mate.exception.MateClawException;
+import vip.mate.llm.chatmodel.OpenAiModelsPath;
 import vip.mate.llm.model.*;
 import vip.mate.llm.oauth.OpenAIOAuthService;
 
@@ -65,6 +66,13 @@ public class ModelDiscoveryService {
     }
 
     private static final Duration TIMEOUT = Duration.ofSeconds(10);
+
+    // Shared HttpClient for OpenAI-compatible providers — avoids creating a new
+    // native thread + connection pool per request (was causing thread-leak OOM).
+    private static final HttpClient SHARED_HTTP_CLIENT = HttpClient.newBuilder()
+            .version(HttpClient.Version.HTTP_1_1)
+            .connectTimeout(Duration.ofSeconds(30))
+            .build();
 
     // Virtual-thread executor for parallel model probing (lightweight, short-lived)
     private static final ExecutorService PROBE_EXECUTOR = Executors.newVirtualThreadPerTaskExecutor();
@@ -454,12 +462,12 @@ public class ModelDiscoveryService {
                 .defaultHeader(HttpHeaders.ACCEPT, MediaType.APPLICATION_JSON_VALUE)
                 .build();
 
-        RestClient.RequestHeadersSpec<?> spec = client.get().uri(resolveModelsPath(baseUrl));
+        Map<String, Object> kwargs = modelProviderService.readProviderGenerateKwargs(provider);
+        RestClient.RequestHeadersSpec<?> spec = client.get().uri(OpenAiModelsPath.resolve(baseUrl, kwargs));
         if (modelProviderService.hasUsableApiKey(apiKey)) {
             spec = spec.header(HttpHeaders.AUTHORIZATION, "Bearer " + apiKey.trim());
         }
         // Apply any custom headers declared in generateKwargs.
-        Map<String, Object> kwargs = modelProviderService.readProviderGenerateKwargs(provider);
         applyCustomHeaders(spec, kwargs);
 
         String body = spec.retrieve().body(String.class);
@@ -924,19 +932,6 @@ public class ModelDiscoveryService {
         return path;
     }
 
-    /**
-     * Resolve the OpenAI-compatible {@code /v1/models} path against a base URL,
-     * stripping the {@code /v1} prefix when the base already carries a {@code /v{N}}
-     * suffix (Volcano Engine Ark, etc.).
-     */
-    private String resolveModelsPath(String baseUrl) {
-        String path = "/v1/models";
-        if (baseUrl != null && BASE_URL_VERSION_SUFFIX.matcher(baseUrl).matches()) {
-            path = "/models";
-        }
-        return path;
-    }
-
     private String normalizeBaseUrl(String baseUrl) {
         if (!StringUtils.hasText(baseUrl)) {
             return null;
@@ -962,10 +957,7 @@ public class ModelDiscoveryService {
      * the upgrade negotiation.
      */
     private RestClient.Builder openAiCompatibleClientBuilder() {
-        HttpClient httpClient = HttpClient.newBuilder()
-                .version(HttpClient.Version.HTTP_1_1)
-                .build();
-        return RestClient.builder().requestFactory(new JdkClientHttpRequestFactory(httpClient));
+        return RestClient.builder().requestFactory(new JdkClientHttpRequestFactory(SHARED_HTTP_CLIENT));
     }
 
     @SuppressWarnings("unchecked")

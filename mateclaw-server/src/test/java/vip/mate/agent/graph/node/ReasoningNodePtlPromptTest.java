@@ -12,6 +12,7 @@ import java.util.List;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -38,7 +39,7 @@ class ReasoningNodePtlPromptTest {
     @Test
     void prefixIncludesSystemRuntimeAndWikiSegments() {
         WikiContextService wikiContextService = mock(WikiContextService.class);
-        when(wikiContextService.buildRelevantContext(eq(42L), anyString()))
+        when(wikiContextService.buildRelevantContext(eq(42L), anyString(), isNull()))
                 .thenReturn(WIKI_RELEVANT_TEXT);
 
         ReasoningNode node = newNode(wikiContextService);
@@ -48,7 +49,7 @@ class ReasoningNodePtlPromptTest {
                 "/workspace/active",
                 "42",
                 "investigate the bug in module X",
-                vip.mate.agent.context.ChatOrigin.EMPTY);
+                vip.mate.agent.context.ChatOrigin.EMPTY, "", "");
 
         // Three layers: System, runtime-context UserMessage, wiki UserMessage.
         assertThat(prefix).hasSize(3);
@@ -67,17 +68,17 @@ class ReasoningNodePtlPromptTest {
         // that two independent calls with the same inputs produce
         // structurally identical output.
         WikiContextService wikiContextService = mock(WikiContextService.class);
-        when(wikiContextService.buildRelevantContext(eq(42L), anyString()))
+        when(wikiContextService.buildRelevantContext(eq(42L), anyString(), isNull()))
                 .thenReturn(WIKI_RELEVANT_TEXT);
 
         ReasoningNode node = newNode(wikiContextService);
 
         List<Message> a = node.buildNonHistoryPrefix(
                 "sys", "/workspace", "42", "goal",
-                vip.mate.agent.context.ChatOrigin.EMPTY);
+                vip.mate.agent.context.ChatOrigin.EMPTY, "", "");
         List<Message> b = node.buildNonHistoryPrefix(
                 "sys", "/workspace", "42", "goal",
-                vip.mate.agent.context.ChatOrigin.EMPTY);
+                vip.mate.agent.context.ChatOrigin.EMPTY, "", "");
 
         assertThat(a).hasSameSizeAs(b);
         for (int i = 0; i < a.size(); i++) {
@@ -98,7 +99,7 @@ class ReasoningNodePtlPromptTest {
                 "/workspace/active",
                 "42",
                 "investigate the bug in module X",
-                vip.mate.agent.context.ChatOrigin.EMPTY);
+                vip.mate.agent.context.ChatOrigin.EMPTY, "", "");
 
         assertThat(prefix).hasSize(2);
         assertThat(prefix.get(0)).isInstanceOf(SystemMessage.class);
@@ -112,7 +113,7 @@ class ReasoningNodePtlPromptTest {
 
         List<Message> prefix = node.buildNonHistoryPrefix(
                 "sys", "/workspace", "not-a-number", "goal",
-                vip.mate.agent.context.ChatOrigin.EMPTY);
+                vip.mate.agent.context.ChatOrigin.EMPTY, "", "");
 
         // Non-numeric agentId is the contract carried over from the
         // pre-refactor codebase — skip wiki injection rather than throwing.
@@ -125,14 +126,14 @@ class ReasoningNodePtlPromptTest {
     @Test
     void blankWikiResultSkipsWikiSegment() {
         WikiContextService wikiContextService = mock(WikiContextService.class);
-        when(wikiContextService.buildRelevantContext(eq(42L), anyString()))
+        when(wikiContextService.buildRelevantContext(eq(42L), anyString(), isNull()))
                 .thenReturn("   ");  // blank → drop the layer
 
         ReasoningNode node = newNode(wikiContextService);
 
         List<Message> prefix = node.buildNonHistoryPrefix(
                 "sys", "/workspace", "42", "goal",
-                vip.mate.agent.context.ChatOrigin.EMPTY);
+                vip.mate.agent.context.ChatOrigin.EMPTY, "", "");
 
         assertThat(prefix).hasSize(2);
     }

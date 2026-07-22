@@ -192,7 +192,7 @@ scripts:
 | `id` | 主键 |
 | `skill_id` | 外键到 `mate_skill` |
 | `file_path` | `scripts/run.py` 或 `references/cfg.md` 这种相对路径 |
-| `content` | UTF-8 文本（单文件 ≤1 MB，bundle ≤50 MB） |
+| `content` | UTF-8 文本（默认单文件 ≤1 MB、bundle ≤50 MB，可通过 `mateclaw.skill.upload.max-entry-size-mb` / `max-total-size-mb` 调整） |
 | `content_size` | 字节数（不用拉 blob 就能列） |
 | `sha256` | 内容指纹，给同步器做幂等 diff |
 
@@ -228,7 +228,7 @@ scripts:
 
 第三方打包者千奇百怪——有人把 `setup.sh` 直接放 zip 根，有人 `scripts/` 排在 `SKILL.md` 之前。`ZipSkillFetcher` v1.3 起：
 
-- **两遍扫描**——先把所有条目缓存（受 50 MB 上限保护），定位 `SKILL.md` 算出 wrapper 前缀，再分类。**条目顺序不再影响结果**。
+- **两遍扫描**——先把所有条目缓存（受总大小上限保护，默认 50 MB，可用 `mateclaw.skill.upload.max-total-size-mb` 调整），定位 `SKILL.md` 算出 wrapper 前缀，再分类。**条目顺序不再影响结果**。
 - **根目录扩展名兜底**——SKILL.md 同级的非约定文件按扩展名归类：`.sh / .py / .js / .rb / ...` → `scripts/`，`.md / .json / .yaml / .csv / ...` → `references/`，未识别扩展名落 `WARN` 日志。
 - **写后裁剪 + 空 bundle 守卫**——重装时**先写新文件再裁剪不在新 bundle 里的旧文件**。如果新 bundle 某个桶（`scripts/` 或 `references/`）一个条目都没有，**保留磁盘上的旧文件**——一个解析失败的损坏 zip 不会再把你的 skill 擦干净。要强制清空就传 `forcePrune=true`。
 
@@ -281,10 +281,8 @@ curl -X POST http://localhost:18088/api/v1/skills \
   }'
 
 # 启用 / 禁用
-curl -X PUT http://localhost:18088/api/v1/skills/1 \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer YOUR_JWT_TOKEN" \
-  -d '{"enabled": true}'
+curl -X PUT "http://localhost:18088/api/v1/skills/1/toggle?enabled=true" \
+  -H "Authorization: Bearer YOUR_JWT_TOKEN"
 
 # 删除
 curl -X DELETE http://localhost:18088/api/v1/skills/1 \
@@ -632,6 +630,18 @@ MCP / ACP 衍生的技能过去是不透明的工具包，没有可读指令。v
 - **MCP 技能约束**——MCP 支撑的技能继承它背后 MCP 服务的安全约束
 
 完整的技能安全审核在 [安全与审批](./security) 里。
+
+---
+
+## 内容工作室技能（1.8.0+）
+
+三个内置技能组成 [内容工作室](./content-studio) 场景——一句话到可发布的公众号 / 小红书成品：
+
+- **`gzh_article`** —— 公众号图文创作，端到端：选题 → 搜集 → 成文 → 配图 → 去 AI 化 → 内联样式 HTML 排版 → 交付 / 草稿箱。遵循你的人设与文风记忆。
+- **`xhs_note`** —— 小红书以图为主图文笔记：标题四件套 + 碎句正文 + 话题标签，渲染成 ≥3 张竖版 3:4 卡片并在线预览。
+- **`deai_humanize`** —— 可度量的去 AI 化：启发式 AI 痕迹评分驱动 检测 → 改写 → 复检 闭环（两种口吻：公众号沉稳、小红书活泼），硬上限 3 轮。
+
+完整流水线、发布链、内容日历见 [内容工作室](./content-studio)。
 
 ---
 

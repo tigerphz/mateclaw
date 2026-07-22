@@ -258,10 +258,10 @@ curl -X POST http://localhost:18088/api/v1/channels \
     "type": "feishu",
     "agentId": 1,
     "config": {
-      "appId": "cli_your_app_id",
-      "appSecret": "your-app-secret",
-      "verificationToken": "your-verification-token",
-      "encryptKey": "your-encrypt-key"
+      "app_id": "cli_your_app_id",
+      "app_secret": "your-app-secret",
+      "verification_token": "your-verification-token",
+      "encrypt_key": "your-encrypt-key"
     },
     "enabled": true
   }'
@@ -349,8 +349,8 @@ curl -X POST http://localhost:18088/api/v1/channels \
     "type": "feishu",
     "agentId": 1,
     "config": {
-      "appId": "cli_your_app_id",
-      "appSecret": "your-app-secret",
+      "app_id": "cli_your_app_id",
+      "app_secret": "your-app-secret",
       "card_format": "auto",
       "card_header": "AI 助手",
       "card_streaming_enabled": true,
@@ -384,19 +384,14 @@ curl -X POST http://localhost:18088/api/v1/channels \
     "type": "wecom",
     "agentId": 1,
     "config": {
-      "corpId": "your-corp-id",
-      "wecomAgentId": "1000002",
-      "secret": "your-secret",
-      "token": "your-token",
-      "encodingAesKey": "your-encoding-aes-key"
+      "bot_id": "your-bot-id",
+      "secret": "your-secret"
     },
     "enabled": true
   }'
 ```
 
 ![Start Chat](/images/channels/wecom/07-chat.png)
-
-Webhook URL: `https://your-domain/api/v1/channels/webhook/wecom`
 
 ::: tip Want WeCom to actually run smoothly?
 Group multi-user collaboration, quoted messages, appmsg parsing, upload constraints, aibot_respond_msg routing, self-loop detection, TLS retry, platform-level permission locks — every non-obvious optimization and corner case is collected in [WeCom Deep Tuning](./wecom-tuning).
@@ -529,8 +524,8 @@ curl -X POST http://localhost:18088/api/v1/channels \
     "type": "qq",
     "agentId": 1,
     "config": {
-      "appId": "your-app-id",
-      "appSecret": "your-app-secret"
+      "app_id": "your-app-id",
+      "client_secret": "your-app-secret"
     },
     "enabled": true
   }'
@@ -563,8 +558,7 @@ curl -X POST http://localhost:18088/api/v1/channels \
     "agentId": 1,
     "config": {
       "bot_token": "xoxb-...",
-      "app_token": "xapp-...",
-      "mode": "socket"
+      "app_token": "xapp-..."
     },
     "enabled": true
   }'
@@ -603,10 +597,20 @@ curl -X POST http://localhost:18088/api/v1/channels \
     "name": "WeChat Personal",
     "type": "weixin",
     "agentId": 1,
-    "config": {"botToken": "your-bot-token"},
+    "config": {"bot_token": "your-bot-token"},
     "enabled": true
   }'
 ```
+
+---
+
+## WeChat Official Account (publish target, 1.8.0+)
+
+Unlike the nine conversational channels above, the **WeChat Official Account (公众号)** integration is a **one-way publish transport**, not an inbound message channel. It's used by [Content Studio](./content-studio) to push image-text articles into your Official Account **draft box**.
+
+- Configure the Official Account `app_id` / `app_secret` in **Settings** — the secret is **AES-GCM encrypted at rest** (set `MATECLAW_SETTING_KEY` and back it up).
+- The WeChat service instance is cached per appId with a **persisted access token** (WeChat allows one valid token per appId), and the publish chain **retries** transient errors and translates known error codes into actionable hints (e.g. *add the server IP to the Official Account whitelist*).
+- Publishing is **draft-box-first**; the optional `publish` action is approval-gated. See [Content Studio](./content-studio).
 
 ---
 

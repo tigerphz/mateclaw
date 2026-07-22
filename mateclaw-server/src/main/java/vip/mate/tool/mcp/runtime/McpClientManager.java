@@ -1,6 +1,7 @@
 package vip.mate.tool.mcp.runtime;
 
 import cn.hutool.json.JSONUtil;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import io.modelcontextprotocol.client.McpClient;
 import io.modelcontextprotocol.client.McpSyncClient;
 import io.modelcontextprotocol.client.transport.ServerParameters;
@@ -13,7 +14,10 @@ import io.modelcontextprotocol.spec.McpSchema;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.mcp.SyncMcpToolCallbackProvider;
 import org.springframework.ai.tool.ToolCallback;
+import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.stereotype.Component;
+import vip.mate.tool.mcp.event.McpConnectionLostEvent;
+import vip.mate.tool.mcp.event.McpServerChangedEvent;
 import vip.mate.tool.mcp.model.McpServerEntity;
 
 import jakarta.annotation.PreDestroy;
@@ -50,6 +54,36 @@ public class McpClientManager {
 
     /** serverId -> discovered tools metadata */
     private final ConcurrentHashMap<Long, List<McpSchema.Tool>> toolsCache = new ConcurrentHashMap<>();
+
+    /**
+     * serverId -> last successfully-built, prefix-wrapped tool callbacks.
+     * Served as a fallback when a live {@code listTools()} momentarily fails
+     * (e.g. the upstream server just restarted), so the agent keeps seeing the
+     * MCP tools instead of dropping the whole server and falling back to
+     * non-MCP tools. Refreshed on every successful collection.
+     */
+    private final ConcurrentHashMap<Long, List<ToolCallback>> lastGoodCallbacks = new ConcurrentHashMap<>();
+
+    private final ApplicationEventPublisher eventPublisher;
+
+    private final McpIdentityForwardService identityForwardService;
+
+    private final McpProgressContext progressContext;
+
+    private final ObjectMapper objectMapper;
+
+    /** serverId -> server name, captured at build time for identity-forward opt-in matching. */
+    private final ConcurrentHashMap<Long, String> serverNames = new ConcurrentHashMap<>();
+
+    public McpClientManager(ApplicationEventPublisher eventPublisher,
+                            McpIdentityForwardService identityForwardService,
+                            McpProgressContext progressContext,
+                            ObjectMapper objectMapper) {
+        this.eventPublisher = eventPublisher;
+        this.identityForwardService = identityForwardService;
+        this.progressContext = progressContext;
+        this.objectMapper = objectMapper;
+    }
 
     /** serverId -> connection result info */
     private final ConcurrentHashMap<Long, ConnectionResult> connectionResults = new ConcurrentHashMap<>();
@@ -102,6 +136,7 @@ public class McpClientManager {
             McpSyncClient old = clients.remove(serverId);
             toolsCache.remove(serverId);
             connectionResults.remove(serverId);
+            lastGoodCallbacks.remove(serverId);
             if (old != null) {
                 closeClientSafely(serverId, old);
             }
@@ -119,7 +154,7 @@ public class McpClientManager {
         long start = System.currentTimeMillis();
         McpSyncClient testClient = null;
         try {
-            testClient = buildClient(server);
+            testClient = buildClient(server, false);
             testClient.initialize();
             List<McpSchema.Tool> tools = testClient.listTools().tools();
             long latency = System.currentTimeMillis() - start;
@@ -170,15 +205,49 @@ public class McpClientManager {
             try {
                 SyncMcpToolCallbackProvider provider = new SyncMcpToolCallbackProvider(entry.getValue());
                 ToolCallback[] cbs = provider.getToolCallbacks();
-                if (cbs == null || cbs.length == 0) {
+                if (cbs != null && cbs.length > 0) {
+                    String serverName = serverNames.get(serverId);
+                    McpIdentityForwardService idSvc =
+                            identityForwardService.forwardsTo(serverId, serverName) ? identityForwardService : null;
+                    String audience = idSvc != null ? identityForwardService.audienceFor(serverId, serverName) : null;
+                    List<ToolCallback> wrapped = wrapServerCallbacks(serverId, cbs, idSvc, audience, serverName,
+                            entry.getValue(), objectMapper);
+                    lastGoodCallbacks.put(serverId, wrapped);
+                    allCallbacks.addAll(wrapped);
                     continue;
                 }
-                allCallbacks.addAll(wrapServerCallbacks(serverId, cbs));
+                // Live call succeeded but returned nothing. This can be a
+                // transient post-restart state while the SDK re-initializes;
+                // keep serving the last good snapshot rather than dropping the
+                // server. A server that legitimately has no tools simply has no
+                // snapshot and contributes nothing — same as before.
+                addSnapshot(allCallbacks, serverId);
             } catch (Exception e) {
-                log.warn("Failed to get tool callbacks from MCP server {}: {}", serverId, e.getMessage());
+                // A live listTools() failure usually means the upstream server
+                // restarted and the held connection went stale. Instead of
+                // dropping the whole server (which makes the agent fall back to
+                // non-MCP tools), keep serving the last known-good callbacks and
+                // ask the service layer to reconnect. For streamable_http the
+                // stale callbacks self-heal on call via the SDK's lazy
+                // re-initialization; for stdio/sse the async reconnect rebuilds
+                // them and clears the agent cache.
+                log.warn("MCP server {} listTools failed; serving cached snapshot and requesting reconnect: {}",
+                        serverId, e.getMessage());
+                eventPublisher.publishEvent(new McpConnectionLostEvent(serverId, "listTools-failed"));
+                addSnapshot(allCallbacks, serverId);
             }
         }
         return allCallbacks;
+    }
+
+    /** Append the last known-good callbacks for {@code serverId}, if any. */
+    private void addSnapshot(List<ToolCallback> out, long serverId) {
+        List<ToolCallback> snapshot = lastGoodCallbacks.get(serverId);
+        if (snapshot != null && !snapshot.isEmpty()) {
+            log.debug("Serving {} cached MCP tool callbacks for server {} while it reconnects",
+                    snapshot.size(), serverId);
+            out.addAll(snapshot);
+        }
     }
 
     /**
@@ -194,6 +263,28 @@ public class McpClientManager {
      * real {@link McpSyncClient}.
      */
     static List<ToolCallback> wrapServerCallbacks(long serverId, ToolCallback[] cbs) {
+        return wrapServerCallbacks(serverId, cbs, null, null, null, null, null);
+    }
+
+    /**
+     * @param identitySvc when non-null, each callback is additionally wrapped in
+     *        {@link IdentityForwardingToolCallback} (inside the prefix wrapper) so
+     *        the caller's identity rides along with the call. Driven by
+     *        {@link McpIdentityForwardService} opt-in per server; {@code null}
+     *        means this server does not forward identity.
+     * @param audience the token audience for this server (ignored in plaintext mode).
+     * @param serverName human-readable MCP server name; forwarded into each
+     *        {@link PrefixedNameToolCallback} so the tool description is tagged
+     *        {@code [MCP server: <name>]}. May be {@code null} when unknown.
+     * @param mcpClient the active {@link McpSyncClient} for this server; when
+     *        non-null each callback is wrapped in {@link ProgressAwareMcpToolCallback}
+     *        so {@code _meta.progressToken} can be injected into tools/call requests.
+     * @param objectMapper JSON mapper for argument serialization inside the wrapper.
+     */
+    static List<ToolCallback> wrapServerCallbacks(long serverId, ToolCallback[] cbs,
+                                                  McpIdentityForwardService identitySvc, String audience,
+                                                  String serverName,
+                                                  McpSyncClient mcpClient, ObjectMapper objectMapper) {
         List<String> rawNames = new ArrayList<>(cbs.length);
         for (ToolCallback cb : cbs) {
             rawNames.add(cb.getToolDefinition() != null ? cb.getToolDefinition().name() : null);
@@ -219,7 +310,17 @@ public class McpClientManager {
                         serverId, raw, d.prefixedName(), d.unavailableReason());
                 continue;
             }
-            out.add(new PrefixedNameToolCallback(d.prefixedName(), cb));
+            ToolCallback inner = identitySvc != null
+                    ? new IdentityForwardingToolCallback(cb, identitySvc, audience)
+                    : cb;
+            // Wrap with progress-aware callback so _meta.progressToken is
+            // injected when ToolContext carries a progress token. Must sit
+            // inside PrefixedNameToolCallback so both the prefixed name and
+            // the call-path see the same chain.
+            if (mcpClient != null) {
+                inner = new ProgressAwareMcpToolCallback(inner, mcpClient, raw, objectMapper);
+            }
+            out.add(new PrefixedNameToolCallback(d.prefixedName(), inner, serverName));
         }
         return out;
     }
@@ -250,6 +351,7 @@ public class McpClientManager {
         clients.clear();
         toolsCache.clear();
         connectionResults.clear();
+        lastGoodCallbacks.clear();
         // 不清除 serverLocks：closeAll 后 server 可能被重新 connect，
         // 保留 lock 对象确保后续操作仍有互斥保护
     }
@@ -260,7 +362,7 @@ public class McpClientManager {
         long start = System.currentTimeMillis();
         McpSyncClient newClient = null;
         try {
-            newClient = buildClient(server);
+            newClient = buildClient(server, true);
             newClient.initialize();
 
             // Discover tools
@@ -301,9 +403,25 @@ public class McpClientManager {
         }
     }
 
-    private McpSyncClient buildClient(McpServerEntity server) {
+    /**
+     * Build a sync MCP client for {@code server}.
+     *
+     * @param managed {@code true} for long-lived clients placed in the active
+     *                pool (connect/replace), {@code false} for throwaway clients
+     *                (testConnection). Only managed clients arm the runtime
+     *                self-healing hooks — a server-pushed {@code tools/list_changed}
+     *                notification refreshes agent graphs, and a stdio subprocess
+     *                death requests a reconnect. A throwaway test client must stay
+     *                side-effect free.
+     */
+    private McpSyncClient buildClient(McpServerEntity server, boolean managed) {
+        if (server.getId() != null && server.getName() != null) {
+            // Remember the name so identity-forward opt-in can be matched by name
+            // (not just numeric id) when callbacks are wrapped.
+            serverNames.put(server.getId(), server.getName());
+        }
         McpClientTransport transport = switch (server.getTransport()) {
-            case "stdio" -> buildStdioTransport(server);
+            case "stdio" -> buildStdioTransport(server, managed);
             case "sse" -> buildSseTransport(server);
             case "streamable_http" -> buildStreamableHttpTransport(server);
             default -> throw new IllegalArgumentException("Unsupported transport: " + server.getTransport());
@@ -314,12 +432,42 @@ public class McpClientManager {
         Duration requestTimeout = Duration.ofSeconds(
                 server.getReadTimeoutSeconds() != null ? server.getReadTimeoutSeconds() : 60);
 
-        return McpClient.sync(transport)
-                .requestTimeout(requestTimeout)
-                .build();
+        var spec = McpClient.sync(transport).requestTimeout(requestTimeout);
+        if (managed) {
+            // Server-pushed tool-list changes (tools/list_changed) refresh the
+            // agent graphs without any polling — the SDK invokes this consumer
+            // on the client's inbound notification thread.
+            Long serverId = server.getId();
+            spec.toolsChangeConsumer(tools ->
+                    eventPublisher.publishEvent(new McpServerChangedEvent("mcp-tools-changed:" + serverId)));
+
+            // MCP progress notifications: the server pushes progress for
+            // long-running tool calls. progressToken → context lookup + event
+            // publish so McpProgressRelay can forward to the SSE stream.
+            spec.progressConsumer(progressNotification -> {
+                if (progressNotification == null || progressNotification.progressToken() == null) return;
+                McpProgressContext.ProgressEntry entry = progressContext.lookup(progressNotification.progressToken());
+                if (entry == null) return;
+                try {
+                    McpProgressEvent event = new McpProgressEvent(
+                            this,
+                            entry.conversationId(),
+                            entry.toolCallId(),
+                            entry.toolName(),
+                            progressNotification.progress(),
+                            progressNotification.total(),
+                            progressNotification.message()
+                    );
+                    eventPublisher.publishEvent(event);
+                } catch (Exception e) {
+                    log.warn("Failed to publish McpProgressEvent: {}", e.getMessage());
+                }
+            });
+        }
+        return spec.build();
     }
 
-    private StdioClientTransport buildStdioTransport(McpServerEntity server) {
+    private StdioClientTransport buildStdioTransport(McpServerEntity server, boolean managed) {
         String command = normalizeStdioCommand(server.getCommand());
         ServerParameters.Builder builder = ServerParameters.builder(command);
 
@@ -341,11 +489,19 @@ public class McpClientManager {
             builder.env(expandedEnv);
         }
 
-        StdioClientTransport transport = new CwdAwareStdioClientTransport(
+        CwdAwareStdioClientTransport transport = new CwdAwareStdioClientTransport(
                 builder.build(),
                 McpJsonMapper.createDefault(),
                 expandEnvVars(server.getCwd()));
         transport.setStdErrorHandler(line -> log.info("MCP stdio stderr [{}]: {}", server.getName(), line));
+        if (managed) {
+            // stdio is the one transport the MCP SDK cannot self-heal: a dead
+            // subprocess is only recoverable by respawning it, which lazy
+            // re-initialization never does. Request a reconnect on unexpected exit.
+            Long serverId = server.getId();
+            transport.setOnUnexpectedExit(() ->
+                    eventPublisher.publishEvent(new McpConnectionLostEvent(serverId, "stdio-process-exited")));
+        }
         return transport;
     }
 

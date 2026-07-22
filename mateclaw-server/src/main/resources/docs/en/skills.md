@@ -192,7 +192,7 @@ The database is the source of truth, the filesystem is a materialized cache. Tha
 | `id` | Primary key |
 | `skill_id` | FK to `mate_skill` |
 | `file_path` | Relative path like `scripts/run.py` or `references/cfg.md` |
-| `content` | UTF-8 text (≤1 MB per file, ≤50 MB per bundle) |
+| `content` | UTF-8 text (defaults: ≤1 MB per file, ≤50 MB per bundle — configurable via `mateclaw.skill.upload.max-entry-size-mb` / `max-total-size-mb`) |
 | `content_size` | Byte count (so listings don't have to load the blob) |
 | `sha256` | Content fingerprint, drives the syncer's idempotent diff |
 
@@ -228,7 +228,7 @@ Two sync passes run at boot, so every node has the latest bundle:
 
 Third-party packagers package weirdly — some put `setup.sh` at the zip root, some emit `scripts/` entries before `SKILL.md`. As of v1.3, `ZipSkillFetcher`:
 
-- **Two-pass extraction** — the entire archive is buffered in memory first (cap-protected at 50 MB), `SKILL.md` is located and the wrapper-dir prefix computed, then entries are classified. **Zip entry order no longer affects the result.**
+- **Two-pass extraction** — the entire archive is buffered in memory first (cap-protected, 50 MB by default via `mateclaw.skill.upload.max-total-size-mb`), `SKILL.md` is located and the wrapper-dir prefix computed, then entries are classified. **Zip entry order no longer affects the result.**
 - **Root-level extension fallback** — files sitting next to `SKILL.md` that aren't already under a known bucket get classified by extension: `.sh / .py / .js / .rb / ...` → `scripts/`, `.md / .json / .yaml / .csv / ...` → `references/`. Unknown extensions are dropped with a `WARN` line so packaging mistakes surface instead of vanishing.
 - **Write-then-prune + empty-bundle guard** — reinstalls **write new files first, then prune anything in the bucket that's not in the new bundle**. If the new bundle has zero entries for a bucket (`scripts/` or `references/`), the disk copies for that bucket are **left alone** — a malformed re-extract can no longer wipe your scripts. Pass `forcePrune=true` if you really want to clear a bucket via an intentionally empty bundle.
 
@@ -281,10 +281,8 @@ curl -X POST http://localhost:18088/api/v1/skills \
   }'
 
 # Enable / disable
-curl -X PUT http://localhost:18088/api/v1/skills/1 \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer YOUR_JWT_TOKEN" \
-  -d '{"enabled": true}'
+curl -X PUT "http://localhost:18088/api/v1/skills/1/toggle?enabled=true" \
+  -H "Authorization: Bearer YOUR_JWT_TOKEN"
 
 # Delete
 curl -X DELETE http://localhost:18088/api/v1/skills/1 \
@@ -633,6 +631,18 @@ Custom skills go through several checks before they become live:
 - **MCP skill constraints** — MCP-backed skills inherit the security constraints of their MCP server
 
 Full review in [Security & Approval](./security).
+
+---
+
+## Content Studio skills (1.8.0+)
+
+Three built-in skills compose the [Content Studio](./content-studio) scene — one sentence to a publishable 公众号 / 小红书 post:
+
+- **`gzh_article`** — WeChat Official Account image-text creation, end-to-end: pick topic → research → draft → illustrate → de-AI → inline-style HTML layout → deliver / draft box. Honors your persona & style memory.
+- **`xhs_note`** — Xiaohongshu image-first notes: four-part title + short-sentence body + topic tags, rendered as ≥3 vertical 3:4 cards with an online preview.
+- **`deai_humanize`** — measurable de-AI-ification: a heuristic AI-trace score drives a detect → rewrite → re-check loop (two tones: 公众号 measured, 小红书 lively), capped at 3 rounds.
+
+See [Content Studio](./content-studio) for the full pipeline, publish chain, and content calendar.
 
 ---
 

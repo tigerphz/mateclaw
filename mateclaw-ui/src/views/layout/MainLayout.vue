@@ -71,6 +71,13 @@
                   :collapsed="effectiveCollapsed"
                   :title="t('notifications.pendingApprovals', { n: pendingApprovals })"
                 />
+                <NavBadge
+                  v-else-if="item.path === '/wiki' && isAdminRole"
+                  :count="failedWikiJobs"
+                  tone="warning"
+                  :collapsed="effectiveCollapsed"
+                  :title="t('notifications.failedWikiJobs', { n: failedWikiJobs })"
+                />
               </router-link>
             </McTooltip>
           </div>
@@ -215,6 +222,7 @@
 <script setup lang="ts">
 import { ref, computed, watch, onMounted, onBeforeUnmount } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
+import { warmRouteChunks } from '@/router'
 import { useIsMobile, useMediaQuery } from '@/composables/useBreakpoint'
 import { useI18n } from 'vue-i18n'
 import { useThemeStore } from '@/stores/useThemeStore'
@@ -281,7 +289,7 @@ function goAutoApproveSettings() {
 // Live view) and `/security` (pending approvals) read from a shared 15s poller
 // so multiple consumers don't multiply HTTP traffic.
 const isAdminRole = computed(() => (localStorage.getItem('role') || 'user') === 'admin')
-const { stuckAgents, pendingApprovals } = useNotificationCenter()
+const { stuckAgents, pendingApprovals, failedWikiJobs } = useNotificationCenter()
 const liveAlertActive = computed(() => isAdminRole.value && stuckAgents.value > 0)
 
 // 移动端状态
@@ -369,6 +377,11 @@ onMounted(async () => {
   fetchAutoApproveSummary()
   // Sidebar attention counts (live / security) are driven by
   // useNotificationCenter — it polls when admins are mounted.
+
+  // Warm every lazy route chunk into the browser cache while the tab is
+  // idle, so sidebar navigation never depends on a live chunk fetch while an
+  // agent run keeps the backend busy (issue #515).
+  warmRouteChunks()
 })
 
 onBeforeUnmount(() => {
@@ -504,6 +517,12 @@ const navGroups = computed(() => [
         requiredCapability: 'manage:skills',
       },
       {
+        path: '/content-calendar',
+        label: t('nav.contentCalendar'),
+        icon: `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="18" rx="2" ry="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>`,
+        requiredCapability: 'manage:agents',
+      },
+      {
         path: '/plugins',
         label: t('nav.plugins'),
         icon: `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="7" width="20" height="14" rx="2" ry="2"/><path d="M16 3h-8v4h8V3z"/></svg>`,
@@ -534,6 +553,11 @@ const navGroups = computed(() => [
         icon: `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>`,
         requiredCapability: 'manage:security',
       },
+      {
+        path: '/docs',
+        label: t('nav.docs'),
+        icon: `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg>`,
+      },
     ] as NavItem[]),
   },
 ].filter((group) => group.items.length > 0))
@@ -554,6 +578,9 @@ function isNavItemActive(item: { path: string; label: string }) {
   if (item.path === '/security') {
     return route.path.startsWith('/security')
   }
+  if (item.path === '/docs') {
+    return route.path.startsWith('/docs')
+  }
   return route.path === item.path
 }
 
@@ -563,7 +590,9 @@ function logout() {
   localStorage.removeItem('token')
   localStorage.removeItem('username')
   localStorage.removeItem('role')
-  router.push('/login')
+  // 刷新页面而非 router.push：确保 keepAlive 缓存的 ChatConsole、
+  // 模块级变量（cachedAgents 等）全部清空，杜绝跨用户数据泄漏。
+  window.location.href = '/login'
 }
 
 async function changeLocale(locale: AppLocale) {

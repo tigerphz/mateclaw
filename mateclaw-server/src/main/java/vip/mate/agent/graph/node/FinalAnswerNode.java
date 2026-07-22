@@ -175,6 +175,7 @@ public class FinalAnswerNode implements NodeAction {
         // validation so the validator sees the user-visible warning rather
         // than treating the fake link as a "reference".
         finalAnswer = scrubFakeUrls(finalAnswer);
+        finalAnswer = accessor.sourceEvidenceLedger().appendWikiSourceTable(finalAnswer);
 
         SourceEvidenceLedger.Validation validation = accessor.sourceEvidenceLedger().validateAnswer(finalAnswer);
         if (finishReason == FinishReason.NORMAL && !validation.valid()) {
@@ -236,9 +237,9 @@ public class FinalAnswerNode implements NodeAction {
     }
 
     private static String appendEvidenceWarning(String answer, List<String> unsupportedReferences) {
-        return answer + "\n\n[证据不足] 以下源码引用未出现在已读取/搜索到的工具证据中："
+        return answer + "\n\n[证据不足] 以下引用未出现在本轮已读取/搜索到的工具证据中，或缺少有效来源标注："
                 + String.join(", ", unsupportedReferences)
-                + "。请继续读取相关文件后再下结论。";
+                + "。请继续检索/读取相关证据后再下结论。";
     }
 
     /**
@@ -264,12 +265,15 @@ public class FinalAnswerNode implements NodeAction {
 
     /**
      * Replace fake {@code /api/v1/files/generated/{id}} URLs (cache-miss)
-     * with a user-visible warning. No-op when no cache is wired (legacy
-     * tests) or when the answer is empty.
+     * with a user-visible warning, and wrap live bare URLs into
+     * {@code [filename](url)} markdown links so the chat shows the file name
+     * instead of the raw id. No-op when no cache is wired (legacy tests) or
+     * when the answer is empty.
      */
     private String scrubFakeUrls(String text) {
         if (generatedFileCache == null || text == null || text.isEmpty()) return text;
-        return generatedFileCache.scrubMissingReferences(text);
+        return generatedFileCache.linkifyBareReferences(
+                generatedFileCache.scrubMissingReferences(text));
     }
 
     private FinishReason parseFinishReason(String reason) {

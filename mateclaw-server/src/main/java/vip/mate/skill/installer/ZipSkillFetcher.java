@@ -8,8 +8,10 @@ import vip.mate.skill.runtime.SkillFrontmatterParser;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.nio.ByteBuffer;
 import java.nio.charset.CharacterCodingException;
 import java.nio.charset.Charset;
+import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -27,7 +29,9 @@ import java.util.zip.ZipInputStream;
  * path (downloaded ZIP bytes). Hardened against:
  * <ul>
  *   <li>Zip Slip path traversal</li>
- *   <li>Per-file ≤1MB, total ≤50MB</li>
+ *   <li>Per-file / total size caps (defaults 1MB / 50MB, configurable via
+ *       {@code mateclaw.skill.upload.max-entry-size-mb} /
+ *       {@code mateclaw.skill.upload.max-total-size-mb})</li>
  *   <li>Only SKILL.md / references/ / scripts/ entries are kept</li>
  *   <li>Binary entries are skipped with a WARN — bundle storage is text-only,
  *       so decoding them as text would persist corrupted content</li>
@@ -44,8 +48,23 @@ import java.util.zip.ZipInputStream;
 @Slf4j
 public class ZipSkillFetcher {
 
-    private static final long MAX_FILE_SIZE = 1_000_000;      // 1MB per file
-    private static final long MAX_TOTAL_SIZE = 50_000_000;     // 50MB total
+    /**
+     * Size caps applied while decompressing a bundle. Callers wire these from
+     * {@code mateclaw.skill.upload.max-entry-size-mb} /
+     * {@code mateclaw.skill.upload.max-total-size-mb}; the defaults preserve
+     * the historical 1MB-per-entry / 50MB-total behaviour. The whole archive
+     * is buffered in memory during extraction, so raising the total cap
+     * raises peak heap usage accordingly.
+     */
+    public record Limits(long maxEntryBytes, long maxTotalBytes) {
+        public static final Limits DEFAULT = ofMb(1, 50);
+
+        public static Limits ofMb(long entryMb, long totalMb) {
+            return new Limits(entryMb * 1_000_000L, totalMb * 1_000_000L);
+        }
+
+        long totalMb() { return maxTotalBytes / 1_000_000L; }
+    }
     private static final String SKILL_MD = "SKILL.md";
     private static final String SKILL_MD_LOWER = "skill.md";
 
@@ -87,16 +106,26 @@ public class ZipSkillFetcher {
      * and source URL is the original filename.
      */
     public static SkillBundle parse(MultipartFile zipFile, SkillFrontmatterParser parser) throws IOException {
+        return parse(zipFile, parser, Limits.DEFAULT);
+    }
+
+    /**
+     * Parse an uploaded ZIP file into a SkillBundle with explicit size caps
+     * (see {@link Limits}).
+     */
+    public static SkillBundle parse(MultipartFile zipFile, SkillFrontmatterParser parser,
+                                    Limits limits) throws IOException {
         if (zipFile == null || zipFile.isEmpty()) {
             throw new IllegalArgumentException("ZIP file is empty");
         }
-        if (zipFile.getSize() > MAX_TOTAL_SIZE) {
-            throw new IllegalArgumentException("ZIP file too large (max 50MB)");
+        if (zipFile.getSize() > limits.maxTotalBytes()) {
+            throw new IllegalArgumentException("ZIP file too large (max " + limits.totalMb()
+                    + "MB; adjust mateclaw.skill.upload.max-total-size-mb)");
         }
 
         ExtractedSkill extracted;
         try (InputStream is = zipFile.getInputStream()) {
-            extracted = extract(is);
+            extracted = extract(is, limits);
         }
 
         var parsed = parser.parse(extracted.skillMdContent());
@@ -140,55 +169,47 @@ public class ZipSkillFetcher {
      * instead of being silently dropped.
      */
     public static ExtractedSkill extract(InputStream zipStream) throws IOException {
-        return extract(zipStream.readAllBytes());
+        return extract(zipStream.readAllBytes(), Limits.DEFAULT);
+    }
+
+    /** Variant of {@link #extract(InputStream)} with explicit size caps. */
+    public static ExtractedSkill extract(InputStream zipStream, Limits limits) throws IOException {
+        return extract(zipStream.readAllBytes(), limits);
     }
 
     /** Fallback charset for archives authored on Chinese Windows (entry names / content in GBK). */
     private static final Charset GBK = Charset.isSupported("GBK") ? Charset.forName("GBK") : null;
 
     /**
-     * Decompress raw ZIP bytes, trying UTF-8 first and falling back to GBK when
-     * an entry name fails to decode as UTF-8 — the common failure mode for zips
-     * packaged on Chinese Windows, where filenames are GBK and UTF-8 decoding
-     * throws a {@link CharacterCodingException}. Buffering the bytes (rather than
-     * a one-shot stream) is what makes the retry possible.
+     * Decompress raw ZIP bytes into in-memory SKILL.md + references + scripts.
+     *
+     * <p>Entry names and entry content are each decoded independently — UTF-8
+     * first, falling back to GBK — rather than picking one charset for the
+     * whole archive. Zips packaged on Windows commonly mix encodings: the OS
+     * zip tool writes entry names in the local codepage (GBK) because it
+     * never sets the ZIP "language encoding flag", while file content
+     * authored in a UTF-8 text editor stays UTF-8. Deciding the charset once
+     * for the entire archive means a single GBK-named entry forces every
+     * already-correct UTF-8 file to be mis-decoded as GBK, turning valid
+     * Chinese text into mojibake.
      */
     public static ExtractedSkill extract(byte[] zipBytes) throws IOException {
-        try {
-            return extract(zipBytes, StandardCharsets.UTF_8);
-        } catch (IOException | RuntimeException e) {
-            if (GBK != null && isCharsetError(e)) {
-                log.warn("[ZipSkillFetcher] UTF-8 entry decode failed, retrying with GBK (Windows-authored archive?)");
-                return extract(zipBytes, GBK);
-            }
-            throw e;
-        }
+        return extract(zipBytes, Limits.DEFAULT);
     }
 
-    /** True if {@code t} (or any cause) is a charset-decode failure, vs a genuine "no SKILL.md" error. */
-    private static boolean isCharsetError(Throwable t) {
-        for (Throwable c = t; c != null; c = c.getCause()) {
-            if (c instanceof CharacterCodingException) {
-                return true;
-            }
-            String m = c.getMessage();
-            if (m != null && m.toLowerCase().contains("malformed")) {
-                return true;
-            }
-            if (c.getCause() == c) {
-                break;
-            }
-        }
-        return false;
-    }
-
-    private static ExtractedSkill extract(byte[] zipBytes, Charset charset) throws IOException {
+    /** Variant of {@link #extract(byte[])} with explicit size caps. */
+    public static ExtractedSkill extract(byte[] zipBytes, Limits limits) throws IOException {
         List<RawEntry> raws = new ArrayList<>();
         String skillMdContent = null;
         String skillMdPrefix = "";
         long totalSize = 0;
 
-        try (ZipInputStream zis = new ZipInputStream(new ByteArrayInputStream(zipBytes), charset)) {
+        // ISO-8859-1 maps every byte value 0-255 to a distinct character, so
+        // ZipInputStream never throws while decoding a name with it — even a
+        // raw GBK-encoded name comes back as reversible mojibake that
+        // fixEntryName() below can re-decode itself, instead of aborting the
+        // whole archive read the way a strict UTF-8/GBK charset would.
+        try (ZipInputStream zis = new ZipInputStream(new ByteArrayInputStream(zipBytes), StandardCharsets.ISO_8859_1)) {
             ZipEntry entry;
             while ((entry = zis.getNextEntry()) != null) {
                 if (entry.isDirectory()) {
@@ -196,7 +217,7 @@ public class ZipSkillFetcher {
                     continue;
                 }
 
-                String entryName = entry.getName();
+                String entryName = fixEntryName(entry.getName());
 
                 // Skip macOS archive cruft so it doesn't surface as "ignored" noise.
                 if (entryName.startsWith("__MACOSX/") || entryName.equals(".DS_Store")
@@ -214,21 +235,22 @@ public class ZipSkillFetcher {
                 }
 
                 long declaredSize = entry.getSize();
-                if (declaredSize > MAX_FILE_SIZE) {
+                if (declaredSize > limits.maxEntryBytes()) {
                     log.warn("[ZipSkillFetcher] Skipping oversized entry: {} ({}bytes)", entryName, declaredSize);
                     zis.closeEntry();
                     continue;
                 }
 
                 byte[] bytes = zis.readAllBytes();
-                if (bytes.length > MAX_FILE_SIZE) {
+                if (bytes.length > limits.maxEntryBytes()) {
                     log.warn("[ZipSkillFetcher] Skipping oversized entry post-read: {} ({}bytes)", entryName, bytes.length);
                     zis.closeEntry();
                     continue;
                 }
                 totalSize += bytes.length;
-                if (totalSize > MAX_TOTAL_SIZE) {
-                    throw new IOException("Total extracted size exceeds 50MB limit");
+                if (totalSize > limits.maxTotalBytes()) {
+                    throw new IOException("Total extracted size exceeds " + limits.totalMb()
+                            + "MB limit (adjust mateclaw.skill.upload.max-total-size-mb)");
                 }
 
                 // Skill bundles persist file contents as text (mate_skill_file
@@ -248,7 +270,7 @@ public class ZipSkillFetcher {
                     continue;
                 }
 
-                String content = new String(bytes, charset);
+                String content = decodeBytes(bytes);
                 String normalizedName = entryPath.toString().replace('\\', '/');
                 String fileName = entryPath.getFileName().toString();
 
@@ -306,6 +328,64 @@ public class ZipSkillFetcher {
         }
 
         return new ExtractedSkill(skillMdContent, references, scripts);
+    }
+
+    /**
+     * Re-decode a ZIP entry name that {@link ZipInputStream} returned via the
+     * byte-preserving ISO-8859-1 read. If the archive's language-encoding
+     * flag was actually set for this entry, the JDK already forced a real
+     * UTF-8 decode and the name contains genuine non-Latin-1 characters —
+     * left untouched. Otherwise the name is just the raw bytes reinterpreted
+     * as Latin-1 (fully reversible), so the original bytes are recovered and
+     * decoded again, trying UTF-8 then falling back to GBK.
+     */
+    private static String fixEntryName(String name) {
+        if (!isLatin1(name)) {
+            return name;
+        }
+        return decodeBytes(name.getBytes(StandardCharsets.ISO_8859_1));
+    }
+
+    private static boolean isLatin1(String s) {
+        for (int i = 0; i < s.length(); i++) {
+            if (s.charAt(i) > 0xFF) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Decode raw bytes as text, trying UTF-8 first and falling back to GBK —
+     * per entry, not per archive, so one mis-encoded name or file doesn't
+     * force a lossy re-decode of everything else that was already correct.
+     * Falls back to a lossy UTF-8 decode (replacement characters) only if
+     * neither charset parses cleanly.
+     */
+    private static String decodeBytes(byte[] bytes) {
+        String utf8 = tryDecodeStrict(bytes, StandardCharsets.UTF_8);
+        if (utf8 != null) {
+            return utf8;
+        }
+        if (GBK != null) {
+            String gbk = tryDecodeStrict(bytes, GBK);
+            if (gbk != null) {
+                return gbk;
+            }
+        }
+        return new String(bytes, StandardCharsets.UTF_8);
+    }
+
+    private static String tryDecodeStrict(byte[] bytes, Charset charset) {
+        try {
+            return charset.newDecoder()
+                    .onMalformedInput(CodingErrorAction.REPORT)
+                    .onUnmappableCharacter(CodingErrorAction.REPORT)
+                    .decode(ByteBuffer.wrap(bytes))
+                    .toString();
+        } catch (CharacterCodingException e) {
+            return null;
+        }
     }
 
     /**

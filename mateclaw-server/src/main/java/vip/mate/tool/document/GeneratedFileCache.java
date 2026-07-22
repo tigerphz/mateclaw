@@ -20,6 +20,7 @@ import java.time.Duration;
 import java.util.Base64;
 import java.util.Collections;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
@@ -235,6 +236,71 @@ public class GeneratedFileCache {
         return Optional.of(entry);
     }
 
+    /**
+     * Best-effort lookup of a live entry's id by its logical filename, optionally
+     * constrained to a mime-type prefix (e.g. {@code "image/"}). Scans the
+     * in-memory cache first — which covers the common case of a reference to a
+     * file generated earlier in the same run — then persisted metadata on disk as
+     * a durable fallback. Returns the first live match, or empty.
+     *
+     * <p>This exists to self-heal references that point at a file's logical
+     * <em>name</em> ({@code cover_xyz.png}) rather than its issued id: such a
+     * reference cannot be resolved by {@link #GENERATED_URL_PATTERN} (the id
+     * capture group stops at the first {@code _} or {@code .}), so a name-based
+     * fallback recovers the real, servable id instead of yielding a broken link.
+     */
+    public Optional<String> findIdByFilename(String filename, @Nullable String mimePrefix) {
+        if (filename == null || filename.isBlank()) {
+            return Optional.empty();
+        }
+        String target = filename.trim();
+        // 1. In-memory — the fresh-same-run case, and cheap.
+        synchronized (entries) {
+            for (Map.Entry<String, Entry> e : entries.entrySet()) {
+                Entry v = e.getValue();
+                if (!v.expired() && target.equalsIgnoreCase(v.filename())
+                        && (mimePrefix == null
+                            || (v.mimeType() != null && v.mimeType().startsWith(mimePrefix)))) {
+                    return Optional.of(e.getKey());
+                }
+            }
+        }
+        // 2. Disk metas — durable fallback (survives memory eviction / restart).
+        if (!Files.isDirectory(storageDir)) {
+            return Optional.empty();
+        }
+        List<Path> metas;
+        try (Stream<Path> files = Files.list(storageDir)) {
+            metas = files.filter(p -> p.getFileName().toString().endsWith(META_SUFFIX)).toList();
+        } catch (IOException e) {
+            log.debug("findIdByFilename disk scan failed: {}", e.toString());
+            return Optional.empty();
+        }
+        long now = System.currentTimeMillis();
+        for (Path metaPath : metas) {
+            try {
+                String[] parts = Files.readString(metaPath).split("\t", 3);
+                if (Long.parseLong(parts[0].trim()) <= now) {
+                    continue;
+                }
+                String mime = parts.length > 1 && !parts[1].isEmpty() ? parts[1] : null;
+                if (mimePrefix != null && (mime == null || !mime.startsWith(mimePrefix))) {
+                    continue;
+                }
+                String fn = parts.length > 2 && !parts[2].isEmpty()
+                        ? new String(Base64.getDecoder().decode(parts[2]), StandardCharsets.UTF_8)
+                        : null;
+                if (fn != null && target.equalsIgnoreCase(fn)) {
+                    String name = metaPath.getFileName().toString();
+                    return Optional.of(name.substring(0, name.length() - META_SUFFIX.length()));
+                }
+            } catch (Exception ignore) {
+                // Skip unreadable / malformed meta.
+            }
+        }
+        return Optional.empty();
+    }
+
     private void persist(String id, Entry entry) {
         if (entry.bytes() == null) {
             return;
@@ -344,6 +410,51 @@ public class GeneratedFileCache {
             String id = m.group(1);
             boolean live = get(id).isPresent();
             String replacement = live ? m.group(0) : MISSING_REFERENCE_NOTICE;
+            m.appendReplacement(out, Matcher.quoteReplacement(replacement));
+        }
+        m.appendTail(out);
+        return out.toString();
+    }
+
+    /**
+     * Wrap bare {@code /api/v1/files/generated/{id}} URLs whose id is live
+     * into a {@code [filename](url)} markdown link, so chat surfaces render
+     * the file name instead of the raw id URL. Models frequently echo the
+     * download URL as plain text ("下载链接：http://…/{uuid}") even though the
+     * tool result hands them a ready-made markdown link; autolink rendering
+     * then displays the UUID to the user.
+     *
+     * <p>URLs already serving as a markdown link destination (directly
+     * preceded by {@code ](}) are left untouched, whatever their link text —
+     * the model may have chosen a legitimate custom label. Cache misses are
+     * also left untouched; {@link #scrubMissingReferences} owns that case.
+     */
+    public String linkifyBareReferences(String text) {
+        if (text == null || text.isEmpty()) return text;
+        Matcher m = GENERATED_URL_PATTERN.matcher(text);
+        if (!m.find()) return text;
+        StringBuilder out = new StringBuilder();
+        m.reset();
+        while (m.find()) {
+            String replacement = m.group(0);
+            int s = m.start();
+            boolean isLinkDestination = s >= 2
+                    && text.charAt(s - 1) == '('
+                    && text.charAt(s - 2) == ']';
+            // Angle-bracket autolinks (<url>) must not be wrapped either —
+            // "[name](<url>)" with the brackets kept inline breaks rendering.
+            boolean isAngleAutolink = s >= 1 && text.charAt(s - 1) == '<';
+            if (!isLinkDestination && !isAngleAutolink) {
+                String filename = get(m.group(1))
+                        .map(Entry::filename)
+                        .filter(n -> n != null && !n.isBlank())
+                        // Square brackets would terminate the link text early.
+                        .map(n -> n.replaceAll("[\\[\\]]", ""))
+                        .orElse(null);
+                if (filename != null) {
+                    replacement = "[" + filename + "](" + m.group(0) + ")";
+                }
+            }
             m.appendReplacement(out, Matcher.quoteReplacement(replacement));
         }
         m.appendTail(out);

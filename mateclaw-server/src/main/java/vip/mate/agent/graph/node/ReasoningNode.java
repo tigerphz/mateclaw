@@ -22,6 +22,7 @@ import vip.mate.llm.chatmodel.ThinkingLevelHolder;
 import vip.mate.agent.graph.NodeStreamingChatHelper;
 import vip.mate.agent.context.ConversationWindowManager;
 import vip.mate.agent.context.LoopBudgetConfig;
+import vip.mate.agent.context.PrefixBudgetPlan;
 import vip.mate.agent.context.LoopMessageBudgeter;
 import vip.mate.agent.context.RuntimeContextInjector;
 import vip.mate.agent.context.TokenEstimator;
@@ -141,19 +142,96 @@ public class ReasoningNode implements NodeAction {
             + "required step is already done, output the final answer to the user now.";
 
     /**
-     * A turn carrying no tool call, no content, and no thinking is not a usable
-     * answer — it would route to the final-answer branch as an empty string and
-     * terminate the run. Fatal / prompt-too-long / partial results are handled by
-     * their own branches and must not be misread as "empty".
+     * Continuation nudge for the most common premature-stop pattern: an empty
+     * turn immediately after a successful tool call. The tool result is already
+     * in context but the model stopped before writing the user-facing answer
+     * (e.g. a download URL produced by a send-file tool). Anchoring the nudge to
+     * the tool result recovers the answer in the same run instead of leaving the
+     * user to send another message to resume.
      */
-    static boolean isEmptyCompletion(NodeStreamingChatHelper.StreamResult result) {
+    private static final String POST_TOOL_EMPTY_NUDGE =
+            "上一步工具已成功返回(结果在上文)。请基于工具结果直接给出面向用户的最终答复"
+            + "(例如下载地址 / 执行结论),不要停在思考阶段,也不要只描述\"接下来要做什么\"。";
+
+    /**
+     * Continuation nudge for a turn that carries reasoning/thinking but no
+     * visible content and no tool call. Interleaved-thinking models sometimes
+     * "decide" the task is done in their reasoning yet never emit the answer
+     * text; this re-prompts them to write it (or call the next tool).
+     */
+    private static final String THINKING_ONLY_NUDGE =
+            "你已完成思考但还没有输出正文。请现在把面向用户的最终答案写出来;"
+            + "如果还有未完成的步骤,则立即调用对应工具。";
+
+    /**
+     * Why a no-tool-call reasoning turn cannot yet be accepted as a final answer.
+     * Both non-FINAL states route a turn into the bounded continuation-nudge loop
+     * instead of letting the final-answer branch emit an empty string and end the
+     * run prematurely.
+     */
+    enum ContinuationIntent {
+        /**
+         * Real user-facing content present, or a tool call, or a failure owned by
+         * another branch (fatal / prompt-too-long / partial) — finalize normally.
+         */
+        FINAL,
+        /**
+         * Reasoning/thinking present but no visible content and no tool call. The
+         * model "thought it was done" without writing the answer — common on
+         * interleaved-thinking models after a tool result. Nudge it to emit it.
+         */
+        THINKING_ONLY,
+        /** No content, no thinking, no tool call — a fully blank turn. Nudge to continue. */
+        BLANK,
+    }
+
+    /**
+     * Classify a no-tool-call turn's continuation intent. Fatal / prompt-too-long
+     * / partial results are handled by their own branches and must not be misread
+     * as needing a nudge.
+     */
+    static ContinuationIntent classifyContinuation(NodeStreamingChatHelper.StreamResult result) {
         if (result == null || result.hasToolCalls() || result.hasFatalError()
                 || result.isPromptTooLong() || result.partial()) {
-            return false;
+            return ContinuationIntent.FINAL;
         }
         boolean noContent = result.text() == null || result.text().isBlank();
+        if (!noContent) {
+            return ContinuationIntent.FINAL;
+        }
         boolean noThinking = result.thinking() == null || result.thinking().isBlank();
-        return noContent && noThinking;
+        return noThinking ? ContinuationIntent.BLANK : ContinuationIntent.THINKING_ONLY;
+    }
+
+    /**
+     * A fully blank turn (no tool call, no content, no thinking) is not a usable
+     * answer — it would route to the final-answer branch as an empty string and
+     * terminate the run. Retained as a thin predicate over {@link #classifyContinuation}.
+     */
+    static boolean isEmptyCompletion(NodeStreamingChatHelper.StreamResult result) {
+        return classifyContinuation(result) == ContinuationIntent.BLANK;
+    }
+
+    /**
+     * True when the newest conversational turn in the model input is a tool
+     * response — i.e. the model is about to reason over a fresh tool result. Used
+     * to pick the result-anchored continuation nudge for the common "empty turn
+     * right after a tool call" stop pattern.
+     */
+    static boolean lastTurnIsToolResponse(List<Message> messages) {
+        if (messages == null) {
+            return false;
+        }
+        for (int i = messages.size() - 1; i >= 0; i--) {
+            Message m = messages.get(i);
+            if (m instanceof ToolResponseMessage) {
+                return true;
+            }
+            if (m instanceof UserMessage || m instanceof AssistantMessage) {
+                return false;
+            }
+        }
+        return false;
     }
 
     /**
@@ -193,6 +271,40 @@ public class ReasoningNode implements NodeAction {
             + "  · 漏做项目 → 任务不完整 → 撞 max_iterations 还没干完\n"
             + "  · ledger snapshot 永远显示初始状态，对你毫无帮助\n\n"
             + "**例外**：单一问题、简单问答、不可拆解的请求 — 不需要用。\n";
+
+    private static final String GROUNDED_CONTRACT = "\n\n"
+            + "## 回答来源约束（强制规则）\n\n"
+            + "**核心原则**：你的回答必须完全基于工具返回的信息（证据），不得使用内部知识编造内容。\n\n"
+            + "**必须遵守**：\n"
+            + "1. **仅据证据作答**：如果工具返回的信息不足以回答问题，必须明确说明\"根据现有信息无法回答此问题\"。\n"
+            + "2. **标记引用来源**：回答中引用的每个事实性陈述都必须用方括号数字标记来源，例如 [1]、[2]。\n"
+            + "3. **文末列出来源**：在回答末尾列出所有引用的来源列表，格式为：\n"
+            + "   [1] 页面标题 - 章节（如有）\n"
+            + "   [2] 页面标题 - 章节（如有）\n"
+            + "4. **禁止捏造来源**：不得引用未在本次对话中通过工具获取的页面或文件。\n"
+            + "5. **内容忠实**：必须准确反映证据内容，不得歪曲、编造或过度推断。\n\n"
+            + "**违规后果**：未按规则引用来源或使用未验证的信息将导致回答被拒绝。\n";
+
+    private static String buildGroundedSystemPrompt(String basePrompt, boolean groundingEnforced) {
+        String prompt = basePrompt + TOOL_USE_ENFORCEMENT;
+        return groundingEnforced ? prompt + GROUNDED_CONTRACT : prompt;
+    }
+
+    /**
+     * The grounded-answer contract (cite-or-refuse) only fits agents that retrieve
+     * from a knowledge base. Detecting a bound {@code wiki_*} tool scopes the strict
+     * regime to those scenarios instead of degrading every agent — a casual agent
+     * with no KB should not be forced to refuse or emit [n] citations.
+     */
+    private boolean hasWikiTool() {
+        if (toolCallbacks == null) {
+            return false;
+        }
+        return toolCallbacks.stream().anyMatch(cb -> {
+            String name = cb.getToolDefinition().name();
+            return name != null && name.toLowerCase(Locale.ROOT).replace("-", "_").startsWith("wiki_");
+        });
+    }
 
     private final ChatModel chatModel;
     private final List<ToolCallback> toolCallbacks;
@@ -238,6 +350,66 @@ public class ReasoningNode implements NodeAction {
      * the prompt is identical to pre-feature behavior.
      */
     private final vip.mate.agent.progress.ProgressLedgerService progressLedgerService;
+
+    /**
+     * Token budget for the optional prefix injection blocks, computed at
+     * agent-build time against the model's effective context window. Null
+     * when the graph was assembled without budgeting (tests, legacy paths) —
+     * all injection sites then keep their previous absolute-cap behavior.
+     */
+    private PrefixBudgetPlan prefixBudgetPlan;
+
+    public void setPrefixBudgetPlan(PrefixBudgetPlan prefixBudgetPlan) {
+        this.prefixBudgetPlan = prefixBudgetPlan;
+    }
+
+    /**
+     * Core-tier tools auto-demoted to the extension catalog because the
+     * advertised schemas exceeded the window's tool-schema budget. Decided
+     * once at agent-build time (kept stable for prompt caching); the baked
+     * extension catalog lists them so {@code enable_tool} can surface any of
+     * them back.
+     */
+    private Set<String> autoDemotedTools = Set.of();
+
+    public void setAutoDemotedTools(Set<String> autoDemotedTools) {
+        this.autoDemotedTools = autoDemotedTools == null ? Set.of() : autoDemotedTools;
+    }
+
+    /**
+     * C4: per-conversation registry of environment-change notifications.
+     * When non-null, each reasoning turn drains pending notifications and
+     * injects them as a single {@code SystemMessage} so the LLM sees that
+     * an MCP server disconnected or a skill was updated mid-turn. Null in
+     * tests / legacy paths — injection is simply skipped.
+     */
+    private vip.mate.agent.runtime.RunningConversationRegistry runningConversationRegistry;
+
+    public void setRunningConversationRegistry(
+            vip.mate.agent.runtime.RunningConversationRegistry runningConversationRegistry) {
+        this.runningConversationRegistry = runningConversationRegistry;
+    }
+
+    /** Floor for the window-aware output clamp — an answer needs at least this much room. */
+    private static final int MIN_CLAMPED_OUTPUT_TOKENS = 512;
+
+    /**
+     * Output cap actually sent to the provider. Strict local servers (vLLM)
+     * statically reject {@code max_tokens >= max_model_len}, so when the
+     * effective context window is known and smaller than the configured /
+     * default output cap, clamp to half the window (leaving the other half
+     * for the prompt). No-op when the window is unknown or already larger.
+     */
+    int effectiveMaxOutputTokens() {
+        int window = (prefixBudgetPlan != null) ? prefixBudgetPlan.effectiveMaxTokens() : 0;
+        if (window > 0 && maxOutputTokens >= window) {
+            int clamped = Math.max(MIN_CLAMPED_OUTPUT_TOKENS, window / 2);
+            log.info("[ReasoningNode] max_tokens {} ≥ 模型窗口 {},钳制为 {}(窗口一半)以避免服务端拒绝",
+                    maxOutputTokens, window, clamped);
+            return clamped;
+        }
+        return maxOutputTokens;
+    }
 
     public ReasoningNode(ChatModel chatModel, AgentToolSet toolSet, String reasoningEffort,
                          NodeStreamingChatHelper streamingHelper,
@@ -359,6 +531,12 @@ public class ReasoningNode implements NodeAction {
      * otherwise the documented fallback.
      */
     private int loopContextWindowTokens() {
+        // Per-model effective window (explicit config or probed) beats the
+        // global default — the loop budgeter is otherwise blind to small
+        // local models and never trims for them.
+        if (prefixBudgetPlan != null && prefixBudgetPlan.effectiveMaxTokens() > 0) {
+            return prefixBudgetPlan.effectiveMaxTokens();
+        }
         if (conversationWindowManager != null) {
             int v = conversationWindowManager.getDefaultMaxInputTokens();
             if (v > 0) return v;
@@ -448,17 +626,16 @@ public class ReasoningNode implements NodeAction {
 
         // ======= 构建 Prompt =======
         String systemPrompt = accessor.systemPrompt();
-        // Append a tool-use enforcement clause to every ReasoningNode call.
-        // Without it, some models (notably DeepSeek thinking and Claude Opus)
-        // tend to "narrate" — emit a final_answer like "现在直接生成立项材料
-        // docx" instead of actually calling renderDocx, which makes the
-        // graph silently terminate at final_answer_node with the narration
-        // as the user-facing reply.
+        // Tool-use enforcement is always appended: without it some models tend to
+        // "narrate" instead of calling tools. The grounded contract (cite-or-refuse)
+        // is appended only when the agent has a knowledge-base (wiki_*) tool bound,
+        // so KB-grounded scenarios get strict source attribution while general
+        // agents keep their normal answering behaviour.
         //
         // Appended at runtime rather than woven into the AgentEntity-stored
         // prompt so it stays out of the user-editable agent UI but is still
         // always-on for the runtime LLM.
-        systemPrompt = systemPrompt + TOOL_USE_ENFORCEMENT;
+        systemPrompt = buildGroundedSystemPrompt(systemPrompt, hasWikiTool());
         List<Message> messages = accessor.messages();
 
         // Per-loop budget: bound the working message list a single Reasoning
@@ -509,6 +686,8 @@ public class ReasoningNode implements NodeAction {
         String workspaceBasePath = state.value(vip.mate.agent.graph.state.MateClawStateKeys.WORKSPACE_BASE_PATH, "");
         String agentIdStr = state.value(MateClawStateKeys.AGENT_ID, "");
         String userMsg = state.value(MateClawStateKeys.USER_MESSAGE, "");
+        String runtimeModelName = state.value(MateClawStateKeys.RUNTIME_MODEL_NAME, "");
+        String runtimeProviderId = state.value(MateClawStateKeys.RUNTIME_PROVIDER_ID, "");
 
         // Build the non-history prefix ONCE. The PTL retry branch below
         // reuses this list verbatim so the retried prompt has exactly the
@@ -517,17 +696,20 @@ public class ReasoningNode implements NodeAction {
         // segment which led to "answer regressed after compaction"
         // complaints on long sessions.
         List<Message> nonHistoryPrefix = buildNonHistoryPrefix(systemPrompt, workspaceBasePath, agentIdStr, userMsg,
-                accessor.chatOrigin());
+                accessor.chatOrigin(), runtimeModelName, runtimeProviderId);
 
-        // Append the runtime-rendered skill catalog as a SEPARATE SystemMessage
-        // right after the skeleton system prompt. Keeping it out of the baked
-        // prompt keeps the stable prefix's prompt-cache hash intact, while
-        // re-rendering each turn lets skills loaded this run (load_skill) pin
-        // to the top of the catalog. Reused verbatim by the PTL retry branch.
+        // Append the skill catalog as a SEPARATE SystemMessage right after the
+        // skeleton system prompt. Rendered with an empty loadedThisRun set so
+        // the catalog content stays stable across turns — this lets the
+        // system+catalog SystemMessage pair be served from the prompt cache
+        // (Anthropic SYSTEM_AND_TOOLS / OpenAI prefix cache). The per-turn
+        // "skills loaded this run" hint is injected separately as a volatile
+        // suffix (after RuntimeContext) so it never invalidates the cached
+        // prefix. Reused verbatim by the PTL retry branch.
         if (skillCatalogRenderer != null) {
-            String skillCatalog = skillCatalogRenderer.render(accessor.loadedSkills());
-            if (skillCatalog != null && !skillCatalog.isBlank()) {
-                nonHistoryPrefix.add(1, new SystemMessage(skillCatalog));
+            String staticCatalog = skillCatalogRenderer.render(java.util.Set.of());
+            if (staticCatalog != null && !staticCatalog.isBlank()) {
+                nonHistoryPrefix.add(1, new SystemMessage(staticCatalog));
             }
         }
 
@@ -567,6 +749,44 @@ public class ReasoningNode implements NodeAction {
             }
         }
 
+        // C4: drain any environment-change notifications that landed while
+        // this conversation was running (MCP disconnect, skill update, etc.)
+        // and inject them as a one-shot SystemMessage. Each notification is
+        // delivered at most once — drain() empties the queue. Skipped when
+        // the registry is absent (tests / legacy paths) or the conversation
+        // has no pending notifications.
+        if (runningConversationRegistry != null && conversationId != null && !conversationId.isBlank()) {
+            try {
+                List<vip.mate.agent.runtime.EnvironmentNotification> notes =
+                        runningConversationRegistry.drain(conversationId);
+                if (!notes.isEmpty()) {
+                    String block = renderEnvironmentNotifications(notes);
+                    if (block != null) {
+                        nonHistoryPrefix.add(new SystemMessage(block));
+                        log.info("[ReasoningNode] Injected {} environment notification(s) for conv {}",
+                                notes.size(), conversationId);
+                    }
+                }
+            } catch (Exception e) {
+                log.warn("[ReasoningNode] Failed to drain environment notifications for {}: {}",
+                        conversationId, e.getMessage());
+            }
+        }
+
+        // Per-turn "skills loaded this run" hint — kept out of the stable
+        // catalog segment (which is rendered with an empty loadedThisRun set
+        // so it stays prompt-cache-friendly). Injected here as a volatile
+        // suffix so the model still sees which skills it already pulled in
+        // via load_skill this run, without invalidating the cached
+        // system+catalog SystemMessage prefix.
+        java.util.Set<String> loadedThisRun = accessor.loadedSkills();
+        if (loadedThisRun != null && !loadedThisRun.isEmpty()) {
+            String hint = renderLoadedSkillsHint(loadedThisRun);
+            if (hint != null) {
+                nonHistoryPrefix.add(new SystemMessage(hint));
+            }
+        }
+
         if (conversationWindowManager != null) {
             // Age-based compaction first: drop the body of tool responses
             // older than the K most recent into a one-line placeholder that
@@ -597,12 +817,34 @@ public class ReasoningNode implements NodeAction {
         // so an enable_tool call earlier in this loop takes effect immediately.
         // Falls back to the full tool set when no disclosure service is wired.
         List<ToolCallback> activeCallbacks = (toolDisclosureService != null && toolSet != null)
-                ? toolDisclosureService.split(toolSet, accessor.enabledExtensionTools()).activeCallbacks()
+                ? toolDisclosureService.split(toolSet, accessor.enabledExtensionTools(), autoDemotedTools)
+                        .activeCallbacks()
                 : toolCallbacks;
 
         ChatOptions options = buildChatOptions(effectiveReasoning, activeCallbacks);
 
         Prompt prompt = new Prompt(promptMessages, options);
+
+        // Prefix accounting: how much of the window the never-trimmed prefix
+        // (system prompt + runtime context + wiki + skill catalog + ledger)
+        // and the advertised tool schemas consume. Logged on the turn's first
+        // call so a small-window overflow is diagnosable per block instead of
+        // surfacing as an opaque provider 400.
+        int prefixEstimateTokens = TokenEstimator.estimateTokens(nonHistoryPrefix);
+        int toolSchemaEstimateTokens = TokenEstimator.estimateToolsTokens(activeCallbacks);
+        if (accessor.llmCallCount() == 0) {
+            log.info("[ReasoningNode] Prefix accounting conv={}: window={} tokens, prefix={} "
+                            + "(system+context+wiki+skills+ledger), toolSchemas={}, history={}",
+                    conversationId, loopContextWindowTokens(), prefixEstimateTokens,
+                    toolSchemaEstimateTokens, TokenEstimator.estimateTokens(messages));
+        }
+        // The prefix cannot be compacted (history compaction is the only lever),
+        // so a prefix that alone exceeds the window makes the request doomed —
+        // fail fast with the same PROMPT_TOO_LONG shape a provider rejection
+        // would produce instead of sending it. Gated on budgeting being active
+        // (an estimation false-positive must not block requests otherwise).
+        boolean prefixOverflow = prefixBudgetPlan != null && prefixBudgetPlan.enabled()
+                && prefixEstimateTokens + toolSchemaEstimateTokens > prefixBudgetPlan.effectiveMaxTokens();
 
         // ======= LLM 调用区域 =======
         // nextLlmCallCount 在首次 streamCall 之前计算。
@@ -633,7 +875,19 @@ public class ReasoningNode implements NodeAction {
 
         NodeStreamingChatHelper.StreamResult result;
         try {
-            result = streamingHelper.streamCall(chatModel, prompt, conversationId, "reasoning");
+            if (prefixOverflow) {
+                String overflowMessage = "Prompt 前缀估算 " + (prefixEstimateTokens + toolSchemaEstimateTokens)
+                        + " tokens(注入块 " + prefixEstimateTokens + " + 工具 schema " + toolSchemaEstimateTokens
+                        + ")已超过模型上下文窗口 " + prefixBudgetPlan.effectiveMaxTokens()
+                        + " tokens,历史压缩无法解决——请精简 Agent 身份 prompt、减少绑定工具/技能,"
+                        + "或换用更大窗口的模型";
+                log.error("[ReasoningNode] {}", overflowMessage);
+                result = new NodeStreamingChatHelper.StreamResult(null, null, null, List.of(), false,
+                        0, 0, false, overflowMessage,
+                        NodeStreamingChatHelper.ErrorType.PROMPT_TOO_LONG, false, 0, 0, 0);
+            } else {
+                result = streamingHelper.streamCall(chatModel, prompt, conversationId, "reasoning");
+            }
 
             // PTL 处理：结构化压缩后重试。复用 nonHistoryPrefix 保证重试
             // Prompt 仍带 wiki / runtime context；早期的 tail-only 路径会把
@@ -675,22 +929,40 @@ public class ReasoningNode implements NodeAction {
                 }
             }
 
-            // Empty-completion guard: a turn with no tool call, no content, and
-            // no thinking is not a real answer. Under heavy message-window
-            // trimming on long multi-step tasks the model occasionally emits a
-            // blank turn; the final-answer branch would then treat it as "done"
-            // (finalAnswer="") and end the run prematurely (observed: a 10-item
-            // research task stopping at item 2). Re-prompt it to continue —
-            // bounded, so a model that genuinely has nothing left still
-            // terminates cleanly through the normal empty-answer path below.
+            // Continuation guard: a no-tool-call turn with no visible content is
+            // not a real answer, whether it is fully blank or carries only
+            // reasoning. The final-answer branch would otherwise treat it as
+            // "done" (finalAnswer="") and end the run prematurely. Two shapes:
+            //   BLANK         — no content, no thinking, no tool call. Seen under
+            //                   heavy message-window trimming on long multi-step
+            //                   tasks (a 10-item research task stopping at item 2).
+            //   THINKING_ONLY — reasoning present but no content and no tool call.
+            //                   Interleaved-thinking models "decide" they are done
+            //                   in their reasoning yet never emit the answer text;
+            //                   most often right after a tool result (e.g. a
+            //                   send-file tool succeeds but the download URL is
+            //                   never written, so the user has to send another
+            //                   message to resume).
+            // Re-prompt to continue — bounded, so a model that genuinely has
+            // nothing left still terminates cleanly through the normal
+            // empty-answer path below. When the newest turn is a tool result, an
+            // answer-anchored nudge recovers the user-facing reply in the same run.
             int emptyRetries = 0;
-            while (emptyRetries < MAX_EMPTY_COMPLETION_RETRIES && isEmptyCompletion(result)) {
+            for (ContinuationIntent intent = classifyContinuation(result);
+                    emptyRetries < MAX_EMPTY_COMPLETION_RETRIES && intent != ContinuationIntent.FINAL;
+                    intent = classifyContinuation(result)) {
                 emptyRetries++;
-                log.warn("[ReasoningNode] Empty LLM completion (no tool call / content / thinking); "
-                                + "nudging to continue (retry {}/{}), conv={}",
-                        emptyRetries, MAX_EMPTY_COMPLETION_RETRIES, conversationId);
+                boolean afterTool = lastTurnIsToolResponse(promptMessages);
+                String nudge = afterTool
+                        ? POST_TOOL_EMPTY_NUDGE
+                        : (intent == ContinuationIntent.THINKING_ONLY
+                                ? THINKING_ONLY_NUDGE
+                                : EMPTY_COMPLETION_NUDGE);
+                log.warn("[ReasoningNode] {} completion (afterTool={}); nudging to continue "
+                                + "(retry {}/{}), conv={}",
+                        intent, afterTool, emptyRetries, MAX_EMPTY_COMPLETION_RETRIES, conversationId);
                 List<Message> nudgedMessages = new ArrayList<>(promptMessages);
-                nudgedMessages.add(new UserMessage(EMPTY_COMPLETION_NUDGE));
+                nudgedMessages.add(new UserMessage(nudge));
                 Prompt nudgePrompt = new Prompt(nudgedMessages, options);
                 nextLlmCallCount++;
                 result = streamingHelper.streamCall(
@@ -863,12 +1135,14 @@ public class ReasoningNode implements NodeAction {
                     "iteration", accessor.iterationCount(),
                     "answerChars", content != null ? content.length() : 0
             ));
+            String answerWithSources = accessor.sourceEvidenceLedger()
+                    .appendWikiSourceTable(content != null ? content : "");
             SourceEvidenceLedger.Validation validation =
-                    accessor.sourceEvidenceLedger().validateAnswer(content != null ? content : "");
+                    accessor.sourceEvidenceLedger().validateAnswer(answerWithSources);
             boolean evidenceInsufficient = !validation.valid();
             String finalAnswer = evidenceInsufficient
                     ? evidenceWarning(validation.unsupportedReferences())
-                    : (content != null ? content : "");
+                    : answerWithSources;
             if (evidenceInsufficient) {
                 log.warn("[ReasoningNode] Evidence insufficient for final answer, unsupportedReferences={}",
                         validation.unsupportedReferences());
@@ -891,7 +1165,7 @@ public class ReasoningNode implements NodeAction {
                     .currentPhase("reasoning")
                     .streamedContent(evidenceInsufficient ? (content != null ? content : "") : "")
                     .finishReason(evidenceInsufficient ? FinishReason.EVIDENCE_INSUFFICIENT : FinishReason.NORMAL)
-                    .contentStreamed(!evidenceInsufficient)
+                    .contentStreamed(!evidenceInsufficient && Objects.equals(answerWithSources, content != null ? content : ""))
                     .thinkingStreamed(!result.thinking().isEmpty())
                     .llmCallCount(nextLlmCallCount)
                     .mergeUsage(state, result)
@@ -901,9 +1175,9 @@ public class ReasoningNode implements NodeAction {
     }
 
     private static String evidenceWarning(List<String> unsupportedReferences) {
-        return "\n\n[证据不足] 以下源码引用未出现在已读取/搜索到的工具证据中："
+        return "\n\n[证据不足] 以下引用未出现在本轮已读取/搜索到的工具证据中，或缺少有效来源标注："
                 + String.join(", ", unsupportedReferences)
-                + "。请继续读取相关文件后再下结论。";
+                + "。请继续检索/读取相关证据后再下结论。";
     }
 
     private AssistantMessage.ToolCall deserializeToolCall(String json) {
@@ -933,6 +1207,53 @@ public class ReasoningNode implements NodeAction {
             if (ev != null) out.add(ev);
         }
         return out;
+    }
+
+    /**
+     * C4: render drained environment notifications into a single markdown
+     * block suitable for injection as a {@code SystemMessage} in
+     * {@code nonHistoryPrefix}. Returns {@code null} for an empty list so the
+     * caller can skip injection entirely (no "(empty)" noise).
+     */
+    // Package-private so black-box tests in vip.mate.agent.graph.node can
+    // exercise the real production rendering without duplicating the format.
+    static String renderEnvironmentNotifications(
+            List<vip.mate.agent.runtime.EnvironmentNotification> notes) {
+        if (notes == null || notes.isEmpty()) {
+            return null;
+        }
+        StringBuilder sb = new StringBuilder(128);
+        sb.append("## 📢 环境变更通知（本轮新增，请立即据此调整计划）\n\n");
+        for (vip.mate.agent.runtime.EnvironmentNotification n : notes) {
+            sb.append("- ").append(n.message()).append('\n');
+        }
+        sb.append("\n以上通知由 Java 运行时检测并注入，权威可信。")
+                .append("如果通知涉及你正在使用的工具/skill，请立即调整后续步骤；")
+                .append("如果与当前任务无关，可忽略。");
+        return sb.toString();
+    }
+
+    /**
+     * Render the per-turn "skills loaded this run" hint as a short
+     * SystemMessage. Kept out of the stable skill-catalog segment (which is
+     * rendered with an empty loadedThisRun set for prompt-cache stability)
+     * so the model still knows which skills it already pulled in via
+     * load_skill without invalidating the cached system+catalog prefix.
+     * Returns {@code null} for an empty set so the caller can skip
+     * injection entirely.
+     */
+    // Package-private so tests can exercise the format without duplicating it.
+    static String renderLoadedSkillsHint(java.util.Set<String> loadedThisRun) {
+        if (loadedThisRun == null || loadedThisRun.isEmpty()) {
+            return null;
+        }
+        StringBuilder sb = new StringBuilder(96);
+        sb.append("Skills already loaded this run (available in context, do not re-load): ");
+        sb.append(String.join(", ", loadedThisRun.stream()
+                .map(n -> "`" + n + "`")
+                .toList()));
+        sb.append('.');
+        return sb.toString();
     }
 
     /**
@@ -967,10 +1288,13 @@ public class ReasoningNode implements NodeAction {
                                         String workspaceBasePath,
                                         String agentIdStr,
                                         String userMsg,
-                                        vip.mate.agent.context.ChatOrigin chatOrigin) {
+                                        vip.mate.agent.context.ChatOrigin chatOrigin,
+                                        String runtimeModelName,
+                                        String runtimeProviderId) {
         List<Message> prefix = new ArrayList<>();
         prefix.add(new SystemMessage(systemPrompt));
-        prefix.add(new UserMessage(RuntimeContextInjector.buildContextMessage(workspaceBasePath, null, chatOrigin)));
+        prefix.add(new UserMessage(RuntimeContextInjector.buildContextMessage(
+                workspaceBasePath, null, chatOrigin, runtimeModelName, runtimeProviderId)));
         // When this turn already recalled the user's own current project from
         // structured memory, skip auto-injecting knowledge-base reference context.
         // Otherwise the KB pages (reference material, possibly about unrelated
@@ -984,7 +1308,9 @@ public class ReasoningNode implements NodeAction {
         if (!projectRecalled && wikiContextService != null && agentIdStr != null && !agentIdStr.isEmpty()) {
             try {
                 Long parsedAgentId = Long.parseLong(agentIdStr);
-                String wikiRelevant = wikiContextService.buildRelevantContext(parsedAgentId, userMsg);
+                Integer wikiBudgetTokens = (prefixBudgetPlan != null && prefixBudgetPlan.enabled())
+                        ? prefixBudgetPlan.wikiTokens() : null;
+                String wikiRelevant = wikiContextService.buildRelevantContext(parsedAgentId, userMsg, wikiBudgetTokens);
                 if (wikiRelevant != null && !wikiRelevant.isBlank()) {
                     prefix.add(new UserMessage(wikiRelevant));
                 }
@@ -1031,11 +1357,11 @@ public class ReasoningNode implements NodeAction {
                     default -> 16384;
                 };
                 builder.thinking(org.springframework.ai.anthropic.api.AnthropicApi.ThinkingType.ENABLED, budgetTokens);
-                builder.maxTokens(budgetTokens + maxOutputTokens);
+                builder.maxTokens(budgetTokens + effectiveMaxOutputTokens());
                 builder.temperature(1.0);
                 log.info("[ReasoningNode] Anthropic extended thinking enabled: model={}, budget={}", currentModel, budgetTokens);
             } else {
-                builder.maxTokens(maxOutputTokens);
+                builder.maxTokens(effectiveMaxOutputTokens());
                 if (thinkingOn && !isClaudeModel) {
                     log.debug("[ReasoningNode] Anthropic protocol model {} does not support thinking, skipping", currentModel);
                 }
@@ -1050,7 +1376,7 @@ public class ReasoningNode implements NodeAction {
         // DashScope rejects max_tokens above its 8192 ceiling with a 400 that
         // the failover layer misreads as "model not found"; clamp so a
         // DashScope-backed model never overflows the provider limit.
-        int effectiveMaxTokens = maxOutputTokens;
+        int effectiveMaxTokens = effectiveMaxOutputTokens();
         if (chatModel instanceof com.alibaba.cloud.ai.dashscope.chat.DashScopeChatModel
                 && effectiveMaxTokens > DASHSCOPE_MAX_OUTPUT_TOKENS) {
             log.debug("[ReasoningNode] Clamping max_tokens {} -> {} for DashScope-backed model",

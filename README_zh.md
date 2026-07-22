@@ -10,14 +10,14 @@
 
 <p align="center"><sub><b>Agent Harness · Spring Boot 内核 · 一个 JAR 交付</b></sub></p>
 
-[![GitHub 仓库](https://img.shields.io/badge/GitHub-仓库-black.svg?logo=github)](https://github.com/matevip/mateclaw)
+[![GitHub 仓库](https://img.shields.io/badge/GitHub-仓库-black.svg?logo=github)](https://github.com/mateaix/mateclaw)
 [![文档](https://img.shields.io/badge/文档-在线-green.svg?logo=readthedocs&label=Docs)](https://claw.mate.vip/docs)
 [![在线演示](https://img.shields.io/badge/演示-在线-orange.svg?logo=vercel&label=Demo)](https://claw-demo.mate.vip)
 [![官网](https://img.shields.io/badge/官网-claw.mate.vip-blue.svg?logo=googlechrome&label=Site)](https://claw.mate.vip)
 [![Java 版本](https://img.shields.io/badge/Java-21+-blue.svg?logo=openjdk&label=Java)](https://adoptium.net/)
 [![Spring Boot](https://img.shields.io/badge/Spring%20Boot-3.5-brightgreen.svg?logo=springboot)](https://spring.io/projects/spring-boot)
 [![Vue](https://img.shields.io/badge/Vue-3-4FC08D.svg?logo=vuedotjs)](https://vuejs.org/)
-[![最后提交](https://img.shields.io/github/last-commit/matevip/mateclaw)](https://github.com/matevip/mateclaw)
+[![最后提交](https://img.shields.io/github/last-commit/mateaix/mateclaw)](https://github.com/mateaix/mateclaw)
 [![许可证](https://img.shields.io/badge/license-Apache--2.0-red.svg?logo=opensourceinitiative&label=License)](LICENSE)
 
 [[官网](https://claw.mate.vip)] [[在线演示](https://claw-demo.mate.vip)] [[文档](https://claw.mate.vip/docs)] [[English](README.md)]
@@ -103,6 +103,9 @@ MateClaw 的 **LLM Wiki** 把它消化成结构化页面，页面之间自己长
 ### 多模态创作
 语音合成 · 语音识别 · 图片 · 音乐 · 视频 · 3D。一等公民，不是附加插件。**多模态旁路**（1.3.0+）让纯文本主模型遇到图片附件时自动调用配置好的视觉模型转描述，主对话保持便宜。**图像编辑**也到位：用 `msg:<id>:<idx>` 引用会话里更早的某张图，让模型改色、改风格。**4 个文档生成工具**（`DocxRenderTool` / `XlsxRenderTool` / `PptxRenderTool` / `PdfRenderTool`）在 JVM 内把 Markdown 直接渲染成 Office 文件——不 fork 子进程、不依赖 npm、不需要装 Office。
 
+### 内容工作室（1.8.0+）
+一个招牌*场景*,不是工具——预置的「内容工作室」员工把一句话变成可发布成品:选题 → 搜集 → 成文 → 配图 → **去 AI 化** → 排版 → 交付。**微信公众号(公众号)** 文章以内联样式 HTML 躺进你的草稿箱,正文图自动上传进微信;**小红书** 笔记打包成 ≥3 张竖版 3:4 卡片并在线预览。去 AI 化对着一个**可度量的 AI 痕迹评分**跑;每次交付都被合规扫描并记进一个按选题指纹去重的**内容日历**。
+
 ### 企业就绪
 RBAC + JWT。**Personal Access Token** 给无人值守脚本和 CI 用。**Webhook 出站 HMAC-SHA-256 签名**。**Cron 分布式锁**多实例不双发。完整审计事件流。Flyway 管理数据库 schema，升级时自愈。一个 JAR 交付。生产用 MySQL，开发用 H2，代码零改动。
 
@@ -161,7 +164,7 @@ docker compose up -d          # http://localhost:18080
 
 ### 桌面端
 
-从 [GitHub Releases](https://github.com/matevip/mateclaw/releases) 下载安装包。内嵌 JRE 21，无需额外装 Java。
+从 [GitHub Releases](https://github.com/mateaix/mateclaw/releases) 下载安装包。内嵌 JRE 21，无需额外装 Java。
 
 ---
 
@@ -193,7 +196,7 @@ mateclaw/
 └── .env.example
 ```
 
-桌面端安装包通过 [GitHub Releases](https://github.com/matevip/mateclaw/releases) 分发，内嵌 JRE 21——无需安装 Java。
+桌面端安装包通过 [GitHub Releases](https://github.com/mateaix/mateclaw/releases) 分发，内嵌 JRE 21——无需安装 Java。
 
 ## 技术栈
 
@@ -217,14 +220,42 @@ mateclaw/
 
 ## 路线图
 
-**v1.3.0（2026-05-13 发布）** — 工作流引擎 · 6 种 pattern 触发器 · Wiki 加工器 · 每员工独立 MCP 绑定 · 多模态旁路路由 · 4 个 JVM 原生文档生成工具 · 图像编辑。完整故事见 [v1.3.0 release notes](https://claw.mate.vip/docs/zh/releases/1.3.0)。
+**v1.8.0（2026-07-12 发布）** — 员工*转向对外、干完一整件活*:**内容工作室**——第一个完全用 MateClaw 自身原子能力端到端搭起来的招牌场景:
 
-**下一步** — 工作流画布可拖拉编辑 · 运行回放时间线 · `loop` / `invoke_skill` step mode · 触发器优先级 + 事件回放 · 行业场景应用市场 · 更多 ACP 上游集成。
+- **内容工作室——一句话到可发布成品** — 预置「内容工作室」员工跑通 选题 → 搜集 → 成文 → 配图 → 去 AI 化 → 排版 → 交付。**微信公众号(公众号)** 图文文章(内联样式 HTML → 草稿箱)与 **小红书** 以图为主图文笔记(≥3 张竖版 3:4 卡片 + 在线预览)首批一等公民
+- **可度量的去 AI 化** — 启发式 AI 痕迹评分(无 LLM、确定性)驱动 检测 → 改写 → 复检 闭环,硬上限 3 轮
+- **为长期投产而加固的发布链** — 正文图上传进微信(不再外链发布即裂)、AES-GCM 加密密钥、服务复用 + token 持久化、重试 + 中文错误提示、兜底封面;草稿箱优先,发表走审批
+- **会去重、会记账的内容日历** — 每次交付都合规扫描 + 自动落台账、选题指纹防重复选题、只读内容日历页展示草稿/已打包/已发布/失败
+- **浏览器 Agent 按引用去看** — 无障碍树 ref 快照 + 按 ref 交互(点元素而非像素)、真实浏览器隐私护栏、受控 CDP 逃生舱
+- **注意力更聚焦、循环更收得住** — 注意力锚定与环境感知(MCP 工具溯源 + skill 约束固定 + 事件通知)、工具调用循环护栏、改动后校验提醒
+
+外加:一次快加载优化(初始加载 ↓约 78%)、聊天上下文占用面板、跨知识库 wikilink、MCP 进度通知、火山方舟供应商,以及公开 Docker 栈切到 PostgreSQL 16。
+
+完整故事见 [v1.8.0 release notes](https://claw.mate.vip/docs/zh/releases/1.8.0)。
+
+**v1.7.0（2026-07-04 发布）** — 一次*生产化加固*：把它放进真正的协作里之后，那些看不见、收不拢、够不着、装不下、连不通的地方全补上：
+
+- **审批三条链路彻底闭环** — 工作流 `await_approval` 真的推到渠道并 resolve→恢复执行、WebChat（API-Key）渠道能批准/拒绝并重放、飞书/企微点卡片直接 resolve 工作流审批
+- **长任务看得见** — 常驻「运行总览」侧栏 + 本轮 Token 明细（缓存命中/未命中/写入 + 推理拆分）+ 子 Agent 成本向上滚加 + 生成文件一键下载
+- **装得下真实模型窗口** — 本地模型上下文窗口探测、prefix 注入统一 Token 预算、小上下文降级、工具 schema 预算门——不再被"猜个 32K"坑到预检拒绝或悄悄截断
+- **开放出去** — 知识库 / Deep Research 开放 API（API-Key + 限流 + SSE）、插件化搜索 Provider SPI、MCP 身份透传（把认证用户身份带给 STDIO MCP）
+- **够得着更远** — 桌面端本地内嵌 / 远程集中部署双模式（`mateclaw-desktop` 源码开放）+ 局域网部署模式放开受控内网访问
+- **运营数据一键导出** — Dashboard 9 表 Excel + CLI 命令行离线导出
+
+完整故事见 [v1.7.0 release notes](https://claw.mate.vip/docs/zh/releases/1.7.0)。
+
+**v1.6.0（2026-06-22 发布）** — 让自驱的数字员工*更快、更会看、更易嵌入*：技能两段式载入 + prefix 压缩（首字节更快）· `execute_code` 原生沙箱代码执行 · 图片跨轮次留存 + `image_analyze` · 可嵌入/无头 webchat 按 `endUserId` 隔离记忆 · 真正可读的 Wiki（阅读与管理分离 · 统一 Sources 标签 · 可点击 `[[wikilinks]]`）· 高负载更稳（MCP 自愈 · 工具调用恢复 · 计划证据闸门）。完整故事见 [v1.6.0 release notes](https://claw.mate.vip/docs/zh/releases/1.6.0)。
+
+**v1.5.0（2026-06-04 发布）** — Goal 可勾选清单（模糊评分 → 逐项打勾）· Wiki 自维护（`[[wikilinks]]` · 事实层/经验层 · pageType 模板与权限 · 知识库流水线 · 本地目录接入）· 按拥有者隔离记忆（`owner_key` + 可见域 + `endUserId` 透传）· 每员工绑定主知识库 · 偏好 provider 驱动选型。完整故事见 [v1.5.0 release notes](https://claw.mate.vip/docs/zh/releases/1.5.0)。
+
+**v1.4.0（2026-05-23 发布）** — 持续目标（锁定目标，每轮自评）· 子员工委派树（最深 3 层 · 同步 / 并行 / 异步 · 一句话组队）· 工具/技能渐进式披露 · 工作空间 RBAC（Owner / Admin / Member / Viewer）· 飞书一等公民（交互卡 / 审批卡 / 流式卡 · 渠道原生工具）。详见 [v1.4.0 release notes](https://claw.mate.vip/docs/zh/releases/1.4.0)。
+
+**v1.3.0（2026-05-13 发布）** — 工作流引擎 · 6 种 pattern 触发器 · Wiki 加工器 · 每员工独立 MCP 绑定 · 多模态旁路路由 · 4 个 JVM 原生文档生成工具 · 图像编辑。详见 [v1.3.0 release notes](https://claw.mate.vip/docs/zh/releases/1.3.0)。
 
 ## 参与贡献
 
 ```bash
-git clone https://github.com/matevip/mateclaw.git
+git clone https://github.com/mateaix/mateclaw.git
 cd mateclaw
 cd mateclaw-server && mvn clean compile
 cd ../mateclaw-ui && pnpm install && pnpm dev

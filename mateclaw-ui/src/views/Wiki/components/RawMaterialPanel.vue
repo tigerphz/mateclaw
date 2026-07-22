@@ -72,13 +72,86 @@
       </div>
     </div>
 
+    <!-- Auto-sync (per-KB source watcher): periodically scans the directory above -->
+    <div v-if="canManageWiki" class="auto-sync-row">
+      <label class="auto-sync-toggle" :class="{ disabled: !watcher.globalEnabled || watcher.busy }">
+        <input
+          type="checkbox"
+          :checked="watcher.kbEnabled"
+          :disabled="!watcher.globalEnabled || watcher.busy"
+          @change="toggleWatcher(($event.target as HTMLInputElement).checked)"
+        />
+        <span>{{ t('wiki.sources.autoSync') }}</span>
+      </label>
+      <span v-if="watcher.globalEnabled && watcher.kbEnabled" class="auto-sync-meta">
+        {{ t('wiki.sources.autoSyncInterval', { sec: Math.round(watcher.intervalMs / 1000) }) }}
+        <template v-if="watcher.sourceType"> · {{ watcher.sourceType }}</template>
+      </span>
+      <span v-else-if="!watcher.globalEnabled" class="auto-sync-hint">
+        {{ t('wiki.sources.autoSyncGlobalOffHint') }}
+      </span>
+    </div>
+
     <!-- Raw materials list -->
     <div class="raw-list">
       <h4 class="raw-list-title">
         {{ t('wiki.rawMaterials') }} ({{ store.rawMaterials.length + uploadingFiles.length }})
       </h4>
+
+      <!-- Filter bar: status / source type / title keyword. Filters are held in
+           the store so they survive background refreshes. -->
+      <div v-if="store.rawMaterials.length > 0 || hasActiveFilter" class="raw-toolbar">
+        <div class="raw-filters">
+          <select v-model="filterStatus" class="raw-filter-select" @change="applyFilters">
+            <option value="">{{ t('wiki.batch.allStatus') }}</option>
+            <option v-for="s in RAW_STATUSES" :key="s" :value="s">{{ t(`wiki.status.${s}`) }}</option>
+          </select>
+          <select v-model="filterSourceType" class="raw-filter-select" @change="applyFilters">
+            <option value="">{{ t('wiki.batch.allTypes') }}</option>
+            <option v-for="st in RAW_SOURCE_TYPES" :key="st" :value="st">{{ st }}</option>
+          </select>
+          <input
+            v-model="filterKeyword"
+            type="text"
+            class="raw-filter-input"
+            :placeholder="t('wiki.batch.keywordPlaceholder')"
+          />
+          <button v-if="hasActiveFilter" class="btn-text" @click="clearFilters">
+            {{ t('wiki.batch.clearFilter') }}
+          </button>
+        </div>
+        <button
+          v-if="canManageWiki && failedCount > 0"
+          class="btn-text retry-all-failed"
+          :disabled="batchBusy"
+          @click="retryAllFailed"
+        >
+          {{ t('wiki.batch.retryAllFailed', { n: failedCount }) }}
+        </button>
+      </div>
+
+      <!-- Selection + batch actions. Always shown (when manageable and rows
+           exist); the action buttons are disabled until at least one row is
+           selected. -->
+      <div v-if="canManageWiki && store.rawMaterials.length > 0" class="raw-selection-bar">
+        <label class="raw-select-all" @click.stop>
+          <input type="checkbox" :checked="allSelected" @change="toggleSelectAll" />
+          <span>{{ selectedIds.size > 0
+            ? t('wiki.batch.selectedCount', { n: selectedIds.size })
+            : t('wiki.batch.selectAll') }}</span>
+        </label>
+        <div class="raw-selection-actions">
+          <button class="btn-text" :disabled="batchBusy || selectedIds.size === 0" @click="batchReprocess">
+            {{ t('wiki.batch.reprocess') }}
+          </button>
+          <button class="btn-text btn-danger-text" :disabled="batchBusy || selectedIds.size === 0" @click="batchDelete">
+            {{ t('wiki.batch.delete') }}
+          </button>
+        </div>
+      </div>
+
       <div v-if="store.rawMaterials.length === 0 && uploadingFiles.length === 0" class="empty-hint">
-        {{ t('wiki.noRawMaterials') }}
+        {{ hasActiveFilter ? t('wiki.batch.noMatch') : t('wiki.noRawMaterials') }}
       </div>
 
       <!-- Optimistic uploading items shown at the top -->
@@ -136,6 +209,13 @@
         @click="toggleRawFilter(raw.id)"
       >
         <div class="raw-item-row">
+          <label v-if="canManageWiki" class="raw-select-box" @click.stop>
+            <input
+              type="checkbox"
+              :checked="selectedIds.has(String(raw.id))"
+              @change="toggleSelect(raw.id)"
+            />
+          </label>
           <div class="raw-item-info">
             <span class="raw-item-title">{{ raw.title }}</span>
             <span class="raw-item-type">{{ raw.sourceType }}</span>
@@ -160,10 +240,16 @@
               {{ t('wiki.cancelledHint') }}
             </span>
             <span
-              v-else-if="raw.errorMessage && (raw.processingStatus === 'failed' || raw.processingStatus === 'partial')"
-              class="error-hint" :title="raw.errorMessage"
+              v-else-if="(raw.errorCode || raw.errorMessage) && (raw.processingStatus === 'failed' || raw.processingStatus === 'partial')"
+              class="error-hint" :title="raw.errorMessage || friendlyError(raw)"
             >
-              {{ raw.errorMessage }}
+              {{ friendlyError(raw) }}
+            </span>
+            <span
+              v-if="(raw.warningCode || raw.warningMessage) && raw.processingStatus !== 'failed'"
+              class="warning-hint" :title="raw.warningMessage || friendlyWarning(raw)"
+            >
+              ⚠ {{ friendlyWarning(raw) }}
             </span>
           </div>
           <div v-if="canManageWiki" class="raw-item-actions">
@@ -290,11 +376,13 @@
 import { ref, reactive, computed, watch, onBeforeUnmount } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { mcToast } from '@/composables/useMcToast'
+import { mcConfirm } from '@/components/common/useConfirm'
 import { useFileDrop } from '@/composables/useFileDrop'
 import { Download } from '@element-plus/icons-vue'
 import { useWikiStore } from '@/stores/useWikiStore'
 import { useWorkspaceStore } from '@/stores/useWorkspaceStore'
 import { wikiApi } from '@/api/index'
+import { processWithConcurrency } from '@/utils/wikiUpload'
 import JobStageBar from './JobStageBar.vue'
 import type { WikiProcessingJob } from '@/composables/useWikiJobPoller'
 
@@ -306,6 +394,163 @@ const workspace = useWorkspaceStore()
 // Viewers can still see the material list but get no write controls.
 const canManageWiki = computed(() => workspace.can('manage:wiki'))
 const fileInput = ref<HTMLInputElement | null>(null)
+
+// ---- Raw-material filtering + batch operations (issue #506) --------------
+// Processing states and source types used to populate the filter dropdowns.
+const RAW_STATUSES = ['pending', 'processing', 'completed', 'failed', 'partial', 'cancelled'] as const
+const RAW_SOURCE_TYPES = ['text', 'pdf', 'docx', 'xlsx', 'pptx', 'html', 'image', 'url'] as const
+
+// Local mirrors of the store's filter state; edits flow back through
+// store.setRawFilters so background refreshes keep the filter applied.
+const filterStatus = ref(store.rawFilters.status)
+const filterSourceType = ref(store.rawFilters.sourceType)
+const filterKeyword = ref(store.rawFilters.keyword)
+
+const hasActiveFilter = computed(
+  () => !!(filterStatus.value || filterSourceType.value || filterKeyword.value),
+)
+const failedCount = computed(
+  () => store.rawMaterials.filter(r => r.processingStatus === 'failed').length,
+)
+
+// Selected raw ids for batch ops. Keyed by String(id) — raw ids are Snowflake
+// values and must stay strings (never coerce to number).
+const selectedIds = ref<Set<string>>(new Set())
+const batchBusy = ref(false)
+const allSelected = computed(
+  () => store.rawMaterials.length > 0
+    && store.rawMaterials.every(r => selectedIds.value.has(String(r.id))),
+)
+
+function applyFilters() {
+  if (!store.currentKB) return
+  clearSelection()
+  void store.setRawFilters(store.currentKB.id, {
+    status: filterStatus.value,
+    sourceType: filterSourceType.value,
+    keyword: filterKeyword.value.trim(),
+  })
+}
+
+// Debounce keyword typing so we don't refetch on every keystroke.
+let keywordTimer: ReturnType<typeof setTimeout> | null = null
+watch(filterKeyword, () => {
+  if (keywordTimer) clearTimeout(keywordTimer)
+  keywordTimer = setTimeout(applyFilters, 350)
+})
+
+function clearFilters() {
+  filterStatus.value = ''
+  filterSourceType.value = ''
+  filterKeyword.value = ''
+  applyFilters()
+}
+
+function toggleSelect(rawId: number | string) {
+  const key = String(rawId)
+  const next = new Set(selectedIds.value)
+  if (next.has(key)) next.delete(key)
+  else next.add(key)
+  selectedIds.value = next
+}
+
+function toggleSelectAll() {
+  if (allSelected.value) {
+    selectedIds.value = new Set()
+  } else {
+    selectedIds.value = new Set(store.rawMaterials.map(r => String(r.id)))
+  }
+}
+
+function clearSelection() {
+  selectedIds.value = new Set()
+}
+
+async function batchReprocess() {
+  if (!store.currentKB || selectedIds.value.size === 0) return
+  const kbId = store.currentKB.id
+  batchBusy.value = true
+  try {
+    const res: any = await wikiApi.batchReprocessRaw(kbId, { ids: [...selectedIds.value] })
+    const d = res.data || res || {}
+    mcToast.success(t('wiki.batch.reprocessDone', { n: d.processed ?? 0 }))
+    clearSelection()
+    await store.fetchRawMaterials(kbId)
+    setTimeout(() => { store.fetchRawMaterials(kbId) }, 5000)
+    setTimeout(() => { store.fetchRawMaterials(kbId) }, 15000)
+  } catch (e) {
+    mcToast.error(e instanceof Error ? e.message : String(e))
+  } finally {
+    batchBusy.value = false
+  }
+}
+
+async function batchDelete() {
+  if (!store.currentKB || selectedIds.value.size === 0) return
+  const ok = await mcConfirm({
+    title: t('wiki.batch.delete'),
+    message: t('wiki.batch.deleteConfirm', { n: selectedIds.value.size }),
+    confirmText: t('common.delete'),
+    tone: 'danger',
+  })
+  if (!ok) return
+  const kbId = store.currentKB.id
+  batchBusy.value = true
+  try {
+    const res: any = await wikiApi.batchDeleteRaw(kbId, { ids: [...selectedIds.value] })
+    const d = res.data || res || {}
+    mcToast.success(t('wiki.batch.deleteDone', { n: d.deleted ?? 0 }))
+    clearSelection()
+    await store.fetchRawMaterials(kbId)
+  } catch (e) {
+    mcToast.error(e instanceof Error ? e.message : String(e))
+  } finally {
+    batchBusy.value = false
+  }
+}
+
+async function retryAllFailed() {
+  if (!store.currentKB) return
+  const kbId = store.currentKB.id
+  batchBusy.value = true
+  try {
+    const res: any = await wikiApi.batchReprocessRaw(kbId, { status: 'failed' })
+    const d = res.data || res || {}
+    mcToast.success(t('wiki.batch.reprocessDone', { n: d.processed ?? 0 }))
+    clearSelection()
+    await store.fetchRawMaterials(kbId)
+    setTimeout(() => { store.fetchRawMaterials(kbId) }, 5000)
+    setTimeout(() => { store.fetchRawMaterials(kbId) }, 15000)
+  } catch (e) {
+    mcToast.error(e instanceof Error ? e.message : String(e))
+  } finally {
+    batchBusy.value = false
+  }
+}
+
+// Map a structured backend errorCode to a localized, user-friendly hint.
+// Falls back to the raw backend message, then to a generic failure label, so
+// the user always sees something meaningful — never a blank "failed" badge.
+function friendlyError(raw: { errorCode?: string | null; errorMessage?: string | null }): string {
+  const code = raw.errorCode
+  if (code) {
+    const key = `wiki.errorCode.${code}`
+    const msg = t(key)
+    if (msg !== key) return msg
+  }
+  return raw.errorMessage || t('wiki.errorCode.UNKNOWN')
+}
+
+// Same idea for the non-blocking warning surface (degraded-but-usable rows).
+function friendlyWarning(raw: { warningCode?: string | null; warningMessage?: string | null }): string {
+  const code = raw.warningCode
+  if (code) {
+    const key = `wiki.warningCode.${code}`
+    const msg = t(key)
+    if (msg !== key) return msg
+  }
+  return raw.warningMessage || t('wiki.warningCode.UNKNOWN')
+}
 
 // While raw materials are active, subscribe to the backend SSE progress stream.
 // A slower polling fallback keeps the UI in sync if SSE reconnects or misses a
@@ -371,10 +616,30 @@ function openSse(kbId: number) {
     try {
       const data = JSON.parse(ev.data)
       const raw = store.rawMaterials.find(r => r.id === data.rawId)
-      if (raw) raw.processingStatus = 'failed'
+      if (raw) {
+        raw.processingStatus = 'failed'
+        // Surface the failure immediately from the event payload instead of
+        // waiting for the refresh round-trip — and never drop it: a null
+        // message would otherwise leave the user with a blank "failed" badge.
+        if (typeof data.error === 'string') raw.errorMessage = data.error
+        if (typeof data.errorCode === 'string') raw.errorCode = data.errorCode
+      }
       // Clear stale job entry
       delete rawJobs[data.rawId]
       if (store.currentKB) void store.refreshCurrentKB()
+    } catch { /* ignore */ }
+  })
+  es.addEventListener('raw.warning', (ev: MessageEvent) => {
+    try {
+      const data = JSON.parse(ev.data)
+      const raw = store.rawMaterials.find(r => r.id === data.rawId)
+      // A warning lands async after the material already completed, so the
+      // refresh round-trip on raw.completed has already happened — apply it
+      // live here, otherwise it would only appear on the next manual reload.
+      if (raw) {
+        if (typeof data.warning === 'string') raw.warningMessage = data.warning
+        if (typeof data.warningCode === 'string') raw.warningCode = data.warningCode
+      }
     } catch { /* ignore */ }
   })
   es.onerror = () => {
@@ -419,6 +684,14 @@ onBeforeUnmount(() => {
   if (fallbackTimer != null) {
     clearInterval(fallbackTimer)
     fallbackTimer = null
+  }
+  // Stop the per-raw job poller too. Without this the setTimeout chain keeps
+  // running after the panel unmounts (e.g. switching to the config tab while a
+  // raw is still processing), calling refreshCurrentKB() every 3s and snapping
+  // the user back to this tab.
+  if (jobPoller != null) {
+    clearTimeout(jobPoller)
+    jobPoller = null
   }
 })
 
@@ -490,6 +763,15 @@ watch(() => store.rawMaterials, (rows) => {
   }
 }, { deep: true })
 
+// Prune batch selections that no longer exist after a refresh (deleted rows,
+// or rows filtered out of the current view).
+watch(() => store.rawMaterials, (rows) => {
+  if (selectedIds.value.size === 0) return
+  const present = new Set(rows.map(r => String(r.id)))
+  const next = new Set([...selectedIds.value].filter(id => present.has(id)))
+  if (next.size !== selectedIds.value.size) selectedIds.value = next
+})
+
 async function handleLocalRepair(rawId: number) {
   if (!store.currentKB) return
   // For local repair, we'd need a page slug. For now, reprocess the raw material.
@@ -503,13 +785,58 @@ const dirPath = ref(store.currentKB?.sourceDirectory || '')
 const scanning = ref(false)
 const scanResult = ref<{ scanned: number; added: number; skipped: number; errors?: string[] } | null>(null)
 
+// ─── Per-KB auto-sync (source watcher) ────────────────────────────────────────
+// Auto-sync periodically scans the directory above. It runs only when the
+// server-global master switch (watcher.globalEnabled, ops-controlled) AND this
+// KB's toggle (watcher.kbEnabled) are both on. When the global switch is off the
+// toggle is disabled with a hint — there's nothing a non-ops user can do here.
+const watcher = reactive({
+  globalEnabled: false,
+  kbEnabled: false,
+  intervalMs: 0,
+  sourceType: null as string | null,
+  busy: false,
+})
+async function loadWatcher(kbId: number) {
+  try {
+    const res: any = await wikiApi.getSourceWatcher(kbId)
+    const d = res?.data ?? res
+    watcher.globalEnabled = !!d.watcherEnabled
+    watcher.kbEnabled = !!d.kbWatcherEnabled
+    watcher.intervalMs = d.intervalMs || 0
+    watcher.sourceType = d.sourceType || null
+  } catch { /* leave defaults; auto-sync UI just shows disabled */ }
+}
+async function toggleWatcher(next: boolean) {
+  if (!store.currentKB) return
+  watcher.busy = true
+  try {
+    await wikiApi.setWatcherEnabled(store.currentKB.id, next)
+    watcher.kbEnabled = next
+    mcToast.success(t('common.saved'))
+  } catch (e: any) {
+    mcToast.error(e?.response?.data?.message || t('wiki.sources.toggleFailed'))
+  } finally {
+    watcher.busy = false
+  }
+}
+watch(() => store.currentKB?.id, (id) => {
+  if (id) {
+    dirPath.value = store.currentKB?.sourceDirectory || ''
+    void loadWatcher(id as number)
+  }
+}, { immediate: true })
+
 // ─── Drag-over state ──────────────────────────────────────────────────────────
 const { isDragging, onDragEnter, onDragLeave, onDrop: handleDrop } = useFileDrop(uploadDroppedFiles)
 
 async function uploadDroppedFiles(event: DragEvent) {
   if (!event.dataTransfer?.files || !store.currentKB) return
   const kbId = store.currentKB.id
-  await Promise.all(Array.from(event.dataTransfer.files).map(f => uploadFile(kbId, f)))
+  await processWithConcurrency(
+    Array.from(event.dataTransfer.files),
+    file => uploadFile(kbId, file),
+  )
 }
 
 // ─── Optimistic upload items ──────────────────────────────────────────────────
@@ -564,8 +891,10 @@ async function handleFileSelect(event: Event) {
   const input = event.target as HTMLInputElement
   if (!input.files || !store.currentKB) return
   const kbId = store.currentKB.id
-  // Upload all files concurrently
-  await Promise.all(Array.from(input.files).map(f => uploadFile(kbId, f)))
+  await processWithConcurrency(
+    Array.from(input.files),
+    file => uploadFile(kbId, file),
+  )
   input.value = ''
 }
 
@@ -708,6 +1037,14 @@ async function handleScanDir() {
 
 /* Directory scan */
 .dir-scan-row { display: flex; gap: 10px; align-items: center; }
+
+/* Auto-sync (per-KB source watcher) */
+.auto-sync-row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-top: -4px; }
+.auto-sync-toggle { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: var(--mc-text-secondary); cursor: pointer; }
+.auto-sync-toggle.disabled { opacity: 0.55; cursor: not-allowed; }
+.auto-sync-toggle input { cursor: inherit; }
+.auto-sync-meta { font-size: 12px; color: var(--mc-text-tertiary); font-variant-numeric: tabular-nums; }
+.auto-sync-hint { font-size: 12px; color: var(--mc-text-tertiary); }
 .dir-input-wrap { flex: 1; display: flex; align-items: center; gap: 8px; padding: 8px 12px; border: 1px solid var(--mc-border); border-radius: 12px; background: var(--mc-bg-elevated); color: var(--mc-text-tertiary); }
 .dir-input-wrap:focus-within { border-color: var(--mc-primary); box-shadow: 0 0 0 2px rgba(217,119,87,0.1); }
 .dir-input { flex: 1; border: none; background: transparent; font-size: 13px; color: var(--mc-text-primary); outline: none; }
@@ -778,6 +1115,7 @@ async function handleScanDir() {
 .raw-item-meta { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
 .raw-item-actions { display: flex; gap: 4px; flex-shrink: 0; }
 .error-hint { font-size: 11px; color: var(--mc-danger); max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.warning-hint { font-size: 11px; color: var(--mc-warning, #d98e00); max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .page-count-chip { display: inline-flex; align-items: center; gap: 3px; font-size: 11px; font-weight: 500; color: var(--mc-text-secondary); background: var(--mc-bg-sunken); border-radius: 9999px; padding: 2px 7px; }
 
 /* Two-phase digest progress bar (RFC-012 M2 v2 UI) */
@@ -858,5 +1196,70 @@ async function handleScanDir() {
     width: 100%;
     justify-content: space-between;
   }
+}
+
+/* ---- Filter bar + batch operations (issue #506) ---- */
+.raw-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+.raw-filters {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.raw-filter-select,
+.raw-filter-input {
+  padding: 5px 10px;
+  font-size: 12px;
+  border: 1px solid var(--mc-border);
+  border-radius: 8px;
+  background: var(--mc-bg-elevated);
+  color: var(--mc-text-primary);
+}
+.raw-filter-input { min-width: 140px; }
+.raw-filter-select:focus,
+.raw-filter-input:focus { outline: none; border-color: var(--mc-primary); }
+.btn-text {
+  padding: 4px 8px;
+  font-size: 12px;
+  background: none;
+  border: none;
+  color: var(--mc-primary);
+  cursor: pointer;
+  border-radius: 6px;
+}
+.btn-text:hover:not(:disabled) { background: var(--mc-bg-sunken); }
+.btn-text:disabled { color: var(--mc-text-tertiary); cursor: not-allowed; }
+.btn-danger-text { color: var(--mc-danger, #e05252); }
+.raw-selection-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 10px;
+  margin-bottom: 8px;
+  background: var(--mc-bg-sunken);
+  border-radius: 8px;
+}
+.raw-select-all {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--mc-text-secondary);
+  cursor: pointer;
+}
+.raw-selection-actions { display: inline-flex; align-items: center; gap: 4px; }
+.raw-select-box {
+  display: inline-flex;
+  align-items: center;
+  margin-right: 8px;
+  cursor: pointer;
 }
 </style>

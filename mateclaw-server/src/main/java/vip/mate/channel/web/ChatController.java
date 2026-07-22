@@ -8,6 +8,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.core.io.FileSystemResource;
 import org.springframework.core.io.Resource;
 import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.core.Authentication;
@@ -15,6 +16,7 @@ import org.springframework.web.bind.annotation.*;
 import org.springframework.web.multipart.MultipartFile;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 import vip.mate.common.result.R;
+import vip.mate.workspace.core.service.ChatUploadLocationResolver;
 import vip.mate.agent.AgentService;
 import vip.mate.agent.model.AgentEntity;
 import vip.mate.approval.ApprovalWorkflowService;
@@ -30,7 +32,6 @@ import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.Paths;
 import java.io.IOException;
 import reactor.core.Disposable;
 
@@ -38,6 +39,8 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -62,10 +65,14 @@ public class ChatController {
     private final ObjectMapper objectMapper;
     private final ConversationCompletionPublisher completionPublisher;
     private final vip.mate.memory.identity.MemoryOwnerResolver memoryOwnerResolver;
-    private final Path uploadRoot = Paths.get("data", "chat-uploads");
+    private final vip.mate.workspace.core.service.ChatUploadLocationResolver uploadLocationResolver;
+    private final vip.mate.tool.document.preview.OfficePreviewService officePreviewService;
 
-    // 使用虚拟线程池处理 SSE（Java 17+ 兼容，Java 21 可用 Executors.newVirtualThreadPerTaskExecutor()）
-    private final ExecutorService sseExecutor = Executors.newCachedThreadPool();
+    // Virtual thread per SSE task: matches the app-wide virtual-thread model
+    // (spring.threads.virtual.enabled=true) and, unlike a cached platform-thread
+    // pool, never reuses a thread across tasks, so no ThreadLocal state can leak
+    // from one stream into another.
+    private final ExecutorService sseExecutor = Executors.newVirtualThreadPerTaskExecutor();
 
     /**
      * SSE 流式对话（支持断线重连）
@@ -356,6 +363,9 @@ public class ChatController {
                                                 persistStatus,
                                                 accumulator.getPromptTokens(),
                                                 accumulator.getCompletionTokens(),
+                                                accumulator.getCacheReadTokens(),
+                                                accumulator.getCacheWriteTokens(),
+                                                accumulator.getReasoningTokens(),
                                                 accumulator.getRuntimeModelName(),
                                                 accumulator.getRuntimeProviderId(),
                                                 accumulator.toMetadataJson());  // includes toolCalls metadata
@@ -435,6 +445,9 @@ public class ChatController {
                                                 errStatus,
                                                 accumulator.getPromptTokens(),
                                                 accumulator.getCompletionTokens(),
+                                                accumulator.getCacheReadTokens(),
+                                                accumulator.getCacheWriteTokens(),
+                                                accumulator.getReasoningTokens(),
                                                 accumulator.getRuntimeModelName(),
                                                 accumulator.getRuntimeProviderId(),
                                                 accumulator.toMetadataJson());
@@ -555,7 +568,7 @@ public class ChatController {
                 // tools that need a workspace path read it from the agent (origin
                 // is enriched with workspaceBasePath in StateGraph buildInitialState).
                 vip.mate.agent.context.ChatOrigin webOrigin =
-                        memoryOrigin(conversationId, username, workspaceId, request.getEndUserId())
+                        memoryOrigin(conversationId, username, requesterUserIdOf(auth), workspaceId, request.getEndUserId())
                                 .withBaseUrl(requestBaseUrl);
                 Disposable disposable = agentService.chatStructuredStream(agentId, promptText, conversationId, username, request.getThinkingLevel(), webOrigin)
                         .doOnNext(delta -> {
@@ -628,6 +641,9 @@ public class ChatController {
                                             persistStatus,
                                             accumulator.getPromptTokens(),
                                             accumulator.getCompletionTokens(),
+                                            accumulator.getCacheReadTokens(),
+                                            accumulator.getCacheWriteTokens(),
+                                            accumulator.getReasoningTokens(),
                                             accumulator.getRuntimeModelName(),
                                             accumulator.getRuntimeProviderId(),
                                             accumulator.toMetadataJson());
@@ -746,6 +762,9 @@ public class ChatController {
                                             status,
                                             accumulator.getPromptTokens(),
                                             accumulator.getCompletionTokens(),
+                                            accumulator.getCacheReadTokens(),
+                                            accumulator.getCacheWriteTokens(),
+                                            accumulator.getReasoningTokens(),
                                             accumulator.getRuntimeModelName(),
                                             accumulator.getRuntimeProviderId(),
                                             accumulator.toMetadataJson());
@@ -848,6 +867,9 @@ public class ChatController {
                                             status,
                                             accumulator.getPromptTokens(),
                                             accumulator.getCompletionTokens(),
+                                            accumulator.getCacheReadTokens(),
+                                            accumulator.getCacheWriteTokens(),
+                                            accumulator.getReasoningTokens(),
                                             accumulator.getRuntimeModelName(),
                                             accumulator.getRuntimeProviderId(),
                                             accumulator.toMetadataJson());
@@ -1056,7 +1078,7 @@ public class ChatController {
         // Carry the web origin so per-owner memory recall (read) and the
         // post-conversation memory write below agree on the same owner key.
         vip.mate.agent.context.ChatOrigin webOrigin =
-                memoryOrigin(request.getConversationId(), username, workspaceId, request.getEndUserId());
+                memoryOrigin(request.getConversationId(), username, requesterUserIdOf(auth), workspaceId, request.getEndUserId());
         AgentService.ChatResult result = agentService.chatWithUsage(agentId, promptText, request.getConversationId(), webOrigin);
         String response = result.content();
         conversationService.saveMessage(request.getConversationId(), "assistant", response, null, "completed",
@@ -1075,7 +1097,9 @@ public class ChatController {
             Authentication auth) throws IOException {
 
         String username = auth != null ? auth.getName() : "anonymous";
-        // 校验会话归属（会话可能尚未创建，此时允许上传——后续 stream/chat 会创建并绑定用户）
+        // 校验会话归属（会话可能尚未创建，此时允许上传——后续 stream/chat 会创建并绑定用户）。
+        // 注意：会话尚不存在时，附件暂存到默认目录（resolveUploadRoot 查不到会话即回退）；
+        // 会话创建后读取走双重查找，仍能命中。
         if (conversationService.conversationExists(conversationId)
                 && !conversationService.isConversationOwner(conversationId, username)) {
             return R.fail(403, "无权操作该会话");
@@ -1087,7 +1111,11 @@ public class ChatController {
         String originalFilename = file.getOriginalFilename() != null ? file.getOriginalFilename() : "file";
         String safeFilename = Path.of(originalFilename).getFileName().toString().replaceAll("[^a-zA-Z0-9._-]", "_");
         String storedName = System.currentTimeMillis() + "_" + safeFilename;
-        Path conversationDir = uploadRoot.resolve(conversationId);
+        Path uploadRoot = uploadLocationResolver.resolveUploadRoot(conversationId);
+        // Sanitize the id before using it as a path segment — IM-channel ids like
+        // "wecom:XXXX" carry a ':' that is illegal in a Windows filename and would
+        // throw InvalidPathException here. Reads use the same sanitization.
+        Path conversationDir = uploadRoot.resolve(ChatUploadLocationResolver.sanitizeSegment(conversationId));
         Files.createDirectories(conversationDir);
         Path target = conversationDir.resolve(storedName);
         file.transferTo(target);
@@ -1099,8 +1127,8 @@ public class ChatController {
         response.setFileName(originalFilename);
         response.setStoredName(storedName);
         response.setUrl("/api/v1/chat/files/" + conversationId + "/" + storedName);
-        // 使用相对路径，避免暴露服务端绝对路径
-        response.setPath(uploadRoot.resolve(conversationId).resolve(storedName).toString());
+        // 用 root 相对路径，避免暴露服务端绝对路径（uploadRoot 现在恒为绝对路径）。
+        response.setPath(toRelativeUploadPath(uploadRoot, conversationId, storedName));
         response.setSize(file.getSize());
         response.setContentType(file.getContentType());
         return R.ok(response);
@@ -1119,8 +1147,8 @@ public class ChatController {
             return ResponseEntity.status(403).build();
         }
 
-        Path filePath = uploadRoot.resolve(conversationId).resolve(storedName).normalize();
-        if (!Files.exists(filePath) || !filePath.startsWith(uploadRoot.resolve(conversationId).normalize())) {
+        Path filePath = resolveUploadedFile(conversationId, storedName);
+        if (filePath == null) {
             return ResponseEntity.notFound().build();
         }
 
@@ -1146,6 +1174,62 @@ public class ChatController {
                 .body(resource);
     }
 
+    @Operation(summary = "生成聊天附件的 PDF 预览（office 格式，soffice 转换）")
+    @GetMapping("/files/{conversationId}/{storedName:.+}/preview")
+    public ResponseEntity<byte[]> previewUploadedFile(
+            @PathVariable String conversationId,
+            @PathVariable String storedName,
+            Authentication auth) {
+
+        // Same ownership gate as the raw file endpoint.
+        String username = auth != null ? auth.getName() : "anonymous";
+        if (!conversationService.isConversationOwner(conversationId, username)) {
+            return ResponseEntity.status(403).build();
+        }
+
+        // 415: the client asked to preview a format this endpoint won't convert.
+        if (!officePreviewService.isConvertible(storedName)) {
+            return ResponseEntity.status(HttpStatus.UNSUPPORTED_MEDIA_TYPE).build();
+        }
+        // 501: no soffice on this host — the UI degrades to a download link.
+        if (!officePreviewService.isAvailable()) {
+            return ResponseEntity.status(HttpStatus.NOT_IMPLEMENTED).build();
+        }
+
+        Path filePath = resolveUploadedFile(conversationId, storedName);
+        if (filePath == null) {
+            return ResponseEntity.notFound().build();
+        }
+
+        try {
+            byte[] pdf = officePreviewService.renderPdf(filePath);
+            return ResponseEntity.ok()
+                    .contentType(MediaType.APPLICATION_PDF)
+                    .header(HttpHeaders.CONTENT_DISPOSITION, "inline")
+                    .body(pdf);
+        } catch (IOException e) {
+            log.warn("[ChatController] office preview conversion failed for {}: {}", storedName, e.getMessage());
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).build();
+        }
+    }
+
+    /**
+     * Resolve an uploaded attachment to its on-disk path, probing every
+     * candidate conversation dir (workspace-scoped + legacy default, sanitized +
+     * raw id) with a per-candidate path-traversal guard. Returns {@code null}
+     * when no candidate holds the file.
+     */
+    private Path resolveUploadedFile(String conversationId, String storedName) {
+        for (Path conversationDir : uploadLocationResolver.resolveCandidateConversationDirs(conversationId)) {
+            Path normDir = conversationDir.normalize();
+            Path candidate = normDir.resolve(storedName).normalize();
+            if (Files.exists(candidate) && candidate.startsWith(normDir)) {
+                return candidate;
+            }
+        }
+        return null;
+    }
+
     /**
      * Build the {@link vip.mate.agent.context.ChatOrigin} that drives per-owner
      * memory isolation for a web request. When {@code endUserId} is supplied
@@ -1154,17 +1238,33 @@ public class ChatController {
      * MateClaw user ({@code user:<username>}).
      */
     private vip.mate.agent.context.ChatOrigin memoryOrigin(String conversationId, String username,
-                                                           Long workspaceId, String endUserId) {
+                                                           Long requesterUserId, Long workspaceId,
+                                                           String endUserId) {
         // Resolve the public base URL here, on the request thread, so it can ride
         // the origin into async tool execution where no request is bound. Tools
         // then mint absolute download links without operator config.
         String baseUrl = resolveRequestBaseUrl();
         if (endUserId != null && !endUserId.isBlank()) {
+            // Third-party single-account integration: the requester is an external
+            // end-user id, not a MateClaw account — no requesterUserId to assert.
             return vip.mate.agent.context.ChatOrigin
                     .web(conversationId, endUserId.trim(), workspaceId, null, baseUrl)
                     .withSender(null, "api", null);
         }
-        return vip.mate.agent.context.ChatOrigin.web(conversationId, username, workspaceId, null, baseUrl);
+        // Authenticated web user: carry the immutable id so on-behalf-of identity
+        // forwarding can assert "MateClaw authenticated this user" (not an anon id).
+        return vip.mate.agent.context.ChatOrigin.web(conversationId, username, workspaceId, null, baseUrl, requesterUserId);
+    }
+
+    /**
+     * Extract the authenticated user's immutable numeric id from the
+     * {@link Authentication} details (stamped by {@code JwtAuthFilter} for both
+     * the JWT and PAT paths). Null when not authenticated or details absent.
+     */
+    private Long requesterUserIdOf(org.springframework.security.core.Authentication auth) {
+        if (auth == null) return null;
+        Object details = auth.getDetails();
+        return details instanceof Long id ? id : null;
     }
 
     /**
@@ -1343,6 +1443,9 @@ public class ChatController {
                                     persistStatus,
                                     accumulator.getPromptTokens(),
                                     accumulator.getCompletionTokens(),
+                                    accumulator.getCacheReadTokens(),
+                                    accumulator.getCacheWriteTokens(),
+                                    accumulator.getReasoningTokens(),
                                     accumulator.getRuntimeModelName(),
                                     accumulator.getRuntimeProviderId(),
                                     accumulator.toMetadataJson());
@@ -1395,6 +1498,9 @@ public class ChatController {
                                     "failed",
                                     accumulator.getPromptTokens(),
                                     accumulator.getCompletionTokens(),
+                                    accumulator.getCacheReadTokens(),
+                                    accumulator.getCacheWriteTokens(),
+                                    accumulator.getReasoningTokens(),
                                     accumulator.getRuntimeModelName(),
                                     accumulator.getRuntimeProviderId(),
                                     accumulator.toMetadataJson());
@@ -1484,6 +1590,31 @@ public class ChatController {
         return savedAssistant != null;
     }
 
+    /**
+     * Build the value stored in {@code ChatUploadResponse.path} (and, downstream,
+     * the message content part): a root-relative path like
+     * {@code chat-uploads/{convId}/{storedName}}, never the absolute on-disk
+     * location.
+     * <p>
+     * {@code uploadRoot} is always absolute (the resolver normalizes it via
+     * {@code toAbsolutePath().normalize()}), and this field is purely
+     * informational — it is rendered into the LLM prompt ("附件: foo (path)") and
+     * returned to the client, while retrieval goes through the basename-based
+     * {@code ChatUploadResolver} plus the {@code /api/v1/chat/files/...} URL. So
+     * the absolute form must be avoided: it leaks the server's filesystem layout
+     * into the prompt/response and breaks if the deploy directory ever moves.
+     * <p>
+     * The path is made relative to {@code uploadRoot}'s parent so the trailing
+     * upload sub-directory name is preserved (e.g. {@code chat-uploads/...}), and
+     * separators are normalized to {@code /} so the value is stable across OSes.
+     */
+    static String toRelativeUploadPath(Path uploadRoot, String conversationId, String storedName) {
+        Path target = uploadRoot.resolve(ChatUploadLocationResolver.sanitizeSegment(conversationId)).resolve(storedName);
+        Path base = uploadRoot.getParent();
+        Path relative = base != null ? base.relativize(target) : target;
+        return relative.toString().replace('\\', '/');
+    }
+
     private MessageEntity saveEmptyAssistantPlaceholder(String conversationId, String status,
                                                        StreamAccumulator accumulator, String source) {
         log.warn("{} with empty accumulator: conversationId={}, status={}, finishReason={}, phase={}, hasSegments={}",
@@ -1493,6 +1624,9 @@ public class ChatController {
                 emptyAssistantPlaceholder(status), null, status,
                 accumulator.getPromptTokens(),
                 accumulator.getCompletionTokens(),
+                accumulator.getCacheReadTokens(),
+                accumulator.getCacheWriteTokens(),
+                accumulator.getReasoningTokens(),
                 accumulator.getRuntimeModelName(),
                 accumulator.getRuntimeProviderId(),
                 accumulator.toMetadataJson());
@@ -1540,6 +1674,19 @@ public class ChatController {
         }
         if (promptTokens > 0) payload.put("promptTokens", promptTokens);
         if (completionTokens > 0) payload.put("completionTokens", completionTokens);
+        // Cache / reasoning detail rides on the persisted row so the live bubble
+        // can render the usage breakdown without waiting for a history reload.
+        if (savedAssistant != null) {
+            if (savedAssistant.getCacheReadTokens() != null && savedAssistant.getCacheReadTokens() > 0) {
+                payload.put("cacheReadTokens", savedAssistant.getCacheReadTokens());
+            }
+            if (savedAssistant.getCacheWriteTokens() != null && savedAssistant.getCacheWriteTokens() > 0) {
+                payload.put("cacheWriteTokens", savedAssistant.getCacheWriteTokens());
+            }
+            if (savedAssistant.getReasoningTokens() != null && savedAssistant.getReasoningTokens() > 0) {
+                payload.put("reasoningTokens", savedAssistant.getReasoningTokens());
+            }
+        }
         payload.put("persisted", persisted);
         if (messageCount != null) payload.put("messageCount", messageCount);
         return payload;
@@ -1594,6 +1741,9 @@ public class ChatController {
                     status,
                     accumulator.getPromptTokens(),
                     accumulator.getCompletionTokens(),
+                    accumulator.getCacheReadTokens(),
+                    accumulator.getCacheWriteTokens(),
+                    accumulator.getReasoningTokens(),
                     accumulator.getRuntimeModelName(),
                     accumulator.getRuntimeProviderId(),
                     accumulator.toMetadataJson());
@@ -1717,6 +1867,11 @@ public class ChatController {
                 || lower.contains("client abort") || lower.contains("closed");
     }
 
+    /** Markdown link pointing at a generated-file download URL. Used by the
+     *  StreamAccumulator to surface generated artifacts in the run-overview rail. */
+    private static final Pattern GENERATED_FILE_LINK_PATTERN =
+            Pattern.compile("\\[([^\\]]+)\\]\\(((?:https?://[^/\\s)\\]]+)?/api/v1/files/generated/[A-Za-z0-9-]+)\\)");
+
     /**
      * 流式累积器 — 收集 StreamDelta 事件，持久化到 DB。
      * <p>
@@ -1739,9 +1894,14 @@ public class ChatController {
         private final List<Map<String, Object>> planStepResults = new ArrayList<>();
         /** RFC-052: tool names whose returnDirect output was folded into the assistant message */
         private final List<String> directToolNames = new ArrayList<>();
+        /** Generated file artifacts extracted from tool results — surfaced in the run-overview rail. */
+        private final List<Map<String, Object>> generatedFiles = new ArrayList<>();
         private int segCounter = 0;
         private int promptTokens = 0;
         private int completionTokens = 0;
+        private int cacheReadTokens = 0;
+        private int cacheWriteTokens = 0;
+        private int reasoningTokens = 0;
         private String runtimeModelName = "";
         private String runtimeProviderId = "";
         private boolean awaitingApproval = false;
@@ -1788,6 +1948,9 @@ public class ChatController {
                     Map<String, Object> data = delta.eventData();
                     promptTokens = ((Number) data.getOrDefault("promptTokens", 0)).intValue();
                     completionTokens = ((Number) data.getOrDefault("completionTokens", 0)).intValue();
+                    cacheReadTokens = ((Number) data.getOrDefault("cacheReadTokens", 0)).intValue();
+                    cacheWriteTokens = ((Number) data.getOrDefault("cacheWriteTokens", 0)).intValue();
+                    reasoningTokens = ((Number) data.getOrDefault("reasoningTokens", 0)).intValue();
                     runtimeModelName = String.valueOf(data.getOrDefault("runtimeModelName", ""));
                     runtimeProviderId = String.valueOf(data.getOrDefault("runtimeProviderId", ""));
                     return;
@@ -2010,6 +2173,30 @@ public class ChatController {
                         break;
                     }
                 }
+                // Extract generated-file links from the tool result so the
+                // run-overview rail can surface artifacts without re-scanning
+                // segments on the frontend.
+                extractGeneratedFiles(String.valueOf(data.getOrDefault("result", "")), toolName);
+            }
+        }
+
+        /** Scan a tool result for markdown links pointing at generated-file
+         *  download URLs and collect them into {@link #generatedFiles}.
+         *  De-duplicates by URL so a link echoed in later tool results doesn't
+         *  produce duplicate entries in the run-overview rail. */
+        private void extractGeneratedFiles(String result, String toolName) {
+            if (result == null || result.isBlank()) return;
+            Matcher m = GENERATED_FILE_LINK_PATTERN.matcher(result);
+            while (m.find()) {
+                String url = m.group(2);
+                boolean dup = generatedFiles.stream()
+                        .anyMatch(f -> url.equals(String.valueOf(f.get("url"))));
+                if (dup) continue;
+                Map<String, Object> file = new LinkedHashMap<>();
+                file.put("filename", m.group(1));
+                file.put("url", url);
+                file.put("toolName", toolName);
+                generatedFiles.add(file);
             }
         }
 
@@ -2052,6 +2239,9 @@ public class ChatController {
         String getThinking() { return thinking.toString().trim(); }
         int getPromptTokens() { return promptTokens; }
         int getCompletionTokens() { return completionTokens; }
+        int getCacheReadTokens() { return cacheReadTokens; }
+        int getCacheWriteTokens() { return cacheWriteTokens; }
+        int getReasoningTokens() { return reasoningTokens; }
         String getRuntimeModelName() { return runtimeModelName; }
         String getRuntimeProviderId() { return runtimeProviderId; }
         String getCurrentPhase() { return currentPhase; }
@@ -2132,6 +2322,9 @@ public class ChatController {
                     // (assembled by FinalAnswerNode). UI uses this to badge
                     // historical messages as "data returned directly by tool".
                     metadata.put("directToolNames", directToolNames);
+                }
+                if (!generatedFiles.isEmpty()) {
+                    metadata.put("generatedFiles", generatedFiles);
                 }
                 if (!finishReason.isEmpty()) {
                     // Surface graph FinishReason so MemorySummarizationGate and

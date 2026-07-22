@@ -1,14 +1,32 @@
 package vip.mate.system.service;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
-import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.boot.context.event.ApplicationReadyEvent;
+import org.springframework.context.annotation.Lazy;
+import org.springframework.context.event.EventListener;
 import org.springframework.stereotype.Service;
+import vip.mate.exception.MateClawException;
+import vip.mate.plugin.PluginManager;
+import vip.mate.system.model.SearchProviderCatalogEntry;
+import vip.mate.system.model.SearchProviderCatalogResponse;
 import vip.mate.system.model.SystemSettingEntity;
 import vip.mate.system.model.SystemSettingsDTO;
 import vip.mate.system.repository.SystemSettingMapper;
+import vip.mate.tool.guard.WorkspacePathGuard;
+import vip.mate.tool.search.SearchProvider;
+import vip.mate.tool.search.SearchProviderRegistry;
+import vip.mate.workspace.core.config.WorkspaceSandboxProperties;
 
+import java.nio.file.Files;
+import java.nio.file.InvalidPathException;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.List;
+import java.util.Set;
+
+@Slf4j
 @Service
-@RequiredArgsConstructor
 public class SystemSettingService {
 
     private static final String LANGUAGE_KEY = "language";
@@ -24,6 +42,10 @@ public class SystemSettingService {
     private static final String SERPER_BASE_URL_KEY = "serperBaseUrl";
     private static final String TAVILY_API_KEY_KEY = "tavilyApiKey";
     private static final String TAVILY_BASE_URL_KEY = "tavilyBaseUrl";
+
+    // WeChat Official Account (公众号) publish credentials — read by GzhPublishTool.
+    private static final String WEIXINOA_APP_ID_KEY = "weixinoa.app_id";
+    private static final String WEIXINOA_APP_SECRET_KEY = "weixinoa.app_secret";
     private static final String DUCKDUCKGO_ENABLED_KEY = "duckduckgoEnabled";
     private static final String SEARXNG_BASE_URL_KEY = "searxngBaseUrl";
 
@@ -67,6 +89,14 @@ public class SystemSettingService {
     private static final String DEFAULT_VISION_MODEL_KEY = "default.vision_model";
     private static final String DEFAULT_VIDEO_MODEL_KEY = "default.video_model";
 
+    /**
+     * Default workspace storage root override. When set, it replaces the
+     * yml/env-configured {@code mateclaw.workspace.sandbox.root} as the global
+     * fallback sandbox root for conversations without a per-workspace base
+     * path. Empty string means "not overridden" (fall back to yml/env).
+     */
+    private static final String WORKSPACE_STORAGE_ROOT_KEY = "workspace.storage_root";
+
     private static final String ZHIPU_API_KEY_KEY = "zhipuApiKey";
     private static final String ZHIPU_BASE_URL_KEY = "zhipuBaseUrl";
     private static final String FAL_API_KEY_KEY = "falApiKey";
@@ -76,7 +106,46 @@ public class SystemSettingService {
     private static final String MINIMAX_API_KEY_KEY = "minimaxApiKey";
     private static final String MINIMAX_REGION_KEY = "minimaxRegion";
 
+    /**
+     * Keys whose values are secrets and must be encrypted at rest. Reads decrypt
+     * transparently and writes encrypt; legacy plaintext is upgraded on next save
+     * (see {@link SettingCrypto}). Add every credential-bearing key here.
+     */
+    private static final Set<String> SENSITIVE_KEYS = Set.of(
+            SERPER_API_KEY_KEY, TAVILY_API_KEY_KEY, WEIXINOA_APP_SECRET_KEY,
+            ZHIPU_API_KEY_KEY, FAL_API_KEY_KEY, KLING_ACCESS_KEY_KEY, KLING_SECRET_KEY_KEY,
+            RUNWAY_API_KEY_KEY, MINIMAX_API_KEY_KEY);
+
     private final SystemSettingMapper systemSettingMapper;
+    private final SearchProviderRegistry searchProviderRegistry;
+    private final SettingCrypto settingCrypto;
+    private final WorkspaceSandboxProperties workspaceSandboxProperties;
+
+    /**
+     * {@code PluginManager} is injected lazily because the bean graph is
+     * cyclic: {@code pluginManager → toolRegistry → i18nService →
+     * systemSettingService}. It is only consulted from
+     * {@link #toEntry} at request time (never at construction), so a lazy
+     * proxy is safe and breaks the cycle cleanly. Note: {@code @Lazy} must be
+     * applied via an explicit constructor (not {@code @RequiredArgsConstructor})
+     * — Lombok does not copy field-level annotations onto the generated
+     * constructor parameter, so a Lombok-only {@code @Lazy} silently has no
+     * effect and Spring still resolves the bean eagerly.
+     */
+    @Lazy
+    private final PluginManager pluginManager;
+
+    public SystemSettingService(SystemSettingMapper systemSettingMapper,
+                                 SearchProviderRegistry searchProviderRegistry,
+                                 SettingCrypto settingCrypto,
+                                 WorkspaceSandboxProperties workspaceSandboxProperties,
+                                 @Lazy PluginManager pluginManager) {
+        this.systemSettingMapper = systemSettingMapper;
+        this.searchProviderRegistry = searchProviderRegistry;
+        this.settingCrypto = settingCrypto;
+        this.workspaceSandboxProperties = workspaceSandboxProperties;
+        this.pluginManager = pluginManager;
+    }
 
     /**
      * Resolve the SearXNG base URL: DB value takes priority; fall back to the
@@ -109,6 +178,10 @@ public class SystemSettingService {
         // API Key 脱敏回显
         dto.setSerperApiKeyMasked(maskApiKey(getValue(SERPER_API_KEY_KEY, "")));
         dto.setTavilyApiKeyMasked(maskApiKey(getValue(TAVILY_API_KEY_KEY, "")));
+
+        // 公众号发布凭证（AppSecret 脱敏回显，AppID 明文）
+        dto.setWeixinoaAppId(getValue(WEIXINOA_APP_ID_KEY, ""));
+        dto.setWeixinoaAppSecretMasked(maskApiKey(getValue(WEIXINOA_APP_SECRET_KEY, "")));
 
         // 视频生成配置
         dto.setVideoEnabled(Boolean.parseBoolean(getValue(VIDEO_ENABLED_KEY, "false")));
@@ -159,6 +232,9 @@ public class SystemSettingService {
         // Multimodal sidecar routing — empty string means "not configured"
         dto.setDefaultVisionModelId(parseIdOrNull(getValue(DEFAULT_VISION_MODEL_KEY, "")));
         dto.setDefaultVideoModelId(parseIdOrNull(getValue(DEFAULT_VIDEO_MODEL_KEY, "")));
+
+        // Default workspace storage root — empty string means "not overridden"
+        dto.setWorkspaceStorageRoot(getValue(WORKSPACE_STORAGE_ROOT_KEY, ""));
         return dto;
     }
 
@@ -206,6 +282,37 @@ public class SystemSettingService {
         return dto;
     }
 
+    /**
+     * 搜索 provider catalog：内置 + 插件注册的全部 provider，标注是否可用、
+     * 属于哪个插件，以及当前实际会被 resolve() 选中的是哪一个。
+     */
+    public SearchProviderCatalogResponse getSearchProviderCatalog() {
+        SystemSettingsDTO config = getSearchSettings();
+
+        List<SearchProviderCatalogEntry> entries = searchProviderRegistry.allSorted().stream()
+                .map(p -> toEntry(p, config))
+                .toList();
+
+        SearchProviderRegistry.ResolvedProvider resolved = searchProviderRegistry.resolve(config);
+        String resolvedId = resolved != null ? resolved.provider().id() : null;
+        String resolvedSource = resolved != null ? resolved.source() : null;
+
+        return new SearchProviderCatalogResponse(entries, resolvedId, resolvedSource);
+    }
+
+    private SearchProviderCatalogEntry toEntry(SearchProvider provider, SystemSettingsDTO config) {
+        boolean builtin = !searchProviderRegistry.isPluginProvider(provider.id());
+        String pluginName = builtin ? null : pluginManager.getPluginNameForSearchProvider(provider.id());
+        return new SearchProviderCatalogEntry(
+                provider.id(),
+                provider.label(),
+                builtin,
+                provider.requiresCredential(),
+                provider.isAvailable(config),
+                pluginName
+        );
+    }
+
     public SystemSettingsDTO saveSettings(SystemSettingsDTO dto) {
         saveValue(LANGUAGE_KEY, dto.getLanguage(), "当前界面语言");
         saveValue(STREAM_ENABLED_KEY, String.valueOf(Boolean.TRUE.equals(dto.getStreamEnabled())), "是否开启流式响应");
@@ -234,6 +341,14 @@ public class SystemSettingService {
         }
         if (dto.getTavilyBaseUrl() != null) {
             saveValue(TAVILY_BASE_URL_KEY, dto.getTavilyBaseUrl(), "Tavily 接口地址");
+        }
+
+        // 公众号发布凭证（AppSecret 仅在非空时保存，避免脱敏回显覆盖为空）
+        if (dto.getWeixinoaAppId() != null) {
+            saveValue(WEIXINOA_APP_ID_KEY, dto.getWeixinoaAppId().trim(), "公众号 AppID");
+        }
+        if (dto.getWeixinoaAppSecret() != null && !dto.getWeixinoaAppSecret().isBlank()) {
+            saveValue(WEIXINOA_APP_SECRET_KEY, dto.getWeixinoaAppSecret().trim(), "公众号 AppSecret");
         }
         // Keyless provider 配置
         if (dto.getDuckduckgoEnabled() != null) {
@@ -371,7 +486,88 @@ public class SystemSettingService {
                     String.valueOf(dto.getDefaultVideoModelId()),
                     "Default video-capable model id (mate_model_config.id) for sidecar routing");
         }
+
+        // Default workspace storage root. null = field not submitted (partial
+        // save from an unrelated settings page); blank = explicit clear, fall
+        // back to the yml/env-configured sandbox root. Applied immediately —
+        // no restart required. Only affects newly created files; existing data
+        // is never migrated.
+        if (dto.getWorkspaceStorageRoot() != null) {
+            String root = dto.getWorkspaceStorageRoot().trim();
+            if (!root.isEmpty()) {
+                validateWorkspaceStorageRoot(root);
+            }
+            saveValue(WORKSPACE_STORAGE_ROOT_KEY, root, "默认工作空间存储路径（全局兜底沙箱根，空=使用配置文件默认值）");
+            applyWorkspaceStorageRoot(root);
+        }
         return getSettings();
+    }
+
+    /**
+     * Reject a storage root that could never work: relative paths (the guard
+     * needs a stable absolute boundary) and paths that cannot be created.
+     */
+    private void validateWorkspaceStorageRoot(String root) {
+        Path path;
+        try {
+            path = Paths.get(root);
+        } catch (InvalidPathException e) {
+            throw new MateClawException("err.settings.storage_root_invalid", 400,
+                    "Invalid storage path: " + e.getMessage());
+        }
+        if (!path.isAbsolute()) {
+            throw new MateClawException("err.settings.storage_root_not_absolute", 400,
+                    "Storage path must be absolute: " + root);
+        }
+        try {
+            Files.createDirectories(path);
+        } catch (Exception e) {
+            throw new MateClawException("err.settings.storage_root_create_failed", 400,
+                    "Cannot create storage directory " + root + ": " + e.getMessage());
+        }
+    }
+
+    /**
+     * Register the effective global fallback sandbox root with
+     * {@link WorkspacePathGuard}. Priority: DB override > yml/env > built-in
+     * default. A blank override restores the yml/env-configured behaviour,
+     * including the {@code enabled=false} escape hatch.
+     */
+    private void applyWorkspaceStorageRoot(String override) {
+        if (override == null || override.isBlank()) {
+            if (workspaceSandboxProperties.isEnabled()) {
+                Path root = Paths.get(workspaceSandboxProperties.getRoot()).toAbsolutePath().normalize();
+                WorkspacePathGuard.setDefaultRoot(root.toString());
+            } else {
+                WorkspacePathGuard.setDefaultRoot(null);
+            }
+            return;
+        }
+        Path root = Paths.get(override).toAbsolutePath().normalize();
+        WorkspacePathGuard.setDefaultRoot(root.toString());
+    }
+
+    /**
+     * Apply a persisted storage-root override once the database is ready.
+     * Startup registration order: WorkspaceSandboxAutoConfiguration registers
+     * the yml/env root at context construction, then this listener overrides
+     * it with the DB value when one is set.
+     */
+    @EventListener(ApplicationReadyEvent.class)
+    public void applyPersistedWorkspaceStorageRoot() {
+        String root = getValue(WORKSPACE_STORAGE_ROOT_KEY, "");
+        if (root == null || root.isBlank()) {
+            return;
+        }
+        try {
+            Files.createDirectories(Paths.get(root));
+        } catch (Exception e) {
+            // Registering the root still tightens the boundary even if the
+            // directory can't be pre-created; log and continue.
+            log.warn("[SystemSetting] Failed to create workspace storage root {}: {}", root, e.getMessage());
+        }
+        applyWorkspaceStorageRoot(root);
+        log.info("[SystemSetting] Workspace storage root override applied: {}", root);
     }
 
     /**
@@ -439,7 +635,12 @@ public class SystemSettingService {
         SystemSettingEntity entity = systemSettingMapper.selectOne(new LambdaQueryWrapper<SystemSettingEntity>()
                 .eq(SystemSettingEntity::getSettingKey, key)
                 .last("LIMIT 1"));
-        return entity != null && entity.getSettingValue() != null ? entity.getSettingValue() : defaultValue;
+        if (entity == null || entity.getSettingValue() == null) {
+            return defaultValue;
+        }
+        String stored = entity.getSettingValue();
+        // Sensitive keys are stored encrypted; decrypt() passes legacy plaintext through.
+        return SENSITIVE_KEYS.contains(key) ? settingCrypto.decrypt(stored) : stored;
     }
 
     private String maskApiKey(String apiKey) {
@@ -453,6 +654,10 @@ public class SystemSettingService {
     }
 
     private void saveValue(String key, String value, String description) {
+        // Encrypt secrets at rest; non-blank only (blank passes through to clear).
+        if (SENSITIVE_KEYS.contains(key) && value != null && !value.isEmpty()) {
+            value = settingCrypto.encrypt(value);
+        }
         SystemSettingEntity entity = systemSettingMapper.selectOne(new LambdaQueryWrapper<SystemSettingEntity>()
                 .eq(SystemSettingEntity::getSettingKey, key)
                 .last("LIMIT 1"));

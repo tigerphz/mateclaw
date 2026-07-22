@@ -45,7 +45,8 @@ export function useGlobalWikilinkClick() {
     const target = e.target as HTMLElement | null
     if (!target) return
     // The click might land on a descendant of the <a>; walk up if needed.
-    const anchor = target.closest<HTMLElement>('a.wiki-link, .wiki-link')
+    // Matches both [[Title]] wikilinks and [n] wiki-citation markers.
+    const anchor = target.closest<HTMLElement>('a.wiki-link, a.wiki-citation, .wiki-link, .wiki-citation')
     if (!anchor) return
     // WikiPageViewer's own postprocess produces <a class="wiki-link"
     // data-slug=...> for in-wiki navigation. Its onMounted hook reads
@@ -53,12 +54,25 @@ export function useGlobalWikilinkClick() {
     // intercept those — only the chat / external surfaces emit
     // data-wiki-title without data-slug.
     if (anchor.hasAttribute('data-slug')) return
-    const title = anchor.getAttribute('data-wiki-title')
+    // Citations use data-citation-title, wikilinks use data-wiki-title.
+    const title = anchor.getAttribute('data-citation-title')
+               || anchor.getAttribute('data-wiki-title')
     if (!title) return
 
     // Prevent the no-op href="#" jump and bubbling.
     e.preventDefault()
     e.stopPropagation()
+
+    // Cross-KB reference [[kbId/slug]] — the token carries an explicit numeric
+    // KB id, so route straight to that KB instead of guessing via lookup.
+    const crossKb = /^(\d+)\/(.+)$/.exec(title.trim())
+    if (crossKb) {
+      const slug = crossKb[2].trim()
+      if (slug) {
+        router.push({ name: 'Wiki', query: { kbId: crossKb[1], slug } })
+        return
+      }
+    }
 
     try {
       // Pass both — backend matches slug first, falls back to title. For

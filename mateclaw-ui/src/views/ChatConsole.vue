@@ -211,6 +211,11 @@
         :capabilities="agentCapabilities"
       />
 
+      <!-- 上下文占用（估算）：点击展开分项面板 -->
+      <div v-if="contextUsage" class="ctx-usage-row">
+        <ContextUsagePanel :usage="contextUsage" />
+      </div>
+
       <!-- 使用组件化的 ChatInput -->
       <ChatInput
         ref="chatInputRef"
@@ -243,6 +248,13 @@
       />
     </div>
 
+        <!-- 运行总览侧栏：计划进度 + 子 Agent 实时状态 -->
+        <RunOverviewPanel
+          :messages="messages"
+          :is-generating="isGenerating"
+          :agent-type="currentAgent?.agentType"
+        />
+
         <!-- Talk Mode 覆盖层 -->
         <TalkMode
           v-if="showTalkMode"
@@ -256,18 +268,23 @@
   </div>
 </template>
 
+<script lang="ts">
+let cachedAgents: import('@/types').Agent[] = []
+</script>
+
 <script setup lang="ts">
-import { ref, computed, onMounted, onBeforeUnmount, watch, nextTick } from 'vue'
+import { ElMessage } from 'element-plus/es/components/message/index'
+import { ref, computed, onMounted, onBeforeUnmount, onActivated, onDeactivated, watch, nextTick } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import { mcToast } from '@/composables/useMcToast'
 import { ChatDotRound, Delete, Setting, UploadFilled } from '@element-plus/icons-vue'
 import { conversationApi, agentApi, modelApi, chatApi, cronJobApi, approvalApi } from '@/api/index'
-import { ElMessage } from 'element-plus'
 import { copyToClipboard } from '@/utils/clipboard'
 import { useFileDrop } from '@/composables/useFileDrop'
 import { useIsMobile, useMediaQuery, BREAKPOINTS } from '@/composables/useBreakpoint'
 import { useChat } from '@/composables/chat/useChat'
+import RunOverviewPanel from '@/components/chat/RunOverviewPanel.vue'
 import { reconstructErrorInfo } from '@/types/chatError'
 import { reconcileMessages, extractMessages } from '@/utils/messageReconcile'
 import type { Conversation, Agent, ModelConfig, ProviderInfo, ActiveModelsInfo, ChatAttachment, MessageContentPart, Message, ToolCallMeta, StreamPhase } from '@/types'
@@ -282,6 +299,7 @@ import { agentIconColor } from '@/utils/agentIconColor'
 import ChatInput from '@/components/chat/ChatInput.vue'
 import MultimodalRoutingHint from '@/components/chat/MultimodalRoutingHint.vue'
 import StreamLoadingBar from '@/components/chat/StreamLoadingBar.vue'
+import ContextUsagePanel from '@/components/chat/ContextUsagePanel.vue'
 import TalkMode from '@/components/chat/TalkMode.vue'
 import ModelSelector from '@/components/chat/ModelSelector.vue'
 import { useEChartsRenderer } from '@/composables/useEChartsRenderer'
@@ -351,7 +369,7 @@ const router = useRouter()
 const route = useRoute()
 const { t } = useI18n()
 
-const agents = ref<Agent[]>([])
+const agents = ref<Agent[]>(cachedAgents.length > 0 ? [...cachedAgents] : [])
 const conversations = ref<Conversation[]>([])
 const selectedAgentId = ref<string | number>('')
 const currentConversationId = ref<string>('')
@@ -386,6 +404,12 @@ const enabledModels = ref<ModelConfig[]>([])
 const activeModels = ref<ActiveModelsInfo | null>(null)
 // Global default model — seeds the selector for conversations with no pin yet.
 const globalDefaultModel = ref<{ providerId: string; model: string } | null>(null)
+// True once the user manually picks a model for the CURRENT conversation.
+// Guards the agent-capability re-seed (see the selectedAgentId watcher) from
+// clobbering that pick during the window where the async capability fetch
+// resolves after a fresh conversation was already seeded. Reset whenever we
+// move to a different conversation.
+const userPickedModel = ref(false)
 const pendingAttachments = ref<ChatAttachment[]>([])
 const uploadingAttachment = ref(false)
 
@@ -427,6 +451,9 @@ function onAgentPicked(value: string | number | null) {
 function selectModel(value: string) {
   const [providerId, model] = value.split('::')
   if (!providerId || !model) return
+  // Remember the explicit pick so a late-arriving agent-capability fetch
+  // doesn't re-seed over it on a not-yet-persisted conversation.
+  userPickedModel.value = true
   // Per-conversation model: switching here only affects THIS conversation.
   // We update the selector + the local list entry immediately so the UI is
   // responsive, then persist the pin to the server right away IF the
@@ -496,13 +523,62 @@ function selectModel(value: string) {
 }
 
 /**
- * Point the model selector at a conversation's pinned model, or the global
- * default when the conversation has no pin yet (fresh chat, IM, cron).
+ * The selected agent's model override, as a (provider, model) pair — or null
+ * when the agent has no usable override.
+ *
+ * Two sources, in order:
+ *   1. agentCapabilities — the backend-resolved pair from /agents/{id}/capabilities.
+ *      Authoritative: it runs the same resolveModel the runtime uses (honouring
+ *      disabled→default fallback and provider disambiguation). But it arrives
+ *      via an async fetch that resolves AFTER the synchronous seeding on an
+ *      agent switch / deep-link, and is lost entirely if that fetch fails.
+ *   2. currentAgent.modelName resolved against the enabled-model list — a
+ *      SYNCHRONOUS fallback so an agent switch, a capability-fetch failure, or a
+ *      not-yet-hydrated deep-link still honour the per-agent override instead of
+ *      silently dropping to the global default (which handleSendMessage would
+ *      then pin, re-introducing the very clobber this whole change fixes).
+ *
+ * enabledModels is viewer-accessible (/models/enabled) and loaded at mount, so
+ * the fallback works for viewers too.
+ */
+function agentSeedModel(): { providerId: string; model: string } | null {
+  const cap = agentCapabilities.value
+  if (cap?.providerId && cap?.modelName) {
+    return { providerId: cap.providerId, model: cap.modelName }
+  }
+  const name = currentAgent.value?.modelName
+  if (name) {
+    const hit = enabledModels.value.find(m => m.modelName === name)
+    if (hit?.provider) {
+      return { providerId: hit.provider, model: hit.modelName }
+    }
+  }
+  return null
+}
+
+/**
+ * Point the model selector at the model this conversation should run, honouring
+ * the same precedence the backend uses when it resolves the runtime model
+ * (see AgentGraphBuilder.resolveRuntimeBaseModel):
+ *
+ *   conversation pin  >  selected agent's model override  >  global default
+ *
+ * The middle tier is the fix for the "I set the agent's model but chat used
+ * another one" bug: without it a fresh conversation seeded the global default,
+ * and handleSendMessage then PINNED that default onto the conversation row —
+ * which outranks the agent override and silently clobbered it.
  */
 function applyConversationModel(conv?: Conversation | null) {
   if (conv?.modelProvider && conv?.modelName) {
     activeModels.value = { activeLlm: { providerId: conv.modelProvider, model: conv.modelName } }
-  } else if (globalDefaultModel.value) {
+    return
+  }
+  const agentModel = agentSeedModel()
+  if (agentModel) {
+    activeModels.value = { activeLlm: { providerId: agentModel.providerId, model: agentModel.model } }
+    return
+  }
+  if (globalDefaultModel.value) {
     activeModels.value = { activeLlm: { ...globalDefaultModel.value } }
   }
 }
@@ -663,6 +739,7 @@ const {
   queueSize,
   heartbeat,
   compactStatus,
+  contextUsage,
   lifecycleStage,
   sendMessage: sendChatMessage,
   stopGeneration: stopChatGeneration,
@@ -868,6 +945,7 @@ const modelPromptText = computed<{ title: string; desc: string }>(() => {
     case 'unprobed':
       return { title: t('chat.prompt.unprobed.title'), desc: t('chat.prompt.unprobed.desc') }
     case 'no-models':
+    default:
       return {
         title: t('chat.prompt.noModels.title', { name: p?.name || '' }),
         desc:  t('chat.prompt.noModels.desc'),
@@ -993,6 +1071,25 @@ const activeCronRuns = ref<ActiveCronRun[]>([])
 function isCronConversation(cid: string | null | undefined): boolean {
   return !!cid && (cid.startsWith('tasks_') || cid.startsWith('cron_'))
 }
+// True when a conversation id was minted client-side for a brand-new chat
+// the user hasn't sent anything in yet, so the backend has never persisted
+// (and therefore can't "own") it. Every per-conversation endpoint called with
+// such an id is rejected with 403 "无权访问该会话" — the status/messages poller
+// and the goal loader both skip the request entirely for these ids instead of
+// spamming the console with ownership errors.
+//
+// Conservative by construction: an id counts as ephemeral only when it is
+// absent from BOTH the loaded conversation list AND the local message buffer,
+// so a freshly-persisted conversation is never mistaken for one. At worst a
+// single stray 403 slips through during the persist race, which the leaf
+// callers swallow.
+function isEphemeralConversation(cid: string | null | undefined): boolean {
+  if (!cid) return true
+  // Server-managed virtual conversations (cron / scheduled tasks) always exist.
+  if (cid.startsWith('tasks_') || cid.startsWith('cron_')) return false
+  if (conversations.value.some((c) => c.conversationId === cid)) return false
+  return !messages.value.some((m: any) => m.conversationId === cid)
+}
 async function refreshActiveCronRuns(cid: string) {
   if (!isCronConversation(cid)) {
     activeCronRuns.value = []
@@ -1057,8 +1154,13 @@ async function pollActivity() {
     } catch {
       // 静默失败，下一轮再试
     }
-    // 自己没在生成时才刷新当前选中会话的消息 + 探测是否该接入流
-    if (currentConversationId.value && !isGenerating.value && streamPhase.value !== 'awaiting_approval') {
+    // 自己没在生成时才刷新当前选中会话的消息 + 探测是否该接入流。
+    // 跳过尚未落库的临时会话(新建空会话、还没发消息):后端查不到会话行,
+    // getStatus / listMessages 一律 403,4s 轮询会把 console 刷爆(见 issue #408)。
+    if (currentConversationId.value
+        && !isGenerating.value
+        && streamPhase.value !== 'awaiting_approval'
+        && !isEphemeralConversation(currentConversationId.value)) {
       const cid = currentConversationId.value
       try {
         const statusRes: any = await conversationApi.getStatus(cid)
@@ -1130,6 +1232,51 @@ onBeforeUnmount(() => {
   revokeAllPreviewUrls()
 })
 
+onDeactivated(() => {
+  if (activityPollTimer !== null) {
+    clearInterval(activityPollTimer)
+    activityPollTimer = null
+  }
+  if (elapsedTickTimer !== null) {
+    clearInterval(elapsedTickTimer)
+    elapsedTickTimer = null
+  }
+  document.removeEventListener('click', handleCodeCopy)
+  disposeECharts()
+  disposeKatex()
+  disposeMermaid()
+  revokeAllPreviewUrls()
+  resetForNewConversation()
+})
+
+onActivated(async () => {
+  document.addEventListener('click', handleCodeCopy)
+  startECharts()
+  startKatex()
+  startMermaid()
+  // Issue #538: ChatConsole is kept alive by the router (meta.keepAlive), so
+  // navigating away and back only fires onActivated, not onMounted — an
+  // agent created/edited/deleted elsewhere (e.g. the Employees page) never
+  // reached this component's own `agents` list otherwise, and stayed
+  // invisible in the picker until a full page reload forced a fresh mount.
+  await loadAgents()
+  activityPollTimer = window.setInterval(pollActivity, ACTIVITY_POLL_MS)
+  elapsedTickTimer = window.setInterval(() => {
+    if (activeCronRuns.value.length > 0) elapsedNow.value = Date.now()
+  }, 1000)
+  // 登出已改为 window.location.href（刷新页面），所以切回时不会有跨用户残留
+  if (currentConversationId.value && !isEphemeralConversation(currentConversationId.value)) {
+    try {
+      const statusRes: any = await conversationApi.getStatus(currentConversationId.value)
+      if (currentConversationId.value && statusRes.data?.streamStatus === 'running') {
+        await reconnectStream(currentConversationId.value)
+      }
+    } catch {
+      // 忽略
+    }
+  }
+})
+
 watch(() => route.query, () => {
   // If a fresh action arrives (e.g. user re-fires Ctrl+K via the URL while
   // the view is already alive), pick it up immediately.
@@ -1149,10 +1296,28 @@ const goalStore = useGoalStore()
 const workspaceStoreForGoal = useWorkspaceStore()
 const currentWorkspaceId = computed(() => workspaceStoreForGoal.currentWorkspaceId ?? '1')
 watch(currentConversationId, async (cid) => {
-  if (cid) {
+  // Skip un-persisted conversations: a brand-new empty chat has no goal yet
+  // and the lookup would only 403 (Not the owner). The ring is hydrated by the
+  // goal_created SSE event once the first turn lands.
+  if (cid && !isEphemeralConversation(cid)) {
     await goalStore.loadActiveForConversation(cid)
   }
 }, { immediate: true })
+
+// Re-fetch the active goal when a turn finishes. A goal can be created or
+// mutated mid-conversation — e.g. auto-derived server-side from a Plan-Execute
+// plan, or completed by the agent — without the conversation id changing and
+// without a goal_* SSE event reaching this client (skipped creation, missed
+// event, reconnect). The per-conversation watch above only fires on switch, so
+// this transition-to-idle refresh is what keeps the goal ring honest after
+// every turn against the persisted truth.
+watch(isGenerating, async (generating, wasGenerating) => {
+  if (wasGenerating && !generating
+      && currentConversationId.value
+      && !isEphemeralConversation(currentConversationId.value)) {
+    await goalStore.loadActiveForConversation(currentConversationId.value)
+  }
+})
 
 // Derive props for the inline prompt + system-line slots that sit
 // between MessageList and ChatInput. The prompt shows only when:
@@ -1268,6 +1433,17 @@ watch(selectedAgentId, async (id) => {
   try {
     const res: any = await agentApi.getCapabilities(id)
     agentCapabilities.value = res.data || null
+    // The capability fetch is async and typically resolves AFTER the
+    // synchronous newConversation()/applyConversationModel() that ran on this
+    // same agent switch (which fell back to the global default because caps
+    // weren't loaded yet). Re-seed now that we know the agent's resolved model
+    // — but only for a conversation with no server-side pin and where the user
+    // hasn't manually picked a model, so we never clobber an explicit choice.
+    const conv = conversations.value.find(c => c.conversationId === currentConversationId.value)
+    const hasServerPin = !!(conv?.modelProvider && conv?.modelName)
+    if (!hasServerPin && !userPickedModel.value) {
+      applyConversationModel(conv)
+    }
   } catch {
     agentCapabilities.value = null
   }
@@ -1281,6 +1457,7 @@ async function loadAgents() {
     // a confusing failure path. The admin Agents view passes no filter.
     const res: any = await agentApi.list({ enabled: true })
     agents.value = res.data || []
+    if (agents.value.length > 0) cachedAgents = [...agents.value]
     // 只有在 URL 没有指定 agentId 且当前无选中时，才默认选第一个
     if (agents.value.length > 0 && !selectedAgentId.value && !route.query.agentId) {
       selectedAgentId.value = agents.value[0].id
@@ -1415,8 +1592,24 @@ async function refreshCurrentConversationMessages(conversationId: string) {
 }
 
 async function hydrateStateFromRoute() {
-  const agentId = route.query.agentId ? String(route.query.agentId) : ''
-  const conversationId = String(route.query.conversationId || '')
+  let agentId = route.query.agentId ? String(route.query.agentId) : ''
+  let conversationId = String(route.query.conversationId || '')
+
+  // The URL can outlive its workspace: switching workspaces remounts this view
+  // (via the router-view key) but keeps the query string, so agentId /
+  // conversationId may still point at entities of the previous workspace. An
+  // agentId missing from the workspace-scoped agent list is such a leftover —
+  // drop it so the default-select below picks a real employee instead of the
+  // picker rendering the unresolvable raw id.
+  if (agentId && agents.value.length > 0 && !agents.value.some(a => String(a.id) === agentId)) {
+    agentId = ''
+    // Only follow the paired conversationId when it resolves locally (e.g. a
+    // Sessions-page jump within this workspace); otherwise it is equally stale
+    // and would attach the fallback agent to a foreign conversation.
+    if (!conversations.value.some(conv => conv.conversationId === conversationId)) {
+      conversationId = ''
+    }
+  }
 
   if (agentId && agentId !== String(selectedAgentId.value)) {
     selectedAgentId.value = agentId
@@ -1433,7 +1626,7 @@ async function hydrateStateFromRoute() {
       try {
         const res: any = await conversationApi.listMessages(conversationId)
         if (currentConversationId.value !== conversationId) return
-        messages.value = extractMessages(res).messages.map((msg: Message) => normalizeMessage(msg))
+      messages.value = extractMessages(res).messages.map((msg: Message) => normalizeMessage(msg, true))
       } catch {
         // 消息加载失败，保持空
       }
@@ -1472,9 +1665,13 @@ async function selectConversation(conv: Conversation) {
   const switchingAway = currentConversationId.value !== conv.conversationId
   if (switchingAway) {
     resetForNewConversation()
+    messageListRef.value?.resetScrollLock()
   }
   currentConversationId.value = conv.conversationId
   selectedAgentId.value = conv.agentId || selectedAgentId.value
+  // Opening another conversation: its pin (or the agent/global fallback) is
+  // authoritative, so clear the previous conversation's manual-pick guard.
+  userPickedModel.value = false
   // Restore this conversation's pinned model into the selector.
   applyConversationModel(conv)
   // Reset cron placeholder state up front; the immediate fetch below repopulates
@@ -1494,7 +1691,8 @@ async function selectConversation(conv: Conversation) {
     if (currentConversationId.value !== requestedConvId) return
     // 点同一个会话时，若已有 SSE 在跑就不要覆盖本地消息状态
     if (switchingAway || !isGenerating.value) {
-      messages.value = extractMessages(res).messages.map((msg: Message) => normalizeMessage(msg))
+      const convRunning = conv.streamStatus === 'running'
+      messages.value = extractMessages(res).messages.map((msg: Message) => normalizeMessage(msg, convRunning))
     }
 
     // Hydrate pending approvals：恢复刷新后丢失的审批卡片（RFC-067 §4.9）
@@ -1608,7 +1806,9 @@ function newConversation() {
   resetForNewConversation()
   currentConversationId.value = `conv_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
   messages.value = []
-  // A fresh conversation starts on the global default model.
+  // A fresh conversation defers to the selected agent's model (then the global
+  // default) until the user explicitly picks one.
+  userPickedModel.value = false
   applyConversationModel()
 }
 
@@ -1621,6 +1821,11 @@ function onConversationsDeleted(ids: string[]) {
     resetStreamingState()
     messages.value = []
     currentConversationId.value = ''
+    // Deleting the open conversation drops us back to a blank slate — clear the
+    // manual-pick guard so the next message (which mints a fresh conversation)
+    // seeds from the agent override again instead of inheriting the deleted
+    // conversation's pick. Mirrors newConversation()/selectConversation().
+    userPickedModel.value = false
   }
 }
 
@@ -1893,7 +2098,6 @@ async function handleApproveAlways(
 
 // 重连到运行中的流
 async function reconnectStream(conversationId: string) {
-  if (isGenerating.value) return
   try {
     await reconnectChatStream(conversationId)
   } catch (e) {
@@ -1987,7 +2191,7 @@ function buildOutgoingParts(text: string, attachments: ChatAttachment[]): Messag
 }
 
 // ============ 工具函数 ============
-function normalizeMessage(raw: Message): Message {
+function normalizeMessage(raw: Message, preserveGeneratingStatus?: boolean): Message {
   const msg: Message = { ...raw, contentParts: raw.contentParts ? [...raw.contentParts] : [] }
 
   // 统一解析 metadata：确保是对象而非 JSON 字符串
@@ -2006,6 +2210,9 @@ function normalizeMessage(raw: Message): Message {
   // 保留后端返回的 token 字段（MessageVO 新增）
   if ((raw as any).promptTokens) msg.promptTokens = (raw as any).promptTokens
   if ((raw as any).completionTokens) msg.completionTokens = (raw as any).completionTokens
+  if ((raw as any).cacheReadTokens) msg.cacheReadTokens = (raw as any).cacheReadTokens
+  if ((raw as any).cacheWriteTokens) msg.cacheWriteTokens = (raw as any).cacheWriteTokens
+  if ((raw as any).reasoningTokens) msg.reasoningTokens = (raw as any).reasoningTokens
   if ((raw as any).runtimeModel) msg.runtimeModel = (raw as any).runtimeModel
   if ((raw as any).runtimeProvider) msg.runtimeProvider = (raw as any).runtimeProvider
 
@@ -2057,7 +2264,7 @@ function normalizeMessage(raw: Message): Message {
     msg.metadata = { ...msg.metadata, toolCalls: cleaned }
   }
 
-  if (msg.status === 'generating') msg.status = 'failed'
+  if (!preserveGeneratingStatus && msg.status === 'generating') msg.status = 'failed'
   // interrupted 是合法的历史状态（interrupt-with-followup），不映射为 stopped
   if (!msg.status) msg.status = 'completed'
 
@@ -2136,6 +2343,11 @@ function handleCodeCopy(e: MouseEvent) {
 </script>
 
 <style scoped>
+.ctx-usage-row {
+  display: flex;
+  justify-content: flex-end;
+  padding: 0 4px 4px;
+}
 .cron-running-bar {
   display: flex;
   flex-direction: column;

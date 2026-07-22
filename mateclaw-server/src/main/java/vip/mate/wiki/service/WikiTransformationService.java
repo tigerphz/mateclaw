@@ -5,6 +5,7 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import vip.mate.exception.MateClawException;
 import vip.mate.wiki.model.WikiTransformationEntity;
 import vip.mate.wiki.model.WikiTransformationRunEntity;
 import vip.mate.wiki.repository.WikiTransformationMapper;
@@ -29,7 +30,12 @@ public class WikiTransformationService {
     private final WikiTransformationMapper transformationMapper;
     private final WikiTransformationRunMapper runMapper;
 
-    /** Templates visible to a KB: pinned to this KB plus workspace-wide ones (kb_id NULL). */
+    /**
+     * Templates visible to a KB: pinned to this KB, plus workspace-wide ones —
+     * either scoped to this workspace ({@code workspace_id = current}) or global
+     * ({@code workspace_id IS NULL}, e.g. the built-in starter pack, visible to
+     * every workspace).
+     */
     public List<WikiTransformationEntity> listForKb(Long kbId, Long workspaceId) {
         if (kbId == null) {
             return List.of();
@@ -38,14 +44,17 @@ public class WikiTransformationService {
                 new LambdaQueryWrapper<WikiTransformationEntity>()
                         .and(w -> w.eq(WikiTransformationEntity::getKbId, kbId)
                                 .or(g -> g.isNull(WikiTransformationEntity::getKbId)
-                                        .eq(WikiTransformationEntity::getWorkspaceId, workspaceId)))
+                                        .and(ws -> ws.eq(WikiTransformationEntity::getWorkspaceId, workspaceId)
+                                                .or().isNull(WikiTransformationEntity::getWorkspaceId))))
                         .orderByDesc(WikiTransformationEntity::getUpdateTime));
     }
 
     public List<WikiTransformationEntity> listByWorkspace(Long workspaceId) {
         return transformationMapper.selectList(
                 new LambdaQueryWrapper<WikiTransformationEntity>()
-                        .eq(WikiTransformationEntity::getWorkspaceId, workspaceId)
+                        // This workspace's own templates plus global ones (workspace_id NULL).
+                        .and(w -> w.eq(WikiTransformationEntity::getWorkspaceId, workspaceId)
+                                .or().isNull(WikiTransformationEntity::getWorkspaceId))
                         .orderByDesc(WikiTransformationEntity::getUpdateTime));
     }
 
@@ -65,9 +74,14 @@ public class WikiTransformationService {
         WikiTransformationEntity global = transformationMapper.selectOne(
                 new LambdaQueryWrapper<WikiTransformationEntity>()
                         .isNull(WikiTransformationEntity::getKbId)
-                        .eq(WikiTransformationEntity::getWorkspaceId, workspaceId)
+                        // This workspace's own template, or a global one (workspace_id NULL).
+                        .and(ws -> ws.eq(WikiTransformationEntity::getWorkspaceId, workspaceId)
+                                .or().isNull(WikiTransformationEntity::getWorkspaceId))
                         .eq(WikiTransformationEntity::getName, name)
-                        .last("LIMIT 1"));
+                        // Deterministic: prefer the workspace-local row over a same-named
+                        // global one, then newer-first. (workspace_id IS NULL) ASC puts the
+                        // non-null workspace-scoped row first — consistent across H2/MySQL/Kingbase.
+                        .last("ORDER BY (workspace_id IS NULL) ASC, update_time DESC LIMIT 1"));
         return Optional.ofNullable(global);
     }
 
@@ -112,6 +126,7 @@ public class WikiTransformationService {
         entity.setOutputTarget(normalizeOutputTarget(input.getOutputTarget()));
         entity.setOutputFormat(normalizeOutputFormat(input.getOutputFormat()));
         entity.setOutputSchema(sanitizeOutputSchema(input.getOutputSchema()));
+        entity.setTargetPageType(normalizeTargetPageType(input.getTargetPageType()));
         transformationMapper.insert(entity);
         log.info("[WikiTransformation] created id={} name={} kbId={}",
                 entity.getId(), entity.getName(), entity.getKbId());
@@ -124,6 +139,10 @@ public class WikiTransformationService {
         if (entity == null) {
             throw new IllegalArgumentException("Transformation not found: " + id);
         }
+        // Defense in depth: global templates are system-owned / read-only.
+        // The controller already rejects this, but this also guards callers that
+        // bypass the controller (e.g. the WikiTool LLM entry points).
+        rejectGlobalTemplateMutation(entity);
         if (patch.getTitle() != null) entity.setTitle(patch.getTitle());
         if (patch.getDescription() != null) entity.setDescription(patch.getDescription());
         if (patch.getPromptTemplate() != null) entity.setPromptTemplate(patch.getPromptTemplate());
@@ -144,6 +163,10 @@ public class WikiTransformationService {
             // Empty string clears the schema; non-blank gets stored after a parse check.
             entity.setOutputSchema(sanitizeOutputSchema(patch.getOutputSchema()));
         }
+        if (patch.getTargetPageType() != null) {
+            // Empty string clears (back to profile fallback); non-blank is stored lowercase.
+            entity.setTargetPageType(normalizeTargetPageType(patch.getTargetPageType()));
+        }
         transformationMapper.updateById(entity);
         return entity;
     }
@@ -156,6 +179,19 @@ public class WikiTransformationService {
             case "page" -> "page";
             default -> "none";
         };
+    }
+
+    /**
+     * Normalise the optional target pageType. Blank / null means "auto" —
+     * stored as {@code null} so the executor falls back to the profile's
+     * {@code fallbackType} at save time. Membership against the KB profile is
+     * NOT validated here: that is deferred to {@code normalizePageType} at
+     * page-save time, so editing a profile never breaks an existing template.
+     */
+    private static String normalizeTargetPageType(String raw) {
+        if (raw == null) return null;
+        String trimmed = raw.trim();
+        return trimmed.isEmpty() ? null : trimmed.toLowerCase();
     }
 
     /** Whitelist incoming outputFormat; unknown / null = "markdown". */
@@ -191,6 +227,11 @@ public class WikiTransformationService {
 
     @Transactional
     public void delete(Long id) {
+        WikiTransformationEntity entity = transformationMapper.selectById(id);
+        if (entity == null) {
+            return;
+        }
+        rejectGlobalTemplateMutation(entity);
         transformationMapper.deleteById(id);
     }
 
@@ -258,6 +299,18 @@ public class WikiTransformationService {
         if (name == null || !NAME_PATTERN.matcher(name).matches()) {
             throw new IllegalArgumentException(
                     "name must be 3-64 chars, lowercase letters / digits / hyphens (start and end alphanumeric)");
+        }
+    }
+
+    /**
+     * Global templates ({@code workspace_id IS NULL}) are shared across all
+     * workspaces and seeded once by Flyway, so they are read-only: a mutation
+     * by one workspace hits everyone, and a delete is unrecoverable.
+     */
+    private static void rejectGlobalTemplateMutation(WikiTransformationEntity entity) {
+        if (entity.getWorkspaceId() == null) {
+            throw new MateClawException("err.wiki.global_template_readonly", 403,
+                    "Built-in global templates are read-only");
         }
     }
 }

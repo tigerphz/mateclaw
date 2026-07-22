@@ -46,6 +46,100 @@
       </div>
     </div>
 
+    <!-- ①c Entity extraction -->
+    <div class="config-card">
+      <div class="config-card__head">
+        <div>
+          <div class="config-card__title">{{ t('wiki.configPanel.entityExtraction') }}</div>
+          <div class="config-card__hint">{{ t('wiki.configPanel.entityExtractionHint') }}</div>
+        </div>
+        <button class="btn-save" @click="saveEntityExtraction" :disabled="savingEntityExtraction">
+          {{ savingEntityExtraction ? t('wiki.saving') : t('common.save') }}
+        </button>
+      </div>
+      <div class="ingest-mode-row">
+        <label class="entity-toggle">
+          <input type="checkbox" v-model="entityExtractionEnabled" :disabled="savingEntityExtraction" />
+          <span class="entity-toggle__label">{{ t('wiki.configPanel.entityExtractionEnable') }}</span>
+        </label>
+        <button
+          v-if="entityExtractionEnabled"
+          class="btn-save btn-save--ghost"
+          @click="runExtraction"
+          :disabled="extracting"
+        >
+          {{ extracting ? t('wiki.configPanel.entityExtractionRunning') : t('wiki.configPanel.entityExtractionRun') }}
+        </button>
+      </div>
+
+      <!-- Entity types to extract (whitelist). Empty = use built-in defaults. -->
+      <div v-if="entityExtractionEnabled" class="entity-types">
+        <div class="entity-types__label">{{ t('wiki.configPanel.entityTypesLabel') }}</div>
+        <el-select
+          v-model="entityTypes"
+          multiple
+          filterable
+          allow-create
+          default-first-option
+          :reserve-keyword="false"
+          size="small"
+          class="entity-types__select"
+          :placeholder="t('wiki.configPanel.entityTypesPlaceholder')"
+        >
+          <el-option v-for="opt in DEFAULT_ENTITY_TYPES" :key="opt" :label="formatEntityType(opt)" :value="opt" />
+        </el-select>
+        <div class="entity-types__hint">{{ t('wiki.configPanel.entityTypesHint') }}</div>
+      </div>
+
+      <!-- Relation schema: optional closed whitelist of (subjectType, predicate, objectType)
+           triples. Empty = open-vocabulary relations (legacy behavior). -->
+      <div v-if="entityExtractionEnabled" class="relation-schema">
+        <div class="relation-schema__label">{{ t('wiki.configPanel.relationSchemaLabel') }}</div>
+        <div class="relation-schema__hint">{{ t('wiki.configPanel.relationSchemaHint') }}</div>
+
+        <div v-for="(row, idx) in relationSchema" :key="idx" class="relation-schema__row">
+          <el-select
+            v-model="row.subjectType"
+            filterable
+            allow-create
+            default-first-option
+            size="small"
+            class="relation-schema__type"
+            :placeholder="t('wiki.configPanel.relationSchemaSubject')"
+          >
+            <el-option v-for="opt in relationSchemaTypeOptions" :key="opt" :label="formatEntityType(opt)" :value="opt" />
+          </el-select>
+          <input
+            type="text"
+            v-model.trim="row.predicate"
+            class="relation-schema__predicate"
+            :placeholder="t('wiki.configPanel.relationSchemaPredicate')"
+          />
+          <el-select
+            v-model="row.objectType"
+            filterable
+            allow-create
+            default-first-option
+            size="small"
+            class="relation-schema__type"
+            :placeholder="t('wiki.configPanel.relationSchemaObject')"
+          >
+            <el-option v-for="opt in relationSchemaTypeOptions" :key="opt" :label="formatEntityType(opt)" :value="opt" />
+          </el-select>
+          <button
+            class="relation-schema__remove"
+            @click="removeRelationSchemaRow(idx)"
+            :title="t('common.delete')"
+            :aria-label="t('common.delete')"
+          >×</button>
+        </div>
+
+        <button class="btn-save btn-save--ghost relation-schema__add" @click="addRelationSchemaRow">
+          {{ t('wiki.configPanel.relationSchemaAdd') }}
+        </button>
+      </div>
+    </div>
+
     <!-- ② Model strategy -->
     <div class="config-card config-card--clickable" @click="modelsOpen = true">
       <div class="config-card__row">
@@ -159,8 +253,21 @@ import WikiModelPicker, { type ModelOption } from './WikiModelPicker.vue'
 import WikiConfigRules from './WikiConfigRules.vue'
 import WikiConfigModels from './WikiConfigModels.vue'
 
-const { t } = useI18n()
+const { t, te } = useI18n()
 const store = useWikiStore()
+
+// Built-in entity types offered as suggestions; users may add custom ones.
+// Empty config falls back to the backend's default set.
+const DEFAULT_ENTITY_TYPES = ['person', 'organization', 'location', 'event', 'product', 'concept']
+
+// Localized label for an entity type in the suggestion dropdown.
+function formatEntityType(type: string): string {
+  const key = (type || '').toLowerCase()
+  if (!key) return ''
+  const i18nKey = `wiki.entityTypes.${key}`
+  if (te(i18nKey)) return `${t(i18nKey)} (${key})`
+  return key
+}
 
 // ── Rules state ──
 const configContent = ref('')
@@ -230,6 +337,81 @@ async function saveIngestMode() {
   }
 }
 
+// ── Entity extraction ──
+// Opt-in named-entity knowledge graph extraction. Off by default because it
+// adds an LLM call per chunk on top of the page pipeline.
+const entityExtractionEnabled = ref(false)
+const entityTypes = ref<string[]>([])
+const savingEntityExtraction = ref(false)
+const extracting = ref(false)
+
+// Optional closed relation schema: a whitelist of (subjectType, predicate,
+// objectType) triples. Empty = open-vocabulary relations (legacy behavior).
+interface RelationSchemaRow { subjectType: string; predicate: string; objectType: string }
+const relationSchema = ref<RelationSchemaRow[]>([])
+
+// Type dropdown suggestions: whatever entity types are currently configured,
+// plus the built-in defaults, deduped.
+const relationSchemaTypeOptions = computed(() =>
+  [...new Set([...entityTypes.value, ...DEFAULT_ENTITY_TYPES])])
+
+function addRelationSchemaRow() {
+  relationSchema.value.push({ subjectType: '', predicate: '', objectType: '' })
+}
+
+function removeRelationSchemaRow(idx: number) {
+  relationSchema.value.splice(idx, 1)
+}
+
+async function saveEntityExtraction() {
+  if (!store.currentKB) return
+  savingEntityExtraction.value = true
+  try {
+    let existingConfig: any = {}
+    try {
+      if (store.currentKB.configContent) existingConfig = JSON.parse(store.currentKB.configContent)
+    } catch { /* config may be plain text rules */ }
+    existingConfig.entityExtractionEnabled = entityExtractionEnabled.value ? true : undefined
+    // Normalize to trimmed lowercase keys so they match the extractor's type
+    // normalization; empty list drops the field and uses backend defaults.
+    const cleanedTypes = entityExtractionEnabled.value
+      ? [...new Set(entityTypes.value.map(s => s.trim().toLowerCase()).filter(Boolean))]
+      : []
+    existingConfig.entityTypes = cleanedTypes.length > 0 ? cleanedTypes : undefined
+    // Only keep fully-filled rows; a row with any blank field can't match
+    // anything on the backend and would silently do nothing.
+    const cleanedRelationSchema = entityExtractionEnabled.value
+      ? relationSchema.value
+          .map(row => ({
+            subjectType: row.subjectType.trim().toLowerCase(),
+            predicate: row.predicate.trim().toLowerCase(),
+            objectType: row.objectType.trim().toLowerCase(),
+          }))
+          .filter(row => row.subjectType && row.predicate && row.objectType)
+      : []
+    existingConfig.relationSchema = cleanedRelationSchema.length > 0 ? cleanedRelationSchema : undefined
+    await wikiApi.updateConfig(store.currentKB.id, JSON.stringify(existingConfig, null, 2))
+  } catch (e) {
+    console.error('[WikiConfig] Failed to save entity extraction toggle', e)
+  } finally {
+    savingEntityExtraction.value = false
+  }
+}
+
+async function runExtraction() {
+  if (!store.currentKB) return
+  extracting.value = true
+  try {
+    // Manual trigger is a full rebuild (force): re-process every chunk so the
+    // current entity-type config takes effect even on already-extracted KBs.
+    await wikiApi.extractEntities(store.currentKB.id, true)
+  } catch (e) {
+    console.error('[WikiConfig] Failed to start entity extraction', e)
+  } finally {
+    extracting.value = false
+  }
+}
+
 // ── Model strategy ──
 const stepKeys = ['route', 'create_page', 'merge_page', 'enrich', 'summary']
 const stepModels = reactive<Record<string, string>>({})
@@ -246,6 +428,9 @@ function loadStepModels() {
   fallbackModelIds.value = []
   wikiGlobalModelId.value = ''
   ingestMode.value = 'eager'
+  entityExtractionEnabled.value = false
+  entityTypes.value = []
+  relationSchema.value = []
   if (!store.currentKB) return
   try {
     const cfg = store.currentKB.configContent ? JSON.parse(store.currentKB.configContent) : null
@@ -258,6 +443,15 @@ function loadStepModels() {
     if (cfg?.fallbackModelIds) fallbackModelIds.value = cfg.fallbackModelIds.map(String)
     if (cfg?.wikiDefaultModelId) wikiGlobalModelId.value = String(cfg.wikiDefaultModelId)
     if (cfg?.ingestMode === 'lazy') ingestMode.value = 'lazy'
+    if (cfg?.entityExtractionEnabled) entityExtractionEnabled.value = true
+    if (Array.isArray(cfg?.entityTypes)) entityTypes.value = cfg.entityTypes.map(String)
+    if (Array.isArray(cfg?.relationSchema)) {
+      relationSchema.value = cfg.relationSchema.map((row: any) => ({
+        subjectType: String(row?.subjectType ?? ''),
+        predicate: String(row?.predicate ?? ''),
+        objectType: String(row?.objectType ?? ''),
+      }))
+    }
   } catch { /* not JSON */ }
 }
 
@@ -475,6 +669,50 @@ loadProviderNames().then(() => {
 }
 .btn-save:hover { opacity: 0.88; }
 .btn-save:disabled { background: var(--mc-border); cursor: not-allowed; }
+.btn-save--ghost { background: transparent; color: var(--mc-primary); border: 1px solid var(--mc-primary); }
+.btn-save--ghost:disabled { background: transparent; color: var(--mc-text-tertiary); border-color: var(--mc-border); }
+
+/* Entity extraction toggle */
+.entity-toggle { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--mc-text-primary); cursor: pointer; }
+.entity-toggle__label { user-select: none; }
+
+/* Entity types editor */
+.entity-types { display: flex; flex-direction: column; gap: 6px; }
+.entity-types__label { font-size: 12px; font-weight: 600; color: var(--mc-text-secondary); }
+.entity-types__select { width: 100%; }
+.entity-types__hint { font-size: 11px; color: var(--mc-text-tertiary); line-height: 1.4; }
+
+/* Relation schema editor */
+.relation-schema { display: flex; flex-direction: column; gap: 6px; margin-top: 10px; }
+.relation-schema__label { font-size: 12px; font-weight: 600; color: var(--mc-text-secondary); }
+.relation-schema__hint { font-size: 11px; color: var(--mc-text-tertiary); line-height: 1.4; }
+.relation-schema__row { display: flex; align-items: center; gap: 6px; }
+.relation-schema__type { flex: 1; min-width: 0; }
+.relation-schema__predicate {
+  flex: 1;
+  min-width: 0;
+  height: 24px;
+  padding: 0 8px;
+  font-size: 12px;
+  color: var(--mc-text-primary);
+  background: var(--mc-bg-sunken);
+  border: 1px solid var(--mc-border);
+  border-radius: 4px;
+}
+.relation-schema__predicate:focus { outline: none; border-color: var(--mc-primary); }
+.relation-schema__remove {
+  flex-shrink: 0;
+  width: 22px;
+  height: 22px;
+  border: 1px solid var(--mc-border);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--mc-text-tertiary);
+  cursor: pointer;
+  line-height: 1;
+}
+.relation-schema__remove:hover { color: var(--mc-text-primary); border-color: var(--mc-text-tertiary); }
+.relation-schema__add { align-self: flex-start; margin-top: 2px; }
 
 /* Ingest mode radio group */
 .ingest-mode-row { display: flex; gap: 8px; flex-wrap: wrap; }

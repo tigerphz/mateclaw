@@ -258,10 +258,10 @@ curl -X POST http://localhost:18088/api/v1/channels \
     "type": "feishu",
     "agentId": 1,
     "config": {
-      "appId": "cli_your_app_id",
-      "appSecret": "your-app-secret",
-      "verificationToken": "your-verification-token",
-      "encryptKey": "your-encrypt-key"
+      "app_id": "cli_your_app_id",
+      "app_secret": "your-app-secret",
+      "verification_token": "your-verification-token",
+      "encrypt_key": "your-encrypt-key"
     },
     "enabled": true
   }'
@@ -349,8 +349,8 @@ curl -X POST http://localhost:18088/api/v1/channels \
     "type": "feishu",
     "agentId": 1,
     "config": {
-      "appId": "cli_your_app_id",
-      "appSecret": "your-app-secret",
+      "app_id": "cli_your_app_id",
+      "app_secret": "your-app-secret",
       "card_format": "auto",
       "card_header": "AI 助手",
       "card_streaming_enabled": true,
@@ -384,19 +384,14 @@ curl -X POST http://localhost:18088/api/v1/channels \
     "type": "wecom",
     "agentId": 1,
     "config": {
-      "corpId": "your-corp-id",
-      "wecomAgentId": "1000002",
-      "secret": "your-secret",
-      "token": "your-token",
-      "encodingAesKey": "your-encoding-aes-key"
+      "bot_id": "your-bot-id",
+      "secret": "your-secret"
     },
     "enabled": true
   }'
 ```
 
 ![开始聊天](/images/channels/wecom/07-chat.png)
-
-Webhook URL：`https://your-domain/api/v1/channels/webhook/wecom`
 
 ::: tip 想把企业微信跑稳？
 群聊多用户协作、引用消息、appmsg 解析、上传约束、aibot_respond_msg 路由、自循环检测、TLS 重试、平台级权限锁……所有非显然的优化点和踩坑，都在 [企业微信深度优化](./wecom-tuning) 单独整理了。
@@ -529,8 +524,8 @@ curl -X POST http://localhost:18088/api/v1/channels \
     "type": "qq",
     "agentId": 1,
     "config": {
-      "appId": "your-app-id",
-      "appSecret": "your-app-secret"
+      "app_id": "your-app-id",
+      "client_secret": "your-app-secret"
     },
     "enabled": true
   }'
@@ -563,8 +558,7 @@ curl -X POST http://localhost:18088/api/v1/channels \
     "agentId": 1,
     "config": {
       "bot_token": "xoxb-...",
-      "app_token": "xapp-...",
-      "mode": "socket"
+      "app_token": "xapp-..."
     },
     "enabled": true
   }'
@@ -603,10 +597,20 @@ curl -X POST http://localhost:18088/api/v1/channels \
     "name": "微信",
     "type": "weixin",
     "agentId": 1,
-    "config": {"botToken": "your-bot-token"},
+    "config": {"bot_token": "your-bot-token"},
     "enabled": true
   }'
 ```
+
+---
+
+## 微信公众号（发布目标，1.8.0+）
+
+与上面九个对话渠道不同，**微信公众号（公众号）** 集成是一个**单向发布传输层**，不是入站消息渠道。它被 [内容工作室](./content-studio) 用来把图文文章推进你公众号的**草稿箱**。
+
+- 在**设置**里配公众号 `app_id` / `app_secret`——密钥**以 AES-GCM 加密存储**（设好 `MATECLAW_SETTING_KEY` 并做好备份）。
+- 微信服务实例按 appId 缓存并**持久化 access token**（微信同 appId 只有一个有效 token），发布链对瞬时错误**重试**，并把已知错误码翻译成可操作提示（比如*把服务器 IP 加进公众号白名单*）。
+- 发布**草稿箱优先**；可选的 `publish` 动作走审批。详见 [内容工作室](./content-studio)。
 
 ---
 

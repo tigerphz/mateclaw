@@ -1,20 +1,33 @@
 <script setup lang="ts">
 import { computed } from 'vue'
-import { useMarkdownRenderer } from '@/composables/useMarkdownRenderer'
+import { useStreamingMarkdown } from '@/composables/useStreamingMarkdown'
+import { linkifyGeneratedFileUrls } from '@/utils/generatedFileLinks'
 import TypingCursor from './TypingCursor.vue'
 import type { MessageSegment } from '@/types'
 
 const props = withDefaults(defineProps<{
   segment: MessageSegment
   showCursor?: boolean
+  /** id → filename map for rewriting bare generated-file URLs into [name](url). */
+  generatedFileNames?: Map<string, string>
 }>(), {
   showCursor: false,
+  generatedFileNames: undefined,
 })
 
-const { renderMarkdown } = useMarkdownRenderer()
-
-const renderedContent = computed(() => renderMarkdown(props.segment.text || ''))
 const isRunning = computed(() => props.segment.status === 'running')
+
+// Throttle markdown rendering while the segment streams; render once at full
+// fidelity the moment it completes.
+const { html: renderedContent } = useStreamingMarkdown(
+  () => {
+    const text = props.segment.text || ''
+    return props.generatedFileNames?.size
+      ? linkifyGeneratedFileUrls(text, props.generatedFileNames)
+      : text
+  },
+  () => isRunning.value,
+)
 </script>
 
 <template>

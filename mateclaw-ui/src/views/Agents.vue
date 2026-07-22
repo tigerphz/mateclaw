@@ -30,7 +30,18 @@
                   :class="{ warn: liveStuck > 0 }"
                 >{{ liveRunning }}</span>
               </button>
+              <button
+                class="view-seg"
+                :class="{ 'is-active': view === 'plans' }"
+                @click="setView('plans')"
+              >{{ t('agents.views.plans') }}</button>
             </div>
+            <button class="btn-secondary" style="display:inline-flex;align-items:center;gap:6px;" @click="router.push('/agents/create')">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M12 3l1.9 4.6L18.5 9.5l-4.6 1.9L12 16l-1.9-4.6L5.5 9.5l4.6-1.9z"/>
+              </svg>
+              {{ t('agents.wizard.entry') }}
+            </button>
             <button class="btn-primary" @click="openCreateModal">
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                 <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
@@ -56,6 +67,23 @@
                 {{ t(tab.key) }}
               </button>
             </div>
+          </div>
+          <!-- Tag filter (#146): orthogonal to the type/status tabs; click to
+               toggle, multi-select narrows by intersection (AND). -->
+          <div v-if="availableTags.length || activeTags.length" class="tag-filter-bar">
+            <span class="tag-filter-bar__label">{{ t('agents.tagFilter.label') }}</span>
+            <button v-for="tag in visibleTags" :key="tag" class="tag-filter-chip"
+              :class="{ active: activeTags.includes(tag) }" @click="toggleTag(tag)">
+              {{ tag }}
+            </button>
+            <input v-if="hasMoreTags" v-model="tagSearch" class="tag-filter-search"
+              :placeholder="t('agents.tagFilter.search')" />
+            <span v-if="tagSearch && !visibleTags.length" class="tag-filter-bar__empty">
+              {{ t('agents.tagFilter.noMatch') }}
+            </span>
+            <button v-if="activeTags.length" class="tag-filter-clear" @click="clearTagFilter">
+              {{ t('agents.tagFilter.clear') }}
+            </button>
           </div>
         </div>
 
@@ -86,6 +114,12 @@
                 <p class="agent-card__tagline">
                   {{ agentTagline(agent) || t('agents.messages.noTagline') }}
                 </p>
+                <div v-if="agentTags(agent).length" class="agent-card__tags">
+                  <span v-for="tag in agentTags(agent)" :key="tag" class="agent-card__tag"
+                    :class="{ active: activeTags.includes(tag) }" @click="toggleTag(tag)">
+                    {{ tag }}
+                  </span>
+                </div>
               </div>
             </div>
 
@@ -133,7 +167,10 @@
         </template>
 
         <!-- Live: what the team is doing right now -->
-        <LivePanel v-else />
+        <LivePanel v-else-if="view === 'live'" />
+
+        <!-- Plans: the team's plans as a step board -->
+        <PlanBoard v-else-if="view === 'plans'" />
       </div>
     </div>
     
@@ -223,11 +260,12 @@
             </button>
             <button v-if="editingAgent" class="modal-tab" :class="{ active: modalTab === 'providers' }" @click="modalTab = 'providers'">
               {{ t('agents.tabs.providers', 'Providers') }}
-              <span v-if="selectedProviderIds.length" class="tab-badge">{{ selectedProviderIds.length }}</span>
+              <span v-if="selectedProviderPrefs.length" class="tab-badge">{{ selectedProviderPrefs.length }}</span>
             </button>
             <button v-if="editingAgent" class="modal-tab" :class="{ active: modalTab === 'wiki' }" @click="modalTab = 'wiki'">
               {{ t('agents.tabs.wiki', 'Wiki') }}
-              <span v-if="selectedKbIds.length" class="tab-badge">{{ selectedKbIds.length }}</span>
+              <span v-if="form.wikiDisabled" class="tab-badge tab-badge--off">{{ t('agents.binding.disableAllWikiBadge') }}</span>
+              <span v-else-if="selectedKbIds.length" class="tab-badge">{{ selectedKbIds.length }}</span>
             </button>
           </div>
 
@@ -318,15 +356,45 @@
             <div class="form-group full-width">
               <details class="advanced-prompt">
                 <summary class="advanced-prompt__summary">
-                  {{ t('agents.fields.extraInstructions') }}
+                  {{ t('agents.fields.advanced') }}
                 </summary>
+                <label class="form-label">{{ t('agents.fields.extraInstructions') }}</label>
                 <textarea v-model="profileForm.extra" class="form-textarea" rows="4" :placeholder="t('agents.placeholders.extraInstructions')"></textarea>
                 <p class="form-hint">{{ t('agents.fields.extraInstructionsHint') }}</p>
+                <div v-if="editingAgent" class="advanced-guide">
+                  <div class="advanced-guide__info">
+                    <span class="advanced-guide__title">{{ t('agents.guide.summary') }}</span>
+                    <p class="advanced-guide__desc">{{ t('agents.guide.desc') }}</p>
+                  </div>
+                  <AgentGuideEditor :agent-id="editingAgent.id" />
+                </div>
               </details>
             </div>
             <div class="form-group">
               <label class="form-label">{{ t('agents.fields.tags') }}</label>
-              <input v-model="form.tags" class="form-input" :placeholder="t('agents.placeholders.tags')" />
+              <div class="tags-editor" @click="($refs.tagInputEl as HTMLInputElement)?.focus()">
+                <span v-for="tag in tagList" :key="tag" class="tag-chip tag-chip--editable">
+                  {{ tag }}
+                  <button type="button" class="tag-chip__remove" @click.stop="removeTag(tag)">×</button>
+                </span>
+                <input
+                  ref="tagInputEl"
+                  v-model="tagInput"
+                  class="tags-editor__input"
+                  :placeholder="tagList.length ? '' : t('agents.placeholders.tags')"
+                  @keydown="onTagInputKeydown"
+                  @compositionstart="tagComposing = true"
+                  @compositionend="tagComposing = false; flushTagSeparators()"
+                  @blur="commitTagInput"
+                />
+              </div>
+              <p class="form-hint tags-hint">
+                <template v-if="recentlyRemovedTag">
+                  {{ t('agents.messages.tagRemoved', { tag: recentlyRemovedTag }) }}
+                  <button type="button" class="tags-undo" @click="undoRemoveTag">{{ t('agents.fields.tagUndo') }}</button>
+                </template>
+                <template v-else>{{ t('agents.fields.tagsHint') }}</template>
+              </p>
             </div>
             <div class="form-group">
               <label class="form-label">{{ t('agents.fields.enabled') }}</label>
@@ -525,34 +593,47 @@
             </details>
           </div>
 
-          <!-- Providers Tab (RFC-009 PR-3) -->
+          <!-- Providers Tab — preferred-model chain (provider + model) -->
           <div v-if="modalTab === 'providers'" class="binding-tab">
             <p class="binding-hint">{{ t('agents.binding.providersHint') }}</p>
-            <!-- Picked: ordered list with up/down/remove controls -->
-            <div v-if="selectedProviderIds.length" class="provider-pref-list">
+            <!-- Picked: ordered (provider, model) entries with up/down/remove -->
+            <div v-if="selectedProviderPrefs.length" class="provider-pref-list">
               <div
-                v-for="(pid, idx) in selectedProviderIds"
-                :key="pid"
+                v-for="(pref, idx) in selectedProviderPrefs"
+                :key="idx"
                 class="provider-pref-item"
               >
                 <span class="provider-pref-rank">{{ idx + 1 }}</span>
-                <span class="provider-pref-name">{{ providerNameById(pid) }}</span>
-                <span class="provider-pref-id">{{ pid }}</span>
-                <button class="provider-pref-btn" :disabled="idx === 0" @click="moveProvider(idx, -1)">↑</button>
-                <button class="provider-pref-btn" :disabled="idx === selectedProviderIds.length - 1" @click="moveProvider(idx, 1)">↓</button>
-                <button class="provider-pref-btn danger" @click="removeProvider(idx)">✕</button>
+                <span class="provider-pref-name">{{ providerNameById(pref.providerId) }}</span>
+                <select class="provider-pref-model" v-model="pref.modelId">
+                  <option :value="null" :disabled="isProviderChoiceTaken(pref.providerId, null, idx)">
+                    {{ t('agents.binding.providerDefaultModel') }}
+                  </option>
+                  <option
+                    v-for="m in modelsForProvider(pref.providerId)"
+                    :key="m.id"
+                    :value="m.id"
+                    :disabled="isProviderChoiceTaken(pref.providerId, m.id, idx)"
+                  >
+                    {{ m.modelName }}
+                  </option>
+                </select>
+                <button class="provider-pref-btn" :disabled="idx === 0" @click="moveProviderEntry(idx, -1)">↑</button>
+                <button class="provider-pref-btn" :disabled="idx === selectedProviderPrefs.length - 1" @click="moveProviderEntry(idx, 1)">↓</button>
+                <button class="provider-pref-btn danger" @click="removeProviderEntry(idx)">✕</button>
               </div>
             </div>
             <div v-else class="binding-empty">{{ t('agents.binding.noProviderPreferences') }}</div>
 
-            <!-- Unpicked: click to append -->
-            <div v-if="unpickedProviders.length" class="provider-pref-pool">
+            <!-- Pool: click to append an entry (same provider may repeat) -->
+            <div v-if="availableProviders.length" class="provider-pref-pool">
               <p class="binding-hint" style="margin-top: 14px">{{ t('agents.binding.providersAddHint') }}</p>
               <button
-                v-for="p in unpickedProviders"
+                v-for="p in availableProviders"
                 :key="p.id"
                 class="provider-pref-add-btn"
-                @click="addProvider(p.id)"
+                :disabled="!hasFreeProviderChoice(p.id)"
+                @click="addProviderEntry(p.id)"
               >+ {{ p.name }}</button>
             </div>
           </div>
@@ -563,24 +644,46 @@
               <span class="binding-intro__kicker">{{ t('agents.binding.wikiKicker') }}</span>
               <p class="binding-intro__tagline">{{ t('agents.binding.wikiTagline') }}</p>
             </div>
+            <!-- Issue #304: explicit "no KBs" toggle. Empty selection alone
+                 falls through to "inherit workspace-wide" (every KB visible,
+                 context bloat for agents that don't need a KB), so an operator
+                 who wants zero KBs needs this dedicated bit — mirrors the
+                 skills_disabled / tools_disabled pattern. -->
+            <div class="binding-disable-row">
+              <label class="binding-disable-label">
+                <input type="checkbox" v-model="form.wikiDisabled" class="binding-disable-checkbox" />
+                <span class="binding-disable-text">
+                  <strong>{{ t('agents.binding.disableAllWiki') }}</strong>
+                  <span class="binding-disable-hint">{{ t('agents.binding.disableAllWikiHint') }}</span>
+                </span>
+              </label>
+            </div>
             <p class="binding-hint">{{ t('agents.binding.wikiHint') }}</p>
             <div v-if="availableKBs.length === 0" class="binding-empty">{{ t('agents.binding.noKBs') }}</div>
             <template v-else>
-              <p class="binding-hint" :class="{ 'binding-hint--warn': selectedKbIds.length > 0 }">
-                {{ selectedKbIds.length === 0 ? t('agents.binding.wikiScopeAll') : t('agents.binding.wikiScopeLimited', { count: selectedKbIds.length }) }}
+              <p class="binding-hint" :class="{ 'binding-hint--warn': !form.wikiDisabled && selectedKbIds.length > 0 }">
+                <template v-if="form.wikiDisabled">{{ t('agents.binding.wikiScopeNone') }}</template>
+                <template v-else>{{ selectedKbIds.length === 0 ? t('agents.binding.wikiScopeAll') : t('agents.binding.wikiScopeLimited', { count: selectedKbIds.length }) }}</template>
               </p>
-              <div class="binding-list">
+              <div class="binding-list" :class="{ 'binding-list--disabled': form.wikiDisabled }">
                 <label
                   v-for="kb in availableKBs"
                   :key="kb.id"
                   class="binding-item"
-                  :class="{ selected: isKbInScope(kb.id) }"
+                  :class="{
+                    selected: !form.wikiDisabled && isKbInScope(kb.id),
+                    'binding-item--inert': form.wikiDisabled,
+                  }"
                 >
+                  <!-- Manual :checked (not v-model) so flipping the toggle
+                       back on restores the previous picks in one click. Same
+                       inert-checkbox trick the skills picker uses (issue #184). -->
                   <input
                     type="checkbox"
                     class="binding-checkbox"
-                    :checked="isKbInScope(kb.id)"
+                    :checked="!form.wikiDisabled && isKbInScope(kb.id)"
                     @change="toggleKbScope(kb.id)"
+                    :disabled="form.wikiDisabled"
                   />
                   <span class="binding-icon">📚</span>
                   <div class="binding-info">
@@ -591,7 +694,8 @@
                   <button
                     type="button"
                     class="kb-primary-toggle"
-                    :class="{ 'kb-primary-toggle--active': selectedKBId === String(kb.id) }"
+                    :class="{ 'kb-primary-toggle--active': !form.wikiDisabled && selectedKBId === String(kb.id) }"
+                    :disabled="form.wikiDisabled"
                     :title="t('agents.binding.wikiSetPrimary')"
                     @click.prevent.stop="setPrimaryKb(kb.id)"
                   >{{ selectedKBId === String(kb.id) ? t('agents.binding.wikiPrimary') : t('agents.binding.wikiSetPrimary') }}</button>
@@ -614,7 +718,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted, onBeforeUnmount } from 'vue'
+import { ref, computed, watch, onMounted, onBeforeUnmount } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import { mcToast } from '@/composables/useMcToast'
@@ -624,6 +728,8 @@ import type { Agent } from '@/types/index'
 import SkillIcon from '@/components/common/SkillIcon.vue'
 import SkillIconPicker from '@/components/common/SkillIconPicker.vue'
 import LivePanel from '@/components/live/LivePanel.vue'
+import PlanBoard from '@/components/agents/PlanBoard.vue'
+import AgentGuideEditor from './Agents/components/AgentGuideEditor.vue'
 import {
   emptyProfile,
   parsePrompt,
@@ -644,6 +750,9 @@ const { resolveSkillName } = useSkillName()
 const agents = ref<Agent[]>([])
 const searchText = ref('')
 const activeFilter = ref('all')
+// Tag filter (#146) — orthogonal to activeFilter; multi-select with AND
+// (intersection) semantics. Empty array = no tag constraint.
+const activeTags = ref<string[]>([])
 const showModal = ref(false)
 const editingAgent = ref<Agent | null>(null)
 const modalTab = ref<'basic' | 'skills' | 'tools' | 'providers' | 'wiki'>('basic')
@@ -840,12 +949,16 @@ function setPrimaryKb(id: string | number) {
   }
   selectedKBId.value = sid
 }
-// RFC-009 PR-3: per-agent provider preference order
+// Per-agent preferred-model chain. Each entry is a provider plus an optional
+// pinned model (modelId null = the provider's default model). The same provider
+// may appear more than once with different models. modelId is a string to keep
+// Snowflake precision (Long is serialised as a string by the backend).
 const availableProviders = ref<{ id: string; name: string }[]>([])
-const selectedProviderIds = ref<string[]>([])
+const selectedProviderPrefs = ref<Array<{ providerId: string; modelId: string | null }>>([])
 // RFC-03 Lane G1: per-Agent model override picker — populated from the
 // global enabled-models list, blank value means "fall back to default".
-const availableModels = ref<Array<{ id: number; name: string; provider: string; modelName: string }>>([])
+// id is a string (Snowflake serialised as string).
+const availableModels = ref<Array<{ id: string; name: string; provider: string; modelName: string }>>([])
 
 // Template selector state
 const showTemplateSelector = ref(false)
@@ -882,10 +995,80 @@ const defaultForm = (): Partial<Agent> & { name: string; defaultThinkingLevel: s
   // "zero rows = inherit global default" contract for newly-created agents.
   skillsDisabled: false,
   toolsDisabled: false,
+  // Issue #304 — same contract for the wiki/knowledge-base picker. Empty
+  // selection alone would fall through to "inherit workspace-wide", so an
+  // operator who wants zero KBs in the context needs this dedicated bit.
+  wikiDisabled: false,
 })
 
 const form = ref(defaultForm())
 const iconPickerVisible = ref(false)
+
+// Chip-style tag editor (#145). `form.tags` stays the comma-separated string
+// source of truth for the API; the chips render a derived array. The input
+// supports Enter / space / ASCII or full-width comma as separators, is
+// IME-safe (won't commit a half-composed Chinese token on the candidate-
+// confirming Enter), and offers a transient inline undo after removal.
+const tagInput = ref('')
+const tagComposing = ref(false)
+const recentlyRemovedTag = ref<string | null>(null)
+let undoTimer: ReturnType<typeof setTimeout> | null = null
+
+// Stored value is comma-joined, so split on comma only — a stored tag may
+// legitimately contain spaces, which the input tokenizer (below) would split.
+const tagList = computed(() => (form.value.tags || '').split(',').map(s => s.trim()).filter(Boolean))
+
+function setTags(list: string[]) {
+  form.value.tags = list.join(',')
+}
+function addTags(tokens: string[]) {
+  const merged = [...tagList.value]
+  for (const raw of tokens) {
+    const tag = raw.trim()
+    if (tag && !merged.includes(tag)) merged.push(tag)
+  }
+  setTags(merged)
+}
+// Enter / blur: commit everything left in the box.
+function commitTagInput() {
+  addTags(tagInput.value.split(/[,，\s]+/))
+  tagInput.value = ''
+}
+// Live typing: once a separator (comma / full-width comma / whitespace) lands,
+// flush the completed tokens and keep any trailing partial in the box. v-model
+// already suppresses updates mid-IME-composition, so this only runs on settled
+// text; the guard is belt-and-suspenders.
+function flushTagSeparators() {
+  if (tagComposing.value || !/[,，\s]/.test(tagInput.value)) return
+  const tokens = tagInput.value.split(/[,，\s]+/)
+  const partial = /[,，\s]$/.test(tagInput.value) ? '' : (tokens.pop() ?? '')
+  addTags(tokens)
+  tagInput.value = partial
+}
+watch(tagInput, flushTagSeparators)
+
+function onTagInputKeydown(e: KeyboardEvent) {
+  if (e.isComposing || e.keyCode === 229) return
+  if (e.key === 'Enter') {
+    e.preventDefault()
+    commitTagInput()
+  } else if (e.key === 'Backspace' && !tagInput.value && tagList.value.length) {
+    e.preventDefault()
+    removeTag(tagList.value[tagList.value.length - 1])
+  }
+}
+function removeTag(tag: string) {
+  setTags(tagList.value.filter(t => t !== tag))
+  recentlyRemovedTag.value = tag
+  if (undoTimer) clearTimeout(undoTimer)
+  undoTimer = setTimeout(() => { recentlyRemovedTag.value = null }, 5000)
+}
+function undoRemoveTag() {
+  if (!recentlyRemovedTag.value) return
+  addTags([recentlyRemovedTag.value])
+  recentlyRemovedTag.value = null
+  if (undoTimer) clearTimeout(undoTimer)
+}
 
 // Identity-triad fields displayed in the basic tab. Kept separate from
 // `form.systemPrompt` so the textarea state stays predictable while the
@@ -904,6 +1087,51 @@ function agentTagline(agent: Agent): string {
   return deriveTagline(profile, agent.description)
 }
 
+/** Parse an agent's comma-separated tags into a trimmed, non-empty, de-duped array. */
+function agentTags(agent: Agent): string[] {
+  const parsed = (agent.tags || '').split(',').map(t => t.trim()).filter(Boolean)
+  return [...new Set(parsed)]
+}
+
+// Distinct tags across all agents, ordered by frequency (most-used first) so
+// the filter bar surfaces the common categories. Hidden entirely when empty.
+const availableTags = computed(() => {
+  const freq = new Map<string, number>()
+  for (const a of agents.value) {
+    for (const tag of agentTags(a)) freq.set(tag, (freq.get(tag) ?? 0) + 1)
+  }
+  return [...freq.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).map(e => e[0])
+})
+
+// Cap the inline chips so a workspace with dozens of tags doesn't bury the
+// roster under a wall of chips. Beyond the cap, a search box appears.
+const TAG_FILTER_LIMIT = 12
+const tagSearch = ref('')
+const hasMoreTags = computed(() => availableTags.value.length > TAG_FILTER_LIMIT)
+
+// Chips actually rendered. When searching, show every name match (no cap).
+// Otherwise show the top-N frequent tags, but always append any selected tags
+// that fell outside the cap so they stay deselectable.
+const visibleTags = computed(() => {
+  const q = tagSearch.value.trim().toLowerCase()
+  if (q) return availableTags.value.filter(t => t.toLowerCase().includes(q))
+  const top = availableTags.value.slice(0, TAG_FILTER_LIMIT)
+  // Always surface selected tags outside the top-N — including ones that no
+  // longer exist on any agent (edited/deleted) — so they stay deselectable
+  // instead of silently filtering the roster with no chip to clear them.
+  const extraActive = activeTags.value.filter(t => !top.includes(t))
+  return [...top, ...extraActive]
+})
+
+function toggleTag(tag: string) {
+  const i = activeTags.value.indexOf(tag)
+  if (i >= 0) activeTags.value.splice(i, 1)
+  else activeTags.value.push(tag)
+}
+function clearTagFilter() {
+  activeTags.value = []
+}
+
 const filteredAgents = computed(() => {
   let list = agents.value
   if (searchText.value) {
@@ -918,22 +1146,32 @@ const filteredAgents = computed(() => {
   else if (activeFilter.value === 'plan_execute') list = list.filter(a => a.agentType === 'plan_execute')
   else if (activeFilter.value === 'enabled') list = list.filter(a => a.enabled)
   else if (activeFilter.value === 'disabled') list = list.filter(a => !a.enabled)
+  // Tag filter: intersection — an agent must carry every selected tag.
+  if (activeTags.value.length) {
+    list = list.filter(a => {
+      const tags = agentTags(a)
+      return activeTags.value.every(t => tags.includes(t))
+    })
+  }
   return list
 })
 
 // Roster ↔ Live view switch — admin only. The running/stuck counts feed the
 // segmented control's pulse + badge so you know whether Live is worth a look.
 const isAdminRole = computed(() => (localStorage.getItem('role') || 'user') === 'admin')
-const view = ref<'roster' | 'live'>(
-  route.query.view === 'live' && isAdminRole.value ? 'live' : 'roster',
+type AgentView = 'roster' | 'live' | 'plans'
+const view = ref<AgentView>(
+  isAdminRole.value && (route.query.view === 'live' || route.query.view === 'plans')
+    ? (route.query.view as AgentView)
+    : 'roster',
 )
 const liveRunning = ref(0)
 const liveStuck = ref(0)
 let livePollTimer: ReturnType<typeof setInterval> | null = null
 
-function setView(next: 'roster' | 'live') {
+function setView(next: AgentView) {
   view.value = next
-  router.replace({ query: next === 'live' ? { view: 'live' } : {} })
+  router.replace({ query: next === 'roster' ? {} : { view: next } })
 }
 
 async function refreshLiveCounts() {
@@ -996,42 +1234,73 @@ function openBlankCreateModal() {
   showTemplateSelector.value = false
   editingAgent.value = null
   form.value = defaultForm()
+  tagInput.value = ''
+  recentlyRemovedTag.value = null
   profileForm.value = emptyProfile()
   modalTab.value = 'basic'
   skillBindingSearch.value = ''
   toolBindingSearch.value = ''
   selectedSkillIds.value = []
   selectedToolNames.value = []
-  selectedProviderIds.value = []
+  selectedProviderPrefs.value = []
   availableKBs.value = []
   selectedKBId.value = null
   selectedKbIds.value = []
   showModal.value = true
 }
 
-// RFC-009 PR-3: provider preference helpers
-const unpickedProviders = computed(() =>
-  availableProviders.value.filter(p => !selectedProviderIds.value.includes(p.id))
-)
-
+// Preferred-model chain helpers
 function providerNameById(id: string): string {
   return availableProviders.value.find(p => p.id === id)?.name || id
 }
 
-function addProvider(id: string) {
-  if (!selectedProviderIds.value.includes(id)) {
-    selectedProviderIds.value.push(id)
+// Enabled models offered by a given provider, for that entry's model dropdown.
+function modelsForProvider(providerId: string) {
+  return availableModels.value.filter(m => m.provider === providerId)
+}
+
+// Whether a specific (provider, model) — or the provider's default slot when
+// modelId === null — is already chosen in another row. Keeps each
+// (provider, model) unique across the chain. `exceptIdx` excludes one row
+// (pass the current row's index so its own value stays selectable); pass -1
+// to check against every row (used when appending).
+function isProviderChoiceTaken(providerId: string, modelId: string | null, exceptIdx: number): boolean {
+  return selectedProviderPrefs.value.some(
+    (pref, i) => i !== exceptIdx && pref.providerId === providerId && pref.modelId === modelId,
+  )
+}
+
+// Whether the provider still has any free (provider, model) slot to add.
+function hasFreeProviderChoice(providerId: string): boolean {
+  if (!isProviderChoiceTaken(providerId, null, -1)) return true
+  return modelsForProvider(providerId).some(m => !isProviderChoiceTaken(providerId, m.id, -1))
+}
+
+// Append a new chain entry. The same provider may repeat across the chain,
+// but each (provider, model) must stay unique: take the default slot if it is
+// still free, otherwise the first unused model. If every option is already
+// picked there is nothing to add.
+function addProviderEntry(providerId: string) {
+  if (!isProviderChoiceTaken(providerId, null, -1)) {
+    selectedProviderPrefs.value.push({ providerId, modelId: null })
+    return
+  }
+  const firstFree = modelsForProvider(providerId).find(
+    m => !isProviderChoiceTaken(providerId, m.id, -1),
+  )
+  if (firstFree) {
+    selectedProviderPrefs.value.push({ providerId, modelId: firstFree.id })
   }
 }
 
-function removeProvider(idx: number) {
-  selectedProviderIds.value.splice(idx, 1)
+function removeProviderEntry(idx: number) {
+  selectedProviderPrefs.value.splice(idx, 1)
 }
 
-function moveProvider(idx: number, dir: -1 | 1) {
+function moveProviderEntry(idx: number, dir: -1 | 1) {
   const next = idx + dir
-  if (next < 0 || next >= selectedProviderIds.value.length) return
-  const arr = selectedProviderIds.value
+  if (next < 0 || next >= selectedProviderPrefs.value.length) return
+  const arr = selectedProviderPrefs.value
   ;[arr[idx], arr[next]] = [arr[next], arr[idx]]
 }
 
@@ -1076,7 +1345,10 @@ async function openEditModal(agent: Agent) {
     primaryKbId: agent.primaryKbId != null ? String(agent.primaryKbId) : null,
     skillsDisabled: agent.skillsDisabled === true,
     toolsDisabled: agent.toolsDisabled === true,
+    wikiDisabled: (agent as any).wikiDisabled === true,
   }
+  tagInput.value = ''
+  recentlyRemovedTag.value = null
   profileForm.value = parsePrompt(agent.systemPrompt)
   modalTab.value = 'basic'
   skillBindingSearch.value = ''
@@ -1111,9 +1383,14 @@ async function openEditModal(agent: Agent) {
     selectedToolNames.value = ((boundToolsRes as any).data || [])
       .filter((b: any) => b.enabled)
       .map((b: any) => b.toolName)
-    selectedProviderIds.value = ((providerPrefsRes as any).data || [])
+    selectedProviderPrefs.value = ((providerPrefsRes as any).data || [])
       .filter((b: any) => b.enabled)
-      .map((b: any) => b.providerId)
+      .map((b: any) => ({
+        providerId: b.providerId,
+        // modelId arrives as a string (Long→String) or null; normalise to keep
+        // the dropdown's option values type-aligned.
+        modelId: b.modelId != null ? String(b.modelId) : null,
+      }))
   } catch {
     mcToast.error(t('agents.messages.loadFailed'))
   }
@@ -1191,10 +1468,13 @@ async function saveAgent() {
       try {
         await agentBindingApi.setSkills(agentId, skillIdsToSave)
         await agentBindingApi.setTools(agentId, toolNamesToSave)
-        await agentBindingApi.setProviderPreferences(agentId, selectedProviderIds.value)
-        // KB access scope. Empty = unrestricted (workspace-wide). Sent as
-        // strings per the Snowflake-precision contract.
-        await agentBindingApi.setKbs(agentId, selectedKbIds.value)
+        await agentBindingApi.setProviderPreferences(agentId, selectedProviderPrefs.value)
+        // KB access scope. Issue #304: when wiki_disabled is on the agent
+        // sees zero KBs regardless of the binding list, so clear the save
+        // payload — same pattern as skills/tools above. Empty save leaves
+        // the wiki_disabled flag untouched (the toggle owns the bit).
+        const kbIdsToSave = form.value.wikiDisabled ? [] : selectedKbIds.value
+        await agentBindingApi.setKbs(agentId, kbIdsToSave)
       } catch (bindingError: any) {
         mcToast.error(bindingError?.message || t('agents.messages.saveFailed'))
         // Pull the authoritative server state back into the editing form so
@@ -1356,6 +1636,16 @@ html.dark .seg-count.warn {
 .filter-tab { padding: 8px 14px; border: 1px solid var(--mc-border); background: var(--mc-bg-muted); border-radius: 999px; font-size: 13px; color: var(--mc-text-secondary); cursor: pointer; transition: all 0.15s; font-weight: 600; }
 .filter-tab:hover { background: var(--mc-bg-sunken); }
 .filter-tab.active { background: var(--mc-primary-bg); border-color: var(--mc-primary); color: var(--mc-primary); font-weight: 500; }
+.tag-filter-bar { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--mc-border); }
+.tag-filter-bar__label { font-size: 12px; color: var(--mc-text-tertiary); font-weight: 600; margin-right: 2px; }
+.tag-filter-chip { padding: 4px 12px; border: 1px solid var(--mc-border); background: var(--mc-bg-muted); border-radius: 999px; font-size: 12px; color: var(--mc-text-secondary); cursor: pointer; transition: all 0.15s; }
+.tag-filter-chip:hover { background: var(--mc-bg-sunken); }
+.tag-filter-chip.active { background: var(--mc-primary-bg); border-color: var(--mc-primary); color: var(--mc-primary); font-weight: 600; }
+.tag-filter-search { padding: 4px 10px; border: 1px solid var(--mc-border); background: var(--mc-bg-muted); border-radius: 999px; font-size: 12px; color: var(--mc-text-primary); width: 120px; outline: none; }
+.tag-filter-search:focus { border-color: var(--mc-primary); }
+.tag-filter-bar__empty { font-size: 12px; color: var(--mc-text-tertiary); }
+.tag-filter-clear { padding: 4px 10px; border: none; background: transparent; font-size: 12px; color: var(--mc-text-tertiary); cursor: pointer; text-decoration: underline; }
+.tag-filter-clear:hover { color: var(--mc-text-secondary); }
 
 /* Agent Card Grid */
 .agent-grid {
@@ -1440,6 +1730,11 @@ html.dark .seg-count.warn {
   text-overflow: ellipsis;
   letter-spacing: -0.005em;
 }
+
+.agent-card__tags { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
+.agent-card__tag { font-size: 11px; padding: 2px 8px; background: var(--mc-bg-sunken); color: var(--mc-text-tertiary); border-radius: 999px; white-space: nowrap; cursor: pointer; transition: all 0.15s; }
+.agent-card__tag:hover { color: var(--mc-text-secondary); }
+.agent-card__tag.active { background: var(--mc-primary-bg); color: var(--mc-primary); font-weight: 600; }
 
 .agent-card__action-row {
   display: flex;
@@ -1688,8 +1983,12 @@ html.dark .seg-count.warn {
   display: inline-flex; align-items: center; justify-content: center;
   background: var(--mc-primary); color: white; font-size: 11px; font-weight: 700; flex-shrink: 0;
 }
-.provider-pref-name { font-size: 14px; color: var(--mc-text-primary); flex: 1; }
-.provider-pref-id { font-size: 12px; color: var(--mc-text-tertiary); font-family: ui-monospace, monospace; }
+.provider-pref-name { font-size: 14px; color: var(--mc-text-primary); flex: 0 0 auto; min-width: 96px; }
+.provider-pref-model {
+  flex: 1; min-width: 0; height: 28px; padding: 0 8px;
+  border: 1px solid var(--mc-border-light); border-radius: 6px;
+  background: var(--mc-bg); color: var(--mc-text-primary); font-size: 13px; cursor: pointer;
+}
 .provider-pref-btn {
   border: 1px solid var(--mc-border-light); background: var(--mc-bg);
   width: 26px; height: 26px; border-radius: 6px; cursor: pointer;
@@ -1776,6 +2075,15 @@ html.dark .seg-count.warn {
 }
 .advanced-prompt[open] > .advanced-prompt__summary { padding: 0 0 8px; border-bottom: 1px solid var(--mc-border-light); margin-bottom: 8px; }
 .advanced-prompt[open] > .advanced-prompt__summary::before { transform: rotate(90deg); }
+.advanced-prompt .form-textarea { width: 100%; box-sizing: border-box; }
+.advanced-guide {
+  margin-top: 16px; display: flex; align-items: center; gap: 14px;
+  padding: 12px 14px; border-radius: 10px; background: var(--mc-bg-sunken);
+  border: 1px solid var(--mc-border-light);
+}
+.advanced-guide__info { flex: 1; min-width: 0; }
+.advanced-guide__title { display: block; font-size: 13px; font-weight: 600; color: var(--mc-text-primary); }
+.advanced-guide__desc { margin: 4px 0 0; font-size: 12px; line-height: 1.5; color: var(--mc-text-tertiary); }
 .modal-footer { display: flex; justify-content: flex-end; gap: 10px; padding: 16px 24px; border-top: 1px solid var(--mc-border-light); }
 
 @media (max-width: 900px) {
@@ -1810,6 +2118,15 @@ html.dark .seg-count.warn {
 
 .template-tags { display: flex; flex-wrap: wrap; gap: 4px; align-self: flex-start; margin-top: 2px; }
 .tag-chip { font-size: 11px; padding: 2px 8px; background: var(--mc-bg-sunken); color: var(--mc-text-tertiary); border-radius: 999px; white-space: nowrap; }
+
+.tags-editor { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; min-height: 38px; padding: 6px 10px; border: 1px solid var(--mc-border); border-radius: 8px; background: var(--mc-bg-sunken); cursor: text; transition: border-color 0.15s; }
+.tags-editor:focus-within { border-color: var(--mc-primary); box-shadow: 0 0 0 2px rgba(217,119,87,0.1); }
+.tag-chip--editable { display: inline-flex; align-items: center; gap: 2px; font-size: 12px; padding: 3px 4px 3px 10px; background: var(--mc-bg); color: var(--mc-text-secondary); border: 1px solid var(--mc-border); }
+.tag-chip__remove { display: inline-flex; align-items: center; justify-content: center; width: 18px; height: 18px; padding: 0; border: none; border-radius: 999px; background: var(--mc-bg-sunken); color: var(--mc-text-secondary); font-size: 15px; line-height: 1; cursor: pointer; transition: background 0.15s, color 0.15s; }
+.tag-chip__remove:hover { background: var(--mc-danger, #e05656); color: #fff; }
+.tags-editor__input { flex: 1; min-width: 80px; border: none; outline: none; background: transparent; font-size: 14px; color: var(--mc-text-primary); padding: 2px 0; }
+.tags-hint { margin-top: 6px; }
+.tags-undo { border: none; background: transparent; padding: 0 2px; color: var(--mc-primary); font-size: inherit; cursor: pointer; text-decoration: underline; }
 
 /* RFC-090 §9.2 调整 B — Advanced Tools picker (collapsed by default) */
 .advanced-tools { border: 1px dashed var(--mc-border); border-radius: 12px; padding: 0; }

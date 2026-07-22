@@ -434,6 +434,20 @@ html.dark body::before {
   line-height: 1.75;
 }
 
+/* Inline preview for tool-generated images (render_html_image / image gen).
+   Rendered by useMarkdownRenderer.link(); click opens full-size in a new tab. */
+.markdown-body .markdown-generated-image {
+  display: block;
+  max-width: min(560px, 100%);
+  max-height: 640px;
+  height: auto;
+  margin: 12px 0;
+  border-radius: 10px;
+  border: 1px solid var(--mc-code-header-border);
+  object-fit: contain;
+  cursor: zoom-in;
+}
+
 /* headings */
 .markdown-body h1,
 .markdown-body h2,
@@ -679,6 +693,29 @@ html.dark body::before {
   color: var(--mc-text-tertiary);
   font-size: 13px;
 }
+
+/* Streaming placeholder for echarts/mermaid blocks (shown until the fenced
+   source finishes streaming, then replaced by the real chart). */
+.markdown-body .chart-loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  margin: 14px 0;
+  min-height: 120px;
+  border-radius: 12px;
+  background: var(--mc-bg-elevated);
+  border: 1px solid var(--mc-border-light);
+}
+.markdown-body .chart-loading__dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--mc-border, #cbd5e1);
+  animation: mc-product-pulse 1.4s ease-in-out infinite;
+}
+.markdown-body .chart-loading__dot:nth-child(2) { animation-delay: 0.2s; }
+.markdown-body .chart-loading__dot:nth-child(3) { animation-delay: 0.4s; }
 
 /* ================================================================
    Product cards (from ```product-cards fenced blocks — shopping /

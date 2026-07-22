@@ -6,7 +6,7 @@ Left to its own devices, a language model is a pattern-matcher wrapped in text. 
 
 Tools are how MateClaw fixes this. Each tool is a concrete operation the agent is allowed to invoke — read a file, search the web, execute a shell command, extract text from a PDF, delegate to another agent. When the agent decides it needs one, it emits a **tool call**, the runtime executes it, and the result comes back as an **observation**.
 
-Fourteen tools ship built-in. Unlimited more can be added through MCP servers, custom skill scripts, or your own `@Tool`-annotated Spring beans.
+Twenty tools ship built-in. Unlimited more can be added through MCP servers, custom skill scripts, or your own `@Tool`-annotated Spring beans.
 
 ---
 
@@ -115,6 +115,20 @@ As the tool count grows, the system prompt balloons with dozens of full tool sch
 
 Plus the `MusicGenerateTool` from [Multimodal](./multimodal). And the 14 Wiki tools from [LLM Wiki](./wiki): `wiki_read_page`, `wiki_read_many`, `wiki_list_pages`, `wiki_search_pages`, `wiki_semantic_search`, `wiki_compile_page`, `wiki_trace_source`, `wiki_create_page`, `wiki_delete_page`, `wiki_archive_page`, `wiki_unarchive_page`, `wiki_related_pages`, `wiki_explain_relation`, `wiki_enrich_page`.
 
+### Content Studio tools (1.8.0+)
+
+Seven built-in tools power the [Content Studio](./content-studio) scene (公众号 / 小红书 image-text creation and publishing):
+
+| Tool | What it does | Dangerous |
+|------|--------------|-----------|
+| `wechat_article_extract` | Clean a `mp.weixin.qq.com` article into `{title, author, time, body, images}` (SSRF-limited to that host) | — |
+| `gzh_package` | Package a WeChat Official Account article (inline HTML + cover); runs compliance scan + records to the content calendar | — |
+| `gzh_publish` | Push the article to the WeChat **draft box** (`draft`); optional `publish` is approval-gated | ⚠️ |
+| `xhs_package` | Package a Xiaohongshu note; hard-validates ≥3 vertical cards; scans + records | — |
+| `xhs_publish` | Best-effort browser-assisted upload (approval-gated) | ⚠️ |
+| `content_item` | Content calendar: `check_recent` (topic-fingerprint dedup), `record`, `mark_published` | — |
+| `compliance_scan` | Server-side lexicon scan (extreme-claim / inducement / guaranteed-return terms); optional `extraBannedWords` | — |
+
 ### DateTimeTool
 
 Returns the current date and time for a given timezone. Zero surprises.
@@ -193,7 +207,9 @@ Lets an agent read, write, and edit its own workspace memory files — `MEMORY.m
 
 ### BrowserUseTool
 
-Drives a headless browser. Navigate, click, type, extract. Every call gated by Tool Guard.
+Drives a browser. Navigate, click, type, extract. Every call gated by Tool Guard.
+
+**Ref interaction (1.8.0+).** The tool reads a page as a compact **accessibility-tree snapshot** where every interactive element gets a stable `ref` handle, and click / type / select target the **element by its `ref`** rather than a screenshot coordinate — so an action survives a page reflow instead of missing. Using a **real** browser session adds **privacy guardrails**, with a controlled CDP (Chrome DevTools Protocol) escape hatch for cases the safe path can't reach (opt-in, not default).
 
 ### DelegateAgentTool — agents delegating to agents
 
@@ -319,10 +335,8 @@ curl http://localhost:18088/api/v1/tools \
   -H "Authorization: Bearer YOUR_JWT_TOKEN"
 
 # Enable / disable
-curl -X PUT http://localhost:18088/api/v1/tools/1 \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer YOUR_JWT_TOKEN" \
-  -d '{"enabled": false}'
+curl -X PUT "http://localhost:18088/api/v1/tools/1/toggle?enabled=false" \
+  -H "Authorization: Bearer YOUR_JWT_TOKEN"
 
 # Set disclosure tier for a builtin or channel tool
 curl -X PUT http://localhost:18088/api/v1/tools/1/disclosure-tier \

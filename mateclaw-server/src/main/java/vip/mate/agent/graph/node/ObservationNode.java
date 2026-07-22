@@ -3,8 +3,10 @@ package vip.mate.agent.graph.node;
 import com.alibaba.cloud.ai.graph.OverAllState;
 import com.alibaba.cloud.ai.graph.action.NodeAction;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.ai.chat.messages.AssistantMessage;
 import org.springframework.ai.chat.messages.ToolResponseMessage;
 import vip.mate.agent.GraphEventPublisher;
+import vip.mate.agent.graph.guard.ToolLoopGuard;
 import vip.mate.agent.graph.observation.ObservationProcessor;
 import vip.mate.agent.graph.state.MateClawStateAccessor;
 
@@ -32,6 +34,33 @@ public class ObservationNode implements NodeAction {
     private final ObservationProcessor observationProcessor;
     private final vip.mate.channel.web.ChatStreamTracker streamTracker;
 
+    /**
+     * Progressive-disclosure meta-tools that perform setup, not real work. A
+     * round whose entire batch is one of these is refunded its iteration (see
+     * {@link MateClawStateKeys#ITERATION_REFUND_COUNT}). Mirrors the authoritative
+     * set in {@code DefaultToolDisclosureService.ALWAYS_CORE}.
+     */
+    private static final java.util.Set<String> DISCLOSURE_TOOLS =
+            java.util.Set.of("load_skill", "enable_tool");
+
+    /** Per-run cap on iteration refunds — keeps a load-skill-only model from looping forever. */
+    private static final int MAX_ITERATION_REFUNDS_PER_RUN = 3;
+
+    /**
+     * File-mutation tools whose first successful call this run triggers the
+     * one-shot verification reminder — nudging the model to verify the change
+     * (run tests / re-read the file) before declaring the task complete.
+     * Shell/code/SQL tools are excluded: their mutating nature can't be
+     * determined statically, and a false reminder is worse than none.
+     */
+    private static final java.util.Set<String> FILE_MUTATION_TOOLS =
+            java.util.Set.of("write_file", "edit_file");
+
+    private static final String VERIFICATION_REMINDER =
+            "\n\n[✅ 验证提醒] 本轮修改了文件。在给出最终回答前，请先验证改动是否生效" +
+            "（运行相关测试 / 构建命令，或重读文件确认关键内容）；" +
+            "若无法验证，请在回答中明确说明「未经验证」及原因，不要声称已确认。";
+
     public ObservationNode(ObservationProcessor observationProcessor) {
         this(observationProcessor, null);
     }
@@ -56,13 +85,28 @@ public class ObservationNode implements NodeAction {
 
         int currentIteration = accessor.iterationCount();
         int maxIterations = accessor.maxIterations();
-        int nextIteration = currentIteration + 1;
-
-        log.info("[ObservationNode] Iteration {}/{}", nextIteration, maxIterations);
 
         // 提取最新的工具结果并处理
         List<ToolResponseMessage.ToolResponse> toolResults =
                 state.<List<ToolResponseMessage.ToolResponse>>value(TOOL_RESULTS).orElse(List.of());
+
+        // Iteration refund: a round whose entire batch was progressive-disclosure
+        // setup (load_skill / enable_tool) did no real work, so don't charge it an
+        // iteration — otherwise a tight budget loses a step to the load-then-use
+        // two-step. Bounded by MAX_ITERATION_REFUNDS_PER_RUN so a model that only
+        // ever loads skills can't dodge the budget forever.
+        int refundCount = accessor.iterationRefundCount();
+        boolean setupOnlyRound = !toolResults.isEmpty()
+                && toolResults.stream().allMatch(tr -> DISCLOSURE_TOOLS.contains(tr.name()));
+        boolean refundIteration = setupOnlyRound && refundCount < MAX_ITERATION_REFUNDS_PER_RUN;
+        int nextIteration = refundIteration ? currentIteration : currentIteration + 1;
+
+        if (refundIteration) {
+            log.info("[ObservationNode] Iteration refunded (setup-only round, refunds {}/{}); staying at {}/{}",
+                    refundCount + 1, MAX_ITERATION_REFUNDS_PER_RUN, nextIteration, maxIterations);
+        } else {
+            log.info("[ObservationNode] Iteration {}/{}", nextIteration, maxIterations);
+        }
 
         // 将每个工具结果通过 ObservationProcessor 标准化和截断
         List<String> processedObservations = toolResults.stream()
@@ -71,6 +115,30 @@ public class ObservationNode implements NodeAction {
 
         // 合并为单条观察记录
         String combinedObservation = String.join("\n---\n", processedObservations);
+
+        // Tool-call loop guard: signature-level repetition detection across the
+        // run (identical-arg failures / per-tool failures / idempotent
+        // no-progress). Warnings are appended so the model can self-correct on
+        // the next reasoning turn; crossing a halt threshold routes to the
+        // graceful wrap-up via the existing ERROR path.
+        List<AssistantMessage.ToolCall> toolCalls =
+                state.<List<AssistantMessage.ToolCall>>value(TOOL_CALLS).orElse(List.of());
+        ToolLoopGuard.Evaluation loopGuard = ToolLoopGuard.evaluate(
+                accessor.toolLoopStats(), toolCalls, toolResults);
+        for (String warning : loopGuard.warnings()) {
+            combinedObservation += "\n\n" + warning;
+            log.info("[ObservationNode] Loop-guard warning injected: {}", warning);
+        }
+
+        // One-shot post-mutation verification reminder: the first successful
+        // file mutation this run asks the model to verify before wrapping up.
+        boolean injectVerificationReminder = !accessor.mutationReminderInjected()
+                && toolResults.stream().anyMatch(tr -> FILE_MUTATION_TOOLS.contains(tr.name())
+                        && !ToolLoopGuard.isFailure(tr.responseData()));
+        if (injectVerificationReminder) {
+            combinedObservation += VERIFICATION_REMINDER;
+            log.info("[ObservationNode] Post-mutation verification reminder injected");
+        }
 
         // Budget Pressure Warning：接近上限时注入警告到工具结果中
         // LLM 下一轮 reasoning 时能看到，从而主动收束，而非被硬性截断
@@ -119,7 +187,16 @@ public class ObservationNode implements NodeAction {
                 .iterationCount(nextIteration)
                 .put(OBSERVATION_HISTORY, updatedHistory)
                 .shouldSummarize(shouldSummarize)
-                .toolCallCount(newToolCallCount);
+                .toolCallCount(newToolCallCount)
+                .toolLoopStats(loopGuard.stats());
+
+        if (refundIteration) {
+            builder.iterationRefundCount(refundCount + 1);
+        }
+
+        if (injectVerificationReminder) {
+            builder.mutationReminderInjected(true);
+        }
 
         // Close out the iteration we just observed. We use currentIteration
         // (not nextIteration) so the index pairs with whatever
@@ -127,14 +204,31 @@ public class ObservationNode implements NodeAction {
         // Char totals are best-effort: ObservationNode doesn't see the LLM
         // delta stream directly, so 0/0 is acceptable for now — consumers
         // that care fall back to summing the deltas themselves.
+        List<GraphEventPublisher.GraphEvent> events = new ArrayList<>();
         if (streamTracker == null || streamTracker.isIterationEventsEnabled()) {
-            builder.events(List.of(
-                    GraphEventPublisher.iterationEnd(currentIteration, "parent", null, 0, 0)));
+            events.add(GraphEventPublisher.iterationEnd(currentIteration, "parent", null, 0, 0));
+        }
+        // Surface loop-guard interventions to the user: the observation-text
+        // injection above is LLM-only, so mirror each warning (and a halt) as
+        // a "warning" graph event — the accumulator persists it under
+        // metadata.warnings and rebroadcasts it live on SSE.
+        for (String warning : loopGuard.warnings()) {
+            events.add(GraphEventPublisher.warning(warning, "loop_guard"));
+        }
+        if (loopGuard.shouldHalt() && !duplicateObservation) {
+            events.add(GraphEventPublisher.warning(
+                    "[⛔ 循环熔断] " + loopGuard.haltReason() + "，已提前收尾。", "loop_guard"));
+        }
+        if (!events.isEmpty()) {
+            builder.events(events);
         }
 
         // 重复观察时标记错误，让 ObservationDispatcher 路由到 limitExceededNode
         if (duplicateObservation) {
             builder.put(ERROR, "连续 3 次工具调用返回相同结果，已强制终止循环");
+        } else if (loopGuard.shouldHalt()) {
+            log.warn("[ObservationNode] Loop-guard halt: {}", loopGuard.haltReason());
+            builder.put(ERROR, loopGuard.haltReason());
         }
 
         return builder.build();

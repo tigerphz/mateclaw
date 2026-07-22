@@ -1,6 +1,5 @@
 /**
  * 消息状态管理 Composable
- * 参考 @agentscope-ai/chat 的消息管理实现
  */
 import { ref, computed } from 'vue'
 import type { Message, MessageContentPart } from '@/types'
@@ -133,7 +132,7 @@ export function useMessages(options: UseMessagesOptions = {}): UseMessagesReturn
     if (!message) return
 
     // 获取或创建对应类型的 contentPart
-    let contentParts = [...(message.contentParts || [])]
+    const contentParts = [...(message.contentParts || [])]
     const partIndex = contentParts.findLastIndex(p => p.type === type)
 
     if (partIndex === -1) {

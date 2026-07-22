@@ -21,6 +21,7 @@ import vip.mate.memory.event.ConversationCompletionPublisher;
 import vip.mate.tts.TtsService;
 import vip.mate.workspace.conversation.ConversationService;
 import vip.mate.workspace.conversation.model.MessageContentPart;
+import vip.mate.workspace.core.service.ChatUploadLocationResolver;
 import vip.mate.workspace.conversation.model.MessageEntity;
 
 import com.fasterxml.jackson.core.type.TypeReference;
@@ -69,6 +70,22 @@ public class ChannelMessageRouter {
      *  router directly. Spring's stock publisher is always available. */
     @Autowired(required = false)
     private ApplicationEventPublisher events;
+
+    /** Field-injected for the same reason as {@link #events}: the chat-upload
+     *  resolver resolves the workspace-aware TTS output directory on the
+     *  voice-reply path. Optional so tests that build the router directly
+     *  still work; falls back to the legacy default dir when unset. */
+    @Autowired(required = false)
+    private vip.mate.workspace.core.service.ChatUploadLocationResolver chatUploadLocationResolver;
+
+    /** Field-injected so the IM sync path can scrub hallucinated
+     *  {@code /api/v1/files/generated/{id}} URLs (LLM wrote a UUID-shaped
+     *  link without ever calling a render tool). The graph's FinalAnswerNode
+     *  already does this, but the IM sync path accumulates {@code delta.content()}
+     *  directly and bypasses FinalAnswerNode — without this scrub, the fake
+     *  URL reaches the IM channel as a clickable link that 404s. */
+    @Autowired(required = false)
+    private vip.mate.tool.document.GeneratedFileCache generatedFileCache;
 
     /** 队列条目：封装消息及其路由上下文 */
     private record QueueEntry(ChannelMessage message, ChannelAdapter adapter, ChannelEntity channelEntity) {}
@@ -263,6 +280,11 @@ public class ChannelMessageRouter {
         }
         channelEntity = fresh;
 
+        String conversationId = buildConversationId(message);
+        if (handleMagicCommand(message, adapter, channelEntity, conversationId)) {
+            return;
+        }
+
         // Fan out to the trigger pipeline FIRST — channel_message and
         // content_match triggers fire on every received message regardless
         // of whether the channel has an agent attached. If we returned
@@ -284,7 +306,6 @@ public class ChannelMessageRouter {
         }
 
         String channelType = adapter.getChannelType();
-        String conversationId = buildConversationId(message);
 
         log.info("[{}] Enqueuing message: sender={}, conversationId={}, agentId={}",
                 channelType, message.getSenderId(), conversationId, agentId);
@@ -584,15 +605,21 @@ public class ChannelMessageRouter {
         }
         channelEntity = fresh;
         Long agentId = channelEntity.getAgentId();
-        if (agentId == null) {
-            log.warn("[{}] Channel {} has no associated agent at processing time; dropping message from {}",
-                    adapter.getChannelType(), channelEntity.getName(), message.getSenderId());
-            return;
-        }
         log.info("[{}] Processing message: sender={}, conversationId={}, agentId={}",
                 adapter.getChannelType(), message.getSenderId(), conversationId, agentId);
 
         try {
+            // Magic commands run before the agent-binding check so /help and
+            // /status still answer on a channel with no agent attached.
+            if (handleMagicCommand(message, adapter, channelEntity, conversationId)) {
+                return;
+            }
+            if (agentId == null) {
+                log.warn("[{}] Channel {} has no associated agent at processing time; dropping message from {}",
+                        adapter.getChannelType(), channelEntity.getName(), message.getSenderId());
+                return;
+            }
+
             // ======= 审批拦截层 =======
             String userText = message.getContent() != null ? message.getContent().trim() : "";
             PendingApproval pending = approvalService.findPendingByConversation(conversationId);
@@ -772,8 +799,8 @@ public class ChannelMessageRouter {
                 if (adapter instanceof StreamingChannelAdapter streamingAdapter) {
                     savedAssistantId = processWithStreaming(message, streamingAdapter, conversationId, agentId, promptText, channelEntity, chatOrigin);
                 } else {
-                    // Sync path for non-streaming IM adapters (feishu / wecom / weixin /
-                    // slack / discord / qq / telegram). We can't use agentService.chat()
+                    // Sync path for non-streaming IM adapters (weixin / slack /
+                    // discord / qq / telegram). We can't use agentService.chat()
                     // because its collector filters out `delta.isEvent()` deltas — that
                     // would silently drop plan_created / plan_step_* events that the Web
                     // Console mirror needs to render PlanStepsPanel. Instead we consume
@@ -783,7 +810,7 @@ public class ChannelMessageRouter {
                     StringBuilder replyAccumulator = new StringBuilder();
                     final String channelType = adapter.getChannelType();
                     // Token usage + model attribution: capture _usage_final event emitted at stream end
-                    final int[] usage = {0, 0}; // [promptTokens, completionTokens]
+                    final int[] usage = {0, 0, 0, 0, 0}; // [prompt, completion, cacheRead, cacheWrite, reasoning]
                     final String[] modelInfo = {null, null}; // [runtimeModel, runtimeProvider]
                     agentService.chatStructuredStream(agentId, promptText, conversationId,
                                     message.getSenderId(), chatOrigin)
@@ -793,6 +820,9 @@ public class ChannelMessageRouter {
                                         Map<String, Object> data = delta.eventData();
                                         usage[0] = ((Number) data.getOrDefault("promptTokens", 0)).intValue();
                                         usage[1] = ((Number) data.getOrDefault("completionTokens", 0)).intValue();
+                                        usage[2] = ((Number) data.getOrDefault("cacheReadTokens", 0)).intValue();
+                                        usage[3] = ((Number) data.getOrDefault("cacheWriteTokens", 0)).intValue();
+                                        usage[4] = ((Number) data.getOrDefault("reasoningTokens", 0)).intValue();
                                         Object model = data.get("runtimeModelName");
                                         Object provider = data.get("runtimeProviderId");
                                         if (model != null) modelInfo[0] = model.toString();
@@ -809,6 +839,22 @@ public class ChannelMessageRouter {
                             })
                             .blockLast(Duration.ofMinutes(10));
                     String reply = replyAccumulator.toString();
+
+                    // The IM sync path bypasses FinalAnswerNode, so hallucinated
+                    // /api/v1/files/generated/{id} URLs (LLM wrote a fake link
+                    // without calling a render tool) reach here verbatim. Scrub
+                    // them to the user-visible warning so IM clients don't see
+                    // a clickable link that 404s. Real tool-produced URLs are
+                    // left intact for the channel adapter's scrubber to upgrade
+                    // into native attachments.
+                    if (generatedFileCache != null) {
+                        String scrubbed = generatedFileCache.scrubMissingReferences(reply);
+                        if (!scrubbed.equals(reply)) {
+                            log.info("[{}] Scrubbed hallucinated generated-file URL(s) from IM reply ({} -> {} chars)",
+                                    adapter.getChannelType(), reply.length(), scrubbed.length());
+                            reply = scrubbed;
+                        }
+                    }
 
                     // 检查 chat 过程中是否产生了审批 pending
                     PendingApproval newPending = approvalService.findPendingByConversation(conversationId);
@@ -833,7 +879,7 @@ public class ChannelMessageRouter {
                         String status = isError ? "error" : "completed";
                         MessageEntity saved = conversationService.saveMessage(
                                 conversationId, "assistant", reply, null, status,
-                                usage[0], usage[1], modelInfo[0], modelInfo[1]);
+                                usage[0], usage[1], usage[2], usage[3], usage[4], modelInfo[0], modelInfo[1], null);
                         savedAssistantId = saved != null ? saved.getId() : null;
                         if (!isError) {
                             publishConversationCompletedEvent(agentId, conversationId, message.getContent(), reply, chatOrigin);
@@ -900,6 +946,94 @@ public class ChannelMessageRouter {
     }
 
     /**
+     * Handle channel-native control commands before the message is persisted
+     * or forwarded to the agent. A recognized command is terminal for this
+     * inbound message: it never reaches the debounce queue or the LLM.
+     */
+    private boolean handleMagicCommand(ChannelMessage message, ChannelAdapter adapter,
+                                       ChannelEntity channelEntity, String conversationId) {
+        String userText = message != null ? message.getContent() : null;
+        ChannelMagicCommand.Parsed command = ChannelMagicCommand.parse(userText).orElse(null);
+        if (command == null) {
+            return false;
+        }
+        String replyTarget = resolveReplyTarget(message);
+        String reply = switch (command.type()) {
+            case CLEAR -> {
+                cancelPending(conversationId);
+                conversationService.clearMessages(conversationId);
+                yield ChannelMagicCommand.clearConfirmation();
+            }
+            case NEW -> {
+                // Channel conversation ids are deterministic (channelType:chatId),
+                // so "new session" cannot rotate the id — it clears the context
+                // like CLEAR and only differs in the confirmation wording.
+                cancelPending(conversationId);
+                conversationService.clearMessages(conversationId);
+                yield ChannelMagicCommand.newConfirmation();
+            }
+            case STOP -> {
+                cancelPending(conversationId);
+                boolean stopped = streamTracker.requestStop(conversationId);
+                yield stopped ? ChannelMagicCommand.stopConfirmation()
+                        : ChannelMagicCommand.stopNothingRunning();
+            }
+            case HELP -> ChannelMagicCommand.helpText();
+            case STATUS -> buildStatusReply(channelEntity, conversationId);
+        };
+        if (replyTarget != null && reply != null) {
+            adapter.sendMessage(replyTarget, reply);
+        }
+        log.info("[{}] Magic command handled: {} conversationId={}, sender={}",
+                adapter.getChannelType(), command.type(), conversationId,
+                message != null ? message.getSenderId() : null);
+        return true;
+    }
+
+    /** Build the /status reply; every lookup degrades gracefully to keep the command side-effect free. */
+    private String buildStatusReply(ChannelEntity channelEntity, String conversationId) {
+        StringBuilder sb = new StringBuilder("📊 会话状态\n");
+        sb.append("- 会话: ").append(conversationId).append('\n');
+        Long agentId = channelEntity != null ? channelEntity.getAgentId() : null;
+        if (agentId == null) {
+            sb.append("- 智能体: 未绑定\n");
+        } else {
+            try {
+                AgentEntity agent = agentService.getAgent(agentId);
+                if (agent != null) {
+                    sb.append("- 智能体: ").append(agent.getName()).append('\n');
+                    if (agent.getModelName() != null && !agent.getModelName().isBlank()) {
+                        sb.append("- 模型: ").append(agent.getModelName()).append('\n');
+                    }
+                } else {
+                    sb.append("- 智能体: 未找到（id=").append(agentId).append("）\n");
+                }
+            } catch (Exception e) {
+                log.warn("Failed to load agent {} for /status: {}", agentId, e.getMessage());
+                sb.append("- 智能体: 查询失败\n");
+            }
+        }
+        try {
+            sb.append("- 历史消息数: ").append(conversationService.countMessages(conversationId)).append('\n');
+        } catch (Exception e) {
+            log.warn("Failed to count messages for /status: {}", e.getMessage());
+        }
+        boolean running = streamTracker.isRunning(conversationId);
+        sb.append("- 当前任务: ").append(running ? "进行中（可用 /stop 停止）" : "空闲");
+        return sb.toString();
+    }
+
+    private void cancelPending(String conversationId) {
+        PendingMessage pending;
+        synchronized (pendingMessages) {
+            pending = pendingMessages.remove(conversationId);
+        }
+        if (pending != null && pending.timer != null) {
+            pending.timer.cancel(false);
+        }
+    }
+
+    /**
      * 流式处理路径（渠道无关）
      * <p>
      * 事件流与渲染分离：
@@ -948,13 +1082,16 @@ public class ChannelMessageRouter {
             // plan_step_* events, leaving the Web Console mirror with no
             // PlanStepsPanel for IM-routed conversations.
             // Token usage + model attribution: capture _usage_final event emitted at stream end
-            final int[] usage = {0, 0}; // [promptTokens, completionTokens]
+            final int[] usage = {0, 0, 0, 0, 0}; // [prompt, completion, cacheRead, cacheWrite, reasoning]
             final String[] modelInfo = {null, null}; // [runtimeModel, runtimeProvider]
             Flux<AgentService.StreamDelta> mirroredStream = stream.doOnNext(delta -> {
                 if (delta.isEvent() && "_usage_final".equals(delta.eventType())) {
                     Map<String, Object> data = delta.eventData();
                     usage[0] = ((Number) data.getOrDefault("promptTokens", 0)).intValue();
                     usage[1] = ((Number) data.getOrDefault("completionTokens", 0)).intValue();
+                    usage[2] = ((Number) data.getOrDefault("cacheReadTokens", 0)).intValue();
+                    usage[3] = ((Number) data.getOrDefault("cacheWriteTokens", 0)).intValue();
+                    usage[4] = ((Number) data.getOrDefault("reasoningTokens", 0)).intValue();
                     Object model = data.get("runtimeModelName");
                     Object provider = data.get("runtimeProviderId");
                     if (model != null) modelInfo[0] = model.toString();
@@ -982,7 +1119,7 @@ public class ChannelMessageRouter {
                 String status = isError ? "error" : "completed";
                 MessageEntity saved = conversationService.saveMessage(
                         conversationId, "assistant", finalContent, null, status,
-                        usage[0], usage[1], modelInfo[0], modelInfo[1]);
+                        usage[0], usage[1], usage[2], usage[3], usage[4], modelInfo[0], modelInfo[1], null);
                 if (!isError) {
                     publishConversationCompletedEvent(agentId, conversationId, promptText, finalContent, chatOrigin);
                 }
@@ -1311,6 +1448,15 @@ public class ChannelMessageRouter {
     }
 
     /**
+     * Read-only existence check for a conversation by its logical id. Used by
+     * adapters that need to alias a legacy conversationId scheme to a new one
+     * without rewriting stored rows (e.g. Feishu group session-id migration).
+     */
+    public boolean conversationExists(String conversationId) {
+        return conversationService.findByConversationId(conversationId) != null;
+    }
+
+    /**
      * Build a sender-attribution tag for group messages. Returns
      * {@code [@senderName]} when the message is from a multi-user channel
      * context (chatId is set), else {@code null} for 1:1 chats.
@@ -1482,10 +1628,12 @@ public class ChannelMessageRouter {
                 // 构建音频 MessageContentPart
                 String audioUrl = (String) result.get("audioUrl");
                 String fileName = Paths.get(audioUrl).getFileName().toString();
-                Path audioPath = Paths.get("data", "chat-uploads", conversationId, fileName);
+                // TTS output may live under a workspace-scoped dir or the legacy
+                // default dir — probe each candidate root to find the file.
+                Path audioPath = resolveVoiceReplyAudio(conversationId, fileName);
 
-                if (!Files.exists(audioPath)) {
-                    log.warn("[voice-reply] TTS output file not found: {}", audioPath);
+                if (audioPath == null) {
+                    log.warn("[voice-reply] TTS output file not found for conversation {} ({})", conversationId, fileName);
                     return;
                 }
 
@@ -1505,6 +1653,29 @@ public class ChannelMessageRouter {
                 log.warn("[voice-reply] Failed for conversation {}: {}", conversationId, e.getMessage());
             }
         });
+    }
+
+    /**
+     * Resolve the TTS audio file across every candidate upload root. Returns the
+     * first existing match, or {@code null} when the file is absent under every
+     * root. Used by the voice-reply path so workspace-scoped and legacy default
+     * outputs are both found.
+     */
+    private Path resolveVoiceReplyAudio(String conversationId, String fileName) {
+        if (chatUploadLocationResolver != null) {
+            for (Path dir : chatUploadLocationResolver.resolveCandidateConversationDirs(conversationId)) {
+                Path candidate = dir.resolve(fileName);
+                if (Files.exists(candidate)) {
+                    return candidate;
+                }
+            }
+        }
+        // Fallback to the legacy default dir when the resolver is absent
+        // (e.g. direct-construction unit tests). Sanitize the id for the path
+        // segment so it matches the write side.
+        Path legacy = Paths.get("data", "chat-uploads",
+                ChatUploadLocationResolver.sanitizeSegment(conversationId), fileName);
+        return Files.exists(legacy) ? legacy : null;
     }
 
     /**

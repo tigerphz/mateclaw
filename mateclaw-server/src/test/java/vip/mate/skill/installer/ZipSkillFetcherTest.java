@@ -267,4 +267,80 @@ class ZipSkillFetcherTest {
         assertEquals(1, ex.references().size(), "GBK-named reference should survive the charset fallback");
         assertEquals("# 中文内容\n", ex.references().get("中文说明.md"));
     }
+
+    @Test
+    @DisplayName("issue #534: GBK-named entry alongside genuinely UTF-8 content — UTF-8 must not be corrupted")
+    void mixedGbkNameAndUtf8ContentDoesNotCorruptUtf8() throws IOException {
+        org.junit.jupiter.api.Assumptions.assumeTrue(
+                java.nio.charset.Charset.isSupported("GBK"), "GBK charset not available on this JVM");
+        java.nio.charset.Charset gbk = java.nio.charset.Charset.forName("GBK");
+
+        String description = "这是一个测试技能，用于复现乱码问题";
+        String skillMdWithDescription = """
+                ---
+                name: tencent-meeting
+                description: %s
+                version: 1.0.0
+                ---
+                # Test skill
+                """.formatted(description);
+
+        // Windows zip tools commonly write entry names in the local codepage
+        // (GBK) without setting the ZIP UTF-8 flag, even when the underlying
+        // file content was authored in UTF-8 by a text editor. Encoding the
+        // whole ZipOutputStream with GBK reproduces that: the entry NAME
+        // "参考资料.md" is GBK bytes, while SKILL.md's CONTENT stays UTF-8.
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        try (ZipOutputStream zos = new ZipOutputStream(baos, gbk)) {
+            zos.putNextEntry(new ZipEntry("SKILL.md"));
+            zos.write(skillMdWithDescription.getBytes(StandardCharsets.UTF_8));
+            zos.closeEntry();
+
+            zos.putNextEntry(new ZipEntry("references/参考资料.md"));
+            zos.write("中文参考内容".getBytes(StandardCharsets.UTF_8));
+            zos.closeEntry();
+        }
+
+        ZipSkillFetcher.ExtractedSkill ex = ZipSkillFetcher.extract(baos.toByteArray());
+
+        assertTrue(ex.skillMdContent().contains(description),
+                "SKILL.md's genuinely UTF-8 content must not be re-decoded as GBK "
+                        + "just because a different entry's name needed the GBK fallback");
+        assertEquals(1, ex.references().size());
+        assertEquals("中文参考内容", ex.references().get("参考资料.md"));
+    }
+
+    @Test
+    @DisplayName("configurable per-entry cap: entry over the default 1MB survives when the cap is raised")
+    void raisedEntryCapKeepsLargeEntry() throws IOException {
+        String bigDoc = "x".repeat(2_000_000); // 2MB, over the 1MB default
+        byte[] zip = zipOf(List.of(
+                new Entry("SKILL.md", SKILL_MD),
+                new Entry("references/big.md", bigDoc)));
+
+        ZipSkillFetcher.ExtractedSkill withDefaults = ZipSkillFetcher.extract(zip);
+        assertTrue(withDefaults.references().isEmpty(),
+                "default 1MB cap should drop the 2MB entry");
+
+        ZipSkillFetcher.ExtractedSkill withRaisedCap = ZipSkillFetcher.extract(
+                zip, ZipSkillFetcher.Limits.ofMb(5, 50));
+        assertEquals(bigDoc, withRaisedCap.references().get("big.md"),
+                "raised cap should keep the 2MB entry intact");
+    }
+
+    @Test
+    @DisplayName("configurable total cap: error message names the effective limit and the config knob")
+    void totalCapErrorNamesConfiguredLimit() throws IOException {
+        byte[] zip = zipOf(List.of(
+                new Entry("SKILL.md", SKILL_MD),
+                new Entry("references/a.md", "y".repeat(900_000)),
+                new Entry("references/b.md", "z".repeat(900_000))));
+
+        IOException ex = assertThrows(IOException.class,
+                () -> ZipSkillFetcher.extract(zip, ZipSkillFetcher.Limits.ofMb(1, 1)));
+        assertTrue(ex.getMessage().contains("1MB"),
+                "message should carry the configured total cap; got: " + ex.getMessage());
+        assertTrue(ex.getMessage().contains("max-total-size-mb"),
+                "message should point at the config property; got: " + ex.getMessage());
+    }
 }

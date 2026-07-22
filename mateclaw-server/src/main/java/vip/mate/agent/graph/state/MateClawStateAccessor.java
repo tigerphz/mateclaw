@@ -80,6 +80,11 @@ public final class MateClawStateAccessor {
         return state.value(LLM_CALL_COUNT, 0);
     }
 
+    /** Iterations refunded this run for setup-only (progressive-disclosure) rounds (0 at run start). */
+    public int iterationRefundCount() {
+        return state.value(ITERATION_REFUND_COUNT, 0);
+    }
+
     // ===== 观察历史 =====
 
     @SuppressWarnings("unchecked")
@@ -248,6 +253,21 @@ public final class MateClawStateAccessor {
         return state.<Set<String>>value(ENABLED_EXTENSION_TOOLS).orElse(Set.of());
     }
 
+    // ===== Tool-call loop guard =====
+
+    /**
+     * Loop-guard counters accumulated so far this run. Empty at run start.
+     */
+    @SuppressWarnings("unchecked")
+    public java.util.Map<String, Object> toolLoopStats() {
+        return state.<java.util.Map<String, Object>>value(TOOL_LOOP_STATS).orElse(java.util.Map.of());
+    }
+
+    /** Whether the one-shot post-mutation verification reminder was already injected this run. */
+    public boolean mutationReminderInjected() {
+        return state.value(MUTATION_REMINDER_INJECTED, false);
+    }
+
     // ===== Token Usage =====
 
     public int promptTokens() {
@@ -301,6 +321,11 @@ public final class MateClawStateAccessor {
     /** Cumulative agent LLM calls already billed to the goal this run (0 at run start). */
     public int goalAccountedLlmCallCount() {
         return state.value(GOAL_ACCOUNTED_LLM_CALL_COUNT, 0);
+    }
+
+    /** Hard continuations (fresh-budget ReAct segments) performed this run (0 at run start). */
+    public int goalHardContinuationCount() {
+        return state.value(GOAL_HARD_CONTINUATION_COUNT, 0);
     }
 
     /**
@@ -366,6 +391,10 @@ public final class MateClawStateAccessor {
 
         public OutputBuilder needsToolCall(boolean needs) {
             return put(NEEDS_TOOL_CALL, needs);
+        }
+
+        public OutputBuilder iterationRefundCount(int count) {
+            return put(ITERATION_REFUND_COUNT, count);
         }
 
         // ---- 消息 ----
@@ -514,6 +543,15 @@ public final class MateClawStateAccessor {
             return put(ENABLED_EXTENSION_TOOLS, names);
         }
 
+        // ---- Tool-call loop guard ----
+        public OutputBuilder toolLoopStats(java.util.Map<String, Object> stats) {
+            return put(TOOL_LOOP_STATS, stats);
+        }
+
+        public OutputBuilder mutationReminderInjected(boolean injected) {
+            return put(MUTATION_REMINDER_INJECTED, injected);
+        }
+
         // ---- Token Usage ----
 
         /** 将本次 LLM 调用的 usage 累加到 state 已有值上 */
@@ -523,6 +561,12 @@ public final class MateClawStateAccessor {
             int existingCompletion = currentState.value(COMPLETION_TOKENS, 0);
             map.put(PROMPT_TOKENS, existingPrompt + result.promptTokens());
             map.put(COMPLETION_TOKENS, existingCompletion + result.completionTokens());
+            map.put(CACHE_READ_TOKENS,
+                    currentState.value(CACHE_READ_TOKENS, 0) + result.cacheReadTokens());
+            map.put(CACHE_WRITE_TOKENS,
+                    currentState.value(CACHE_WRITE_TOKENS, 0) + result.cacheWriteTokens());
+            map.put(REASONING_TOKENS,
+                    currentState.value(REASONING_TOKENS, 0) + result.reasoningTokens());
             return this;
         }
 
@@ -552,6 +596,10 @@ public final class MateClawStateAccessor {
             return put(GOAL_ACCOUNTED_LLM_CALL_COUNT, n);
         }
 
+        public OutputBuilder goalHardContinuationCount(int n) {
+            return put(GOAL_HARD_CONTINUATION_COUNT, n);
+        }
+
         /** Wipe FINAL_ANSWER on follow-up so the next graph pass doesn't
          *  immediately re-terminate via the existing final text. */
         public OutputBuilder clearFinalAnswer() {
@@ -561,6 +609,18 @@ public final class MateClawStateAccessor {
         /** Wipe FINISH_REASON for the same reason as clearFinalAnswer(). */
         public OutputBuilder clearFinishReason() {
             return put(FINISH_REASON, "");
+        }
+
+        /**
+         * Wipe the limit-exceeded draft + flag. Required before a hard
+         * continuation re-enters the ReAct loop: FinalAnswerNode prefers
+         * FINAL_ANSWER_DRAFT over a freshly reasoned answer, so a stale draft
+         * left by LimitExceededNode would otherwise resurface as the next
+         * segment's answer.
+         */
+        public OutputBuilder clearLimitExceededDraft() {
+            put(FINAL_ANSWER_DRAFT, "");
+            return put(LIMIT_EXCEEDED, false);
         }
 
         /** Plan-Execute follow-up: clear the terminal-side plan summary so

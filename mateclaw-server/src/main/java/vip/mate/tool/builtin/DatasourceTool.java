@@ -1,8 +1,8 @@
 package vip.mate.tool.builtin;
 
-import cn.hutool.json.JSONArray;
 import cn.hutool.json.JSONObject;
 import cn.hutool.json.JSONUtil;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.tool.annotation.Tool;
@@ -14,7 +14,9 @@ import vip.mate.datasource.service.DatasourceService;
 
 import java.sql.*;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.regex.Pattern;
 
 /**
@@ -32,6 +34,14 @@ public class DatasourceTool {
 
     private final DatasourceService datasourceService;
     private final DatasourceConnectionManager connectionManager;
+    /**
+     * The application ObjectMapper, which serializes every {@code Long} as a JSON
+     * string (see {@code JacksonConfig}). Tool output goes through it so 19-digit
+     * Snowflake ids reach the model as strings — exactly like the HTTP API — and
+     * never as JSON numbers that lose their low digits in a double/JS-number
+     * round-trip on the way back into a tool call.
+     */
+    private final ObjectMapper objectMapper;
 
     /** SQL identifier whitelist: letters, digits, underscore, dot, hyphen only */
     private static final Pattern SAFE_IDENTIFIER = Pattern.compile("^[a-zA-Z0-9_][a-zA-Z0-9_.\\-]{0,127}$");
@@ -67,22 +77,25 @@ public class DatasourceTool {
         }
     }
 
-    private String listDatasources() {
+    private String listDatasources() throws Exception {
         List<DatasourceEntity> list = datasourceService.listEnabled();
-        JSONArray arr = new JSONArray();
+        List<Map<String, Object>> rows = new ArrayList<>();
         for (DatasourceEntity ds : list) {
-            JSONObject obj = new JSONObject();
-            obj.set("id", ds.getId());
-            obj.set("name", ds.getName());
-            obj.set("dbType", ds.getDbType());
-            obj.set("databaseName", ds.getDatabaseName());
-            obj.set("description", ds.getDescription());
-            arr.add(obj);
+            Map<String, Object> obj = new LinkedHashMap<>();
+            // ds.getId() is a Long; the shared ObjectMapper renders it as a JSON
+            // string so the model copies an exact id back into list_tables /
+            // execute_sql / describe_table calls.
+            obj.put("id", ds.getId());
+            obj.put("name", ds.getName());
+            obj.put("dbType", ds.getDbType());
+            obj.put("databaseName", ds.getDatabaseName());
+            obj.put("description", ds.getDescription());
+            rows.add(obj);
         }
-        JSONObject result = new JSONObject();
-        result.set("datasources", arr);
-        result.set("count", arr.size());
-        return result.toStringPretty();
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("datasources", rows);
+        result.put("count", rows.size());
+        return objectMapper.writerWithDefaultPrettyPrinter().writeValueAsString(result);
     }
 
     private String listTables(Long datasourceId) throws SQLException {
@@ -97,9 +110,11 @@ public class DatasourceTool {
                     "SELECT TABLE_NAME, TABLE_COMMENT, TABLE_ROWS FROM information_schema.TABLES WHERE TABLE_SCHEMA = '%s' ORDER BY TABLE_NAME",
                     sanitizeIdentifier(entity.getDatabaseName()));
             case "postgresql" -> String.format(
-                    "SELECT tablename AS table_name, obj_description(c.oid) AS table_comment " +
-                    "FROM pg_tables t LEFT JOIN pg_class c ON c.relname = t.tablename " +
-                    "WHERE t.schemaname = '%s' ORDER BY tablename",
+                    "SELECT t.table_name, obj_description(c.oid) AS table_comment " +
+                    "FROM information_schema.tables t " +
+                    "LEFT JOIN pg_namespace n ON n.nspname = t.table_schema " +
+                    "LEFT JOIN pg_class c ON c.relnamespace = n.oid AND c.relname = t.table_name " +
+                    "WHERE t.table_schema = '%s' ORDER BY t.table_name",
                     sanitizeIdentifier(entity.getSchemaName() != null ? entity.getSchemaName() : "public"));
             case "clickhouse" -> "SHOW TABLES";
             default -> throw new IllegalArgumentException("不支持的数据库类型: " + dbType);

@@ -94,8 +94,13 @@ deploy/nginx/ssl/*.crt
 deploy/nginx/ssl/*.key
 deploy/nginx/ssl/*.pem
 
-# Deploy env
-deploy/.env
+# Env files (real secrets - do not commit)
+# .env matches any level; .env.example / *.env.example are templates and stay tracked.
+.env
+.env.local
+.env.*.local
+!.env.example
+!**/.env.example
 
 # Claude Code local settings
 CLAUDE.md
@@ -105,6 +110,9 @@ CLAUDE.md
 # Codex CLI local artifacts
 .codex/
 
+# Codebase memory (local agent index / graph artifact; do not commit)
+.codebase-memory/
+
 # Sync tooling local state (generated each run; report is intentionally tracked)
 scripts/.*-sync-state.json
 
@@ -112,4 +120,12 @@ scripts/.*-sync-state.json
 # but should not ship in the repo.
 outputs/
 
-.mateclaw/
+# This is a pnpm monorepo — pnpm-lock.yaml is the only lockfile we track.
+# Ignore stray npm/yarn lockfiles so they are not committed by mistake.
+package-lock.json
+yarn.lock
+
+# Python bytecode caches generated when skill scripts (e.g. skills/*/scripts/*.py)
+# are executed. Never commit or sync these.
+__pycache__/
+*.pyc

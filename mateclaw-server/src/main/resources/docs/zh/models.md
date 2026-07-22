@@ -23,8 +23,9 @@ MateClaw 不关心你用哪个 LLM。它通过五个协议适配器跟所有主�
 | **xAI / Grok** | Grok 3、Grok 4 | openai | OpenAI 兼容（base URL + API Key）；UI 带 xAI 品牌图标 |
 | **DeepSeek** | deepseek-chat、deepseek-coder、**DeepSeek V4 flash + pro**（支持思考模式） | openai | OpenAI 兼容 |
 | **Kimi（Moonshot）** | moonshot-v1-8k/32k/128k | openai | OpenAI 兼容 |
-| **智谱 AI** | GLM-5-Turbo、GLM-5V-Turbo、GLM-5、GLM-5.1 | openai | OpenAI 兼容 |
-| **MiniMax** | abab6.5、abab5.5；扩展视频模型目录 + 国内端点 | openai | OpenAI 兼容 |
+| **智谱 AI** | GLM-5-Turbo、GLM-5V-Turbo、GLM-5、GLM-5.1、**GLM-5.2** | openai | OpenAI 兼容；中国区 + 国际区各一个 standard 端点，外加两个 Coding Plan 订阅端点 |
+| **火山方舟 Agent Plan** _(1.8.0+)_ | GLM-5.2（主模型）等 | openai | OpenAI 兼容；agent-plan 端点（`/api/plan/v3`） |
+| **MiniMax** | abab6.5、abab5.5；扩展视频模型目录 + 国内端点 | anthropic | Anthropic Messages API 兼容（端点 `/anthropic`） |
 | **SiliconFlow CN/INTL** | 托管路由推理 | openai | 双端点，OpenAI 兼容 |
 | **OpenCode** | 代码场景路由 | openai | OpenAI 兼容 |
 | **OpenRouter** | 200+ 模型含免费档 | openai | 一个 key 路由到任何上游 |
@@ -46,8 +47,8 @@ MateClaw 不关心你用哪个 LLM。它通过五个协议适配器跟所有主�
 
 | 协议 | 谁在用 |
 |------|--------|
-| **OpenAI** | OpenAI、Kimi、DeepSeek、MiniMax、智谱、OpenRouter、LM Studio、llama.cpp、MLX |
-| **Anthropic** | Claude 家族 |
+| **OpenAI** | OpenAI、Kimi、DeepSeek、智谱、OpenRouter、LM Studio、llama.cpp、MLX |
+| **Anthropic** | Claude 家族、MiniMax |
 | **DashScope** | Qwen 家族 |
 | **Gemini** | Google Gemini 家族 |
 | **Ollama** | 通过 Ollama 跑的本地模型 |
@@ -198,6 +199,18 @@ token 持久化和刷新走的是和浏览器回调流**完全相同**的代码�
 
 对 OpenRouter 特别有用——**让 200+ 免费档模型全都可见**。挑一个免费模型零成本有一套能用的环境。
 
+### 自建供应商的模型发现
+
+自己「添加供应商」建的兼容端点（vLLM / Xinference / LocalAI / 各类兼容网关）默认按协议开启发现：`openai-compatible`、`dashscope-native`、`gemini-native`、`anthropic-messages` 会自动带上「发现模型」按钮；OAuth 类协议（ChatGPT OAuth、Claude Code OAuth）不带（它们的发现走专属登录回调，与 baseUrl 无关）。
+
+如果端点的模型列举路径不是标准的 `/v1/models`（例如反向代理加了前缀 `/openai/v1/models`），在「生成参数(JSON)」里加一行 `modelsPath` 覆盖即可：
+
+```json
+{ "modelsPath": "/openai/v1/models" }
+```
+
+同一个 JSON 里的 `completionsPath` 用来覆盖对话补全路径（默认 `/v1/chat/completions`），两者互不影响。若端点根本不提供 OpenAI 风格的列举接口，直接用「添加模型」手动录入模型 id。
+
 ### Ollama 启动时自动检测
 
 不用手动配。启动时：
@@ -273,7 +286,7 @@ ollama pull qwen3
 
 不用配 `EMBEDDING_API_KEY` 环境变量。嵌入模型就是 `mate_model_config` 里 `model_type='embedding'` 的普通行。`设置 → 模型` 里和聊天模型列在一起。知识库从下拉里选它的嵌入模型。
 
-::: tip 1.4.0 新增（[issue #79](https://github.com/matevip/mateclaw/issues/79)）
+::: tip 1.4.0 新增（[issue #79](https://github.com/mateaix/mateclaw/issues/79)）
 **任意供应商都能提供嵌入模型。** 在 `设置 → 模型` 的嵌入区域里，配一个来自任何供应商的嵌入模型——直接**复用那家供应商的 API Key**，不再单独要 `EMBEDDING_API_KEY`。每个知识库从下拉里挑自己的嵌入模型。无密钥的本地代理用一个空操作占位 key；协议从该供应商的聊天模型 / protocol 设置里自动解析，不用再手填。
 :::
 
@@ -300,7 +313,7 @@ ollama pull qwen3
 
 **多轮 tool call + thinking**：带 thinking 的模型（DeepSeek-Reasoner / GPT-5 / Kimi K2.5 / 小米 MiMo）在 ReAct 多轮 tool call 场景下，历史消息的 `reasoning_content` 会正确回传给 provider；跨用户问题边界时自动清除，同一问题内的子轮次全部保留——符合 DeepSeek 的"同问题子轮必须回传、跨问题时清"契约。
 
-**小米 MiMo 思考模式多轮修复**（[issue #189](https://github.com/matevip/mateclaw/issues/189)）：MiMo 思考模式的 `reasoning_content` 现在能在多轮对话里正确保留，不再在后续轮次丢失。
+**小米 MiMo 思考模式多轮修复**（[issue #189](https://github.com/mateaix/mateclaw/issues/189)）：MiMo 思考模式的 `reasoning_content` 现在能在多轮对话里正确保留，不再在后续轮次丢失。
 
 ---
 
@@ -324,7 +337,7 @@ MateClaw 用一个**活跃模型**作为全局默认。没有指定自己模型�
 也支持按 Agent 覆盖：把某个 Agent 绑定到特定模型配置。
 
 ::: tip 1.4.0 新增
-- **按会话选模型**（[issue #150](https://github.com/matevip/mateclaw/issues/150)）：在聊天界面里可以为**当前这一条会话**临时切换模型，不影响全局活跃模型和别的会话。详见 [聊天与消息](./chat)。
+- **按会话选模型**（[issue #150](https://github.com/mateaix/mateclaw/issues/150)）：在聊天界面里可以为**当前这一条会话**临时切换模型，不影响全局活跃模型和别的会话。详见 [聊天与消息](./chat)。
 - **单个坏模型 id 不再连累整个供应商**：发现 / 探活时遇到一个无效的模型标识符，只跳过那一个模型，供应商下其余模型照常可用。
 :::
 
@@ -346,7 +359,7 @@ MateClaw 用一个**活跃模型**作为全局默认。没有指定自己模型�
 ## 多模态旁路（系统级）
 
 ::: tip 1.3.0 新增
-让纯文本主模型也能"看图回答"，参见 [issue #87](https://github.com/matevip/mateclaw/issues/87)。
+让纯文本主模型也能"看图回答"，参见 [issue #87](https://github.com/mateaix/mateclaw/issues/87)。
 :::
 
 入口：**设置 → 模型 → 多模态旁路**。两个独立的卡片：
@@ -363,7 +376,7 @@ MateClaw 用一个**活跃模型**作为全局默认。没有指定自己模型�
 
 下拉只列**支持对应 modality 的模型**——筛选逻辑走后端 `ModelCapabilityService.supports(...)`，未启用 / 没声明 vision 能力的模型都不会出现在选项里。每张卡片有独立的"保存"按钮，互不干扰。
 
-什么时候触发？运行时由 `MultimodalRouter` 决策（[源码](https://github.com/matevip/mateclaw/blob/main/mateclaw-server/src/main/java/vip/mate/llm/routing/MultimodalRouter.java)）：
+什么时候触发？运行时由 `MultimodalRouter` 决策（[源码](https://github.com/mateaix/mateclaw/blob/main/mateclaw-server/src/main/java/vip/mate/llm/routing/MultimodalRouter.java)）：
 
 - 主模型已支持图片 → 不路由（走原 native multimodal 路径）
 - 主模型不支持图片 + 配了视觉旁路 → SIDECAR 策略，视觉模型转描述
@@ -388,7 +401,7 @@ MateClaw 用一个**活跃模型**作为全局默认。没有指定自己模型�
 - **自动 fallback** —— 主 provider 返回 `AUTH_ERROR` / `BILLING` / `MODEL_NOT_FOUND` / `NETWORK` / `5xx` 时，运行时滚到下一个 provider，而不是把错误抛到 UI
 - **每个 agent 自定义优先级** —— 在 `设置 → 模型` 的拖拽编辑器里把某个 agent 锁成 "OpenAI 优先 → Anthropic → DashScope"
 - **池子状态实时可见** —— 每个 provider 用绿/琥珀/红徽章标健康状态
-- **4 协议探活** —— DashScope、OpenAI 兼容、Anthropic、Ollama 风格
+- **5 协议探活** —— DashScope、OpenAI 兼容、Anthropic、Gemini、Ollama 风格
 - **手动重探 + 配置变更自动重探** —— 换 key 不用重启
 - **出口 sanitizer** —— provider 专属选项（如 OpenAI 推理模型的 `reasoning_effort`）在 failover 到不支持的 provider 时被剥离，泄漏的选项不会让 fallback 报 400
 - **UI 区分 401 与会话过期** —— provider 认证错误和用户会话过期现在显示不同消息、不同处置

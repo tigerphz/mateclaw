@@ -46,33 +46,39 @@
                 <el-icon><WarningFilled /></el-icon>
                 <span>{{ $t('chat.iterationEmpty', { index: iter.index + 1 }) }}</span>
               </div>
+              <!-- Render each iteration's segments in their original emission
+                   order (thinking / tool_call / content interleaved exactly as
+                   the model produced them) so tool boxes never reorder. -->
               <template v-else>
-                <ThinkingSegment v-for="t in iter.thinkings" :key="t.id" :segment="t" />
-                <ToolCallSegment v-for="tool in iter.tools" :key="tool.id" :segment="tool" />
-                <template v-for="c in iter.contents" :key="c.id">
+                <template v-for="seg in iter.items" :key="seg.id">
+                <ThinkingSegment v-if="seg.type === 'thinking' && debugMode" :segment="seg" />
+                <ToolCallSegment v-else-if="seg.type === 'tool_call'" :segment="seg" />
+                <template v-else-if="seg.type === 'content'">
                   <button
-                    v-if="c.superseded"
+                    v-if="seg.superseded"
                     class="superseded-toggle"
                     type="button"
-                    @click="toggleSupersededSegment(c.id)"
+                    @click="toggleSupersededSegment(seg.id)"
                   >
                     <el-icon><InfoFilled /></el-icon>
                     <span>{{ $t('chat.supersededPreviewCollapsed') }}</span>
                     <span class="superseded-toggle__action">
-                      {{ isSupersededExpanded(c.id) ? $t('chat.collapse') : $t('chat.expand') }}
+                      {{ isSupersededExpanded(seg.id) ? $t('chat.collapse') : $t('chat.expand') }}
                     </span>
                   </button>
-                  <div v-if="c.repetitionWarning && (!c.superseded || isSupersededExpanded(c.id))" class="repetition-warning">
+                  <div v-if="seg.repetitionWarning && (!seg.superseded || isSupersededExpanded(seg.id))" class="repetition-warning">
                     <el-icon><WarningFilled /></el-icon>
                     <span class="repetition-warning__text">{{ $t('chat.contentRepetitionWarning') }}</span>
-                    <span v-if="c.truncatedChars" class="repetition-warning__meta">({{ c.truncatedChars }} chars)</span>
+                    <span v-if="seg.truncatedChars" class="repetition-warning__meta">({{ seg.truncatedChars }} chars)</span>
                   </div>
                   <ContentSegment
-                    v-if="!c.superseded || isSupersededExpanded(c.id)"
-                    :segment="c"
-                    :show-cursor="showCursor && c.status === 'running'"
-                    :class="{ 'content-segment--superseded': c.superseded }"
+                    v-if="!seg.superseded || isSupersededExpanded(seg.id)"
+                    :segment="seg"
+                    :show-cursor="showCursor && seg.status === 'running'"
+                    :generated-file-names="generatedFileNames"
+                    :class="{ 'content-segment--superseded': seg.superseded }"
                   />
+                </template>
                 </template>
               </template>
             </template>
@@ -251,6 +257,20 @@
         </div>
 
         <!--
+          Runtime warning chips (metadata.warnings): loop-guard interventions
+          and other backend runtime notices. Populated live via the 'warning'
+          SSE event (useChat merges it into metadata.warnings) and persisted by
+          the stream accumulator, so streaming and history reload render the
+          same chips. Message text arrives pre-localized from the backend.
+        -->
+        <div v-if="runtimeWarnings.length" class="runtime-warnings">
+          <div v-for="(warning, wIdx) in runtimeWarnings" :key="wIdx" class="runtime-warning-chip">
+            <el-icon class="runtime-warning-chip__icon"><WarningFilled /></el-icon>
+            <span class="runtime-warning-chip__text">{{ warning }}</span>
+          </div>
+        </div>
+
+        <!--
           feedback_event card: recovery affordances for turns that ended
           in a non-transient error. Backend's NodeStreamingChatHelper
           handles transient TLS / IO retries silently; this card only
@@ -345,11 +365,16 @@
             :key="attachment.storedName"
             class="message-attachment"
             type="button"
-            @click="downloadFile(attachment)"
+            @click="openFileAttachment(attachment)"
           >
             <el-icon class="message-attachment__icon"><Document /></el-icon>
             <span class="message-attachment__name">{{ attachment.name }}</span>
             <span class="message-attachment__meta">{{ formatFileSize(attachment.size) }}</span>
+            <el-icon
+              class="message-attachment__download"
+              :title="$t('chat.preview.download')"
+              @click.stop="downloadFile(attachment)"
+            ><Download /></el-icon>
           </button>
         </div>
       </div>
@@ -403,6 +428,100 @@
             class="action-model"
             :title="replyModelTitle"
           >{{ replyModel }}</span>
+          <!-- Turn token total (assistant only): own usage + delegated sub-agents.
+               Click opens the per-turn consumption breakdown panel (cache hit/miss/write,
+               reasoning vs reply, cache hit rate). -->
+          <el-popover
+            v-if="role === 'assistant' && tokenUsage"
+            placement="top-end"
+            trigger="click"
+            :width="288"
+            popper-class="mc-usage-popover"
+          >
+            <template #reference>
+              <button
+                class="action-tokens usage-trigger"
+                type="button"
+                :title="tokenUsage.delegated > 0
+                  ? $t('chat.tokenUsageTooltipDelegated', {
+                      total: tokenUsage.total.toLocaleString(),
+                      input: tokenUsage.input.toLocaleString(),
+                      output: tokenUsage.output.toLocaleString(),
+                      delegated: tokenUsage.delegated.toLocaleString(),
+                    })
+                  : $t('chat.tokenUsageTooltip', {
+                      total: tokenUsage.total.toLocaleString(),
+                      input: tokenUsage.input.toLocaleString(),
+                      output: tokenUsage.output.toLocaleString(),
+                    })"
+              >Σ {{ fmtTokens(tokenUsage.total) }} tok</button>
+            </template>
+            <div class="mc-usage-panel">
+              <div class="mc-usage-header">
+                <span class="mc-usage-title">{{ $t('chat.usageDetail.title') }}</span>
+                <span class="mc-usage-total-label">{{ $t('chat.usageDetail.total') }}</span>
+                <span class="mc-usage-total">{{ tokenUsage.total.toLocaleString() }}</span>
+              </div>
+              <div class="mc-usage-row mc-usage-row-main">
+                <i class="mc-usage-dot mc-dot-input"></i>
+                <span class="mc-usage-label">{{ $t('chat.usageDetail.input') }}</span>
+                <span class="mc-usage-value">{{ tokenUsage.input.toLocaleString() }}</span>
+              </div>
+              <template v-if="tokenUsage.hasCacheData">
+                <div class="mc-usage-row mc-usage-row-sub">
+                  <i class="mc-usage-dot mc-dot-hit"></i>
+                  <span class="mc-usage-label">{{ $t('chat.usageDetail.cacheHit') }}</span>
+                  <span class="mc-usage-value">{{ tokenUsage.cacheRead.toLocaleString() }}</span>
+                </div>
+                <div class="mc-usage-row mc-usage-row-sub">
+                  <i class="mc-usage-dot mc-dot-miss"></i>
+                  <span class="mc-usage-label">{{ $t('chat.usageDetail.cacheMiss') }}</span>
+                  <span class="mc-usage-value">{{ tokenUsage.cacheMiss.toLocaleString() }}</span>
+                </div>
+                <div class="mc-usage-row mc-usage-row-sub">
+                  <i class="mc-usage-dot mc-dot-write"></i>
+                  <span class="mc-usage-label">{{ $t('chat.usageDetail.cacheWrite') }}</span>
+                  <span class="mc-usage-value">{{ tokenUsage.cacheWrite.toLocaleString() }}</span>
+                </div>
+              </template>
+              <div class="mc-usage-divider"></div>
+              <div class="mc-usage-row mc-usage-row-main">
+                <i class="mc-usage-dot mc-dot-output"></i>
+                <span class="mc-usage-label">{{ $t('chat.usageDetail.output') }}</span>
+                <span class="mc-usage-value">{{ tokenUsage.output.toLocaleString() }}</span>
+              </div>
+              <div class="mc-usage-row mc-usage-row-sub">
+                <span class="mc-usage-label mc-usage-label-indent">{{ $t('chat.usageDetail.reasoning') }}</span>
+                <span class="mc-usage-value">{{ tokenUsage.reasoning.toLocaleString() }}</span>
+              </div>
+              <div class="mc-usage-row mc-usage-row-sub">
+                <span class="mc-usage-label mc-usage-label-indent">{{ $t('chat.usageDetail.reply') }}</span>
+                <span class="mc-usage-value">{{ tokenUsage.reply.toLocaleString() }}</span>
+              </div>
+              <div v-if="tokenUsage.delegated > 0" class="mc-usage-row mc-usage-row-sub">
+                <span class="mc-usage-label mc-usage-label-indent">{{ $t('chat.usageDetail.delegated') }}</span>
+                <span class="mc-usage-value">{{ tokenUsage.delegated.toLocaleString() }}</span>
+              </div>
+              <template v-if="tokenUsage.hasCacheData">
+                <div class="mc-usage-divider"></div>
+                <div class="mc-usage-row mc-usage-row-main">
+                  <span class="mc-usage-hit-icon">⚡</span>
+                  <span class="mc-usage-label">{{ $t('chat.usageDetail.hitRate') }}</span>
+                  <span class="mc-usage-value mc-usage-hit-rate">{{ (tokenUsage.hitRate * 100).toFixed(1) }}%</span>
+                </div>
+                <div class="mc-usage-bar">
+                  <i class="mc-bar-hit" :style="{ width: usageBarPct(tokenUsage.cacheRead) }"></i>
+                  <i class="mc-bar-write" :style="{ width: usageBarPct(tokenUsage.cacheWrite) }"></i>
+                  <i class="mc-bar-miss" :style="{ width: usageBarPct(tokenUsage.cacheMiss) }"></i>
+                </div>
+                <div class="mc-usage-legend">
+                  <span><i class="mc-usage-dot mc-dot-hit"></i>{{ $t('chat.usageDetail.legendHit') }}</span>
+                  <span><i class="mc-usage-dot mc-dot-write"></i>{{ $t('chat.usageDetail.legendWrite') }}</span>
+                  <span><i class="mc-usage-dot mc-dot-miss"></i>{{ $t('chat.usageDetail.legendMiss') }}</span>
+                </div>
+              </template>
+            </div>
+          </el-popover>
           <!-- Multimodal sidecar routing badge (assistant only, when sidecar fired) -->
           <span
             v-if="role === 'assistant' && routingBadge"
@@ -425,6 +544,7 @@ import {
   CloseBold,
   CopyDocument,
   Document,
+  Download,
   InfoFilled,
   Loading,
   Microphone,
@@ -435,28 +555,43 @@ import {
   VideoPause,
   WarningFilled,
 } from '@element-plus/icons-vue'
-import { useMarkdownRenderer } from '@/composables/useMarkdownRenderer'
+import { useStreamingMarkdown } from '@/composables/useStreamingMarkdown'
+import { buildGeneratedFileNameMap, linkifyGeneratedFileUrls } from '@/utils/generatedFileLinks'
+import { ensureModelViewer } from '@/utils/lazyModelViewer'
 import { useAuthenticatedAttachment } from '@/composables/useAuthenticatedAttachment'
 import { useToolLabel } from '@/composables/useToolLabel'
 import { http } from '@/api'
 import { copyToClipboard } from '@/utils/clipboard'
 import TypingCursor from './TypingCursor.vue'
+import { previewKindOf } from './preview/previewKind'
+import { openFilePreview } from './preview/previewBus'
 import BrowserTimeline from './BrowserTimeline.vue'
 import ToolCallSegment from './ToolCallSegment.vue'
 import ThinkingSegment from './ThinkingSegment.vue'
 import ContentSegment from './ContentSegment.vue'
 import GoalAvatarRing from '@/components/goal/GoalAvatarRing.vue'
 import { useGoalStore } from '@/stores/useGoalStore'
+import { useSystemSettingsStore } from '@/stores/useSystemSettingsStore'
+import { storeToRefs } from 'pinia'
 import PlanStepsPanel from './PlanStepsPanel.vue'
 import UserMessageContent from './UserMessageContent.vue'
 import type { BrowserAction } from './BrowserTimeline.vue'
-import type { Message, MessageSegment, ChatAttachment, ToolCallMeta, PlanMeta } from '@/types'
+import type { Message, MessageSegment, ChatAttachment, ToolCallMeta, PlanMeta, DelegationNode } from '@/types'
 import type { ChatErrorInfo } from '@/types/chatError'
 
-const { renderMarkdown } = useMarkdownRenderer()
 const { t, locale } = useI18n()
 const { getToolLabel } = useToolLabel()
 const { blobUrls, loadAllImages, loadAllVideos, loadAllAudios, loadAllModels, downloadFile, openImage, getDisplayUrl, revokeAll } = useAuthenticatedAttachment()
+
+// Document attachments: preview in the global dialog when the format is
+// supported, otherwise fall back to the legacy download behavior.
+function openFileAttachment(attachment: ChatAttachment) {
+  if (previewKindOf(attachment)) {
+    openFilePreview(attachment)
+  } else {
+    void downloadFile(attachment)
+  }
+}
 
 interface Props {
   message: Message
@@ -562,7 +697,13 @@ const hasContent = computed(() => {
   return !!(textPart?.text || props.message.content)
 })
 
-const showThinkingPanel = computed(() => !!thinkingContent.value)
+// Debug mode gates whether the model's reasoning ("thinking") is surfaced.
+// Off (default) keeps the transcript focused on tool activity + the answer,
+// directly addressing the "thinking piles up" complaint. Tool-call boxes stay
+// visible (they auto-collapse) so the user still sees what the agent did.
+const { debugMode } = storeToRefs(useSystemSettingsStore())
+
+const showThinkingPanel = computed(() => debugMode.value && !!thinkingContent.value)
 
 // 思考耗时（生成结束后显示）
 const thinkingDuration = computed(() => {
@@ -601,10 +742,12 @@ const toggleThinking = () => {
   emit('toggle-thinking', localThinkingExpanded.value)
 }
 
-const renderedThinkingContent = computed(() => {
-  if (!thinkingContent.value) return ''
-  return renderMarkdown(thinkingContent.value)
-})
+// Throttle thinking + main-content markdown while the turn streams; both render
+// once at full fidelity when generation stops.
+const { html: renderedThinkingContent } = useStreamingMarkdown(
+  () => thinkingContent.value,
+  () => isGenerating.value,
+)
 
 // --- 主内容 ---
 const isApprovalPlaceholder = (text: string) => {
@@ -621,8 +764,15 @@ const displayContent = computed(() => {
   if (text && isApprovalPlaceholder(text)) return ''
   // 有错误卡片时隐藏 [错误] 原始文本，避免重复展示
   if (status.value === 'failed' && errorInfo.value && text.startsWith('[错误]')) return ''
-  return text
+  return linkifyGeneratedFileUrls(text, generatedFileNames.value)
 })
+
+// id → filename map for generated-file downloads, sourced from the metadata
+// the server builds out of tool results. Used to rewrite bare download URLs
+// the model echoed as plain text into [name](url) links (the persisted copy
+// is rewritten server-side; this covers the live-streamed bubble).
+const generatedFileNames = computed(() =>
+  buildGeneratedFileNameMap((props.message.metadata as any)?.generatedFiles))
 
 // --- parse_error detection ---
 const parseErrorText = computed(() => {
@@ -630,10 +780,10 @@ const parseErrorText = computed(() => {
   return errorPart?.text || ''
 })
 
-const renderedContent = computed(() => {
-  if (!displayContent.value) return ''
-  return renderMarkdown(displayContent.value)
-})
+const { html: renderedContent } = useStreamingMarkdown(
+  () => displayContent.value,
+  () => isGenerating.value,
+)
 
 const showLoadingIndicator = computed(() => {
   return isGenerating.value && !displayContent.value
@@ -784,9 +934,14 @@ watch(audioAttachments, (atts) => {
   if (atts.length > 0) loadAllAudios(atts)
 }, { immediate: true })
 // 3D models also need the auth-blob loader — <model-viewer src> doesn't carry
-// the Authorization header any more than <img>/<audio> do.
+// the Authorization header any more than <img>/<audio> do. The heavy
+// @google/model-viewer Web Component is lazy-loaded here (only when a bubble
+// actually has a 3D attachment) instead of eagerly in main.ts.
 watch(model3dAttachments, (atts) => {
-  if (atts.length > 0) loadAllModels(atts)
+  if (atts.length > 0) {
+    ensureModelViewer()
+    loadAllModels(atts)
+  }
 }, { immediate: true })
 
 // --- 时间 ---
@@ -927,11 +1082,19 @@ const segments = computed<MessageSegment[]>(() => {
       }
     }
 
-    // 去重：相同 toolName + toolArgs 的 tool_call segment 只保留第一个
+    // 去重 tool_call segment。优先用 LLM 提供的 toolCallId —— 它端到端稳定
+    // （live 流与持久化两侧都带，见 useChat handleToolCallStarted / 后端
+    // accumulator），既能正确识别"同一次调用被 live+reload 渲染两遍"（两侧
+    // toolArgs 序列化可能有空白/键序差异，用 toolName::toolArgs 会漏判 → 重复
+    // 显示，issue #521），又不会把"同名同参的多次真实调用"（如重试 shell/python）
+    // 误合并成一次。仅当没有 toolCallId（历史/遗留 segment）时才退回
+    // toolName::toolArgs。
     const seenToolCalls = new Set<string>()
     const deduped = segs.filter(seg => {
       if (seg.type !== 'tool_call') return true
-      const key = `${seg.toolName}::${seg.toolArgs || ''}`
+      const key = seg.toolCallId
+        ? `id::${seg.toolCallId}`
+        : `na::${seg.toolName}::${seg.toolArgs || ''}`
       if (seenToolCalls.has(key)) return false
       seenToolCalls.add(key)
       return true
@@ -988,6 +1151,68 @@ const useSegmentedView = computed(() =>
 )
 
 /**
+ * Total token consumption for this assistant turn, rolled up the way a
+ * multi-agent orchestrator should report it: the parent message's own usage
+ * PLUS every delegated sub-agent's usage (depth-1 delegation segments and
+ * their nested children). Returns null when nothing is known yet.
+ */
+const tokenUsage = computed(() => {
+  const m = props.message
+  if (m.role !== 'assistant') return null
+  // Base usage comes from the message, which the backend already rolls
+  // delegated sub-agent tokens into (so live and reloaded values match and there
+  // is no double counting against the segment sum below).
+  const prompt = m.promptTokens || 0
+  const output = m.completionTokens || 0
+  if (prompt + output <= 0) return null
+  const cacheRead = m.cacheReadTokens || 0
+  const cacheWrite = m.cacheWriteTokens || 0
+  const reasoning = m.reasoningTokens || 0
+  // Provider accounting differs: the native Anthropic API reports input_tokens
+  // EXCLUDING the cache read/write segments (additive), while OpenAI-compatible
+  // and DashScope responses report prompt_tokens INCLUDING cached hits.
+  const additive = (m.runtimeProvider || '').toLowerCase().includes('anthropic')
+  const input = additive ? prompt + cacheRead + cacheWrite : prompt
+  const cacheMiss = Math.max(0, input - cacheRead - cacheWrite)
+  const reply = Math.max(0, output - reasoning)
+  const hitRate = input > 0 ? cacheRead / input : 0
+  const hasCacheData = cacheRead > 0 || cacheWrite > 0
+  const total = input + output
+  // Informational breakdown for the tooltip: how much of that total came from
+  // delegated sub-agents. Derived from the delegation segments, so it is present
+  // live and degrades to 0 after reload (the segments are not persisted).
+  let delegated = 0
+  const addNodes = (nodes?: DelegationNode[]) => {
+    if (!nodes) return
+    for (const n of nodes) {
+      delegated += (n.promptTokens || 0) + (n.completionTokens || 0)
+      addNodes(n.children)
+    }
+  }
+  for (const s of segments.value) {
+    if (s.type !== 'tool_call') continue
+    delegated += (s.delegPromptTokens || 0) + (s.delegCompletionTokens || 0)
+    addNodes(s.childTimeline?.children)
+  }
+  return {
+    input, output, total, delegated: Math.min(delegated, total),
+    cacheRead, cacheWrite, cacheMiss, reasoning, reply, hitRate, hasCacheData,
+  }
+})
+
+/** Width of a cache-bar segment as a percentage of total input tokens. */
+function usageBarPct(part: number): string {
+  const u = tokenUsage.value
+  if (!u || u.input <= 0) return '0%'
+  return (part / u.input * 100).toFixed(2) + '%'
+}
+
+/** Compact token count, e.g. 67890 → "67.9k". */
+function fmtTokens(n: number): string {
+  return n >= 1000 ? (n / 1000).toFixed(1) + 'k' : String(n)
+}
+
+/**
  * Group segments by iterationIndex so each ReAct iteration renders as its own
  * thinking/tool-calls/content cluster. Falls back to a single ungrouped bucket
  * for legacy messages (no iterationIndex tagged) so historical conversations
@@ -997,32 +1222,29 @@ const useSegmentedView = computed(() =>
 const groupedIterations = computed(() => {
   const segs = segments.value || []
   const anyTagged = segs.some(s => typeof s.iterationIndex === 'number')
+  // Untagged (legacy / persisted-without-iterationIndex) messages render as a
+  // single bucket — but still in their ORIGINAL emission order, never split by
+  // type. Splitting into thinking/tool/content arrays was what made a tool box
+  // jump above or below its surrounding text depending on the message.
   if (!anyTagged) {
-    return [{
-      key: 'all',
-      index: 0,
-      empty: false,
-      thinkings: segs.filter(s => s.type === 'thinking'),
-      tools: segs.filter(s => s.type === 'tool_call'),
-      contents: segs.filter(s => s.type === 'content'),
-    }]
+    return [{ key: 'all', index: 0, empty: segs.length === 0, items: segs }]
   }
-  const buckets = new Map<number, { thinkings: MessageSegment[]; tools: MessageSegment[]; contents: MessageSegment[] }>()
+  // Group by iteration for visual separation, but keep each bucket's segments
+  // in their original array order (segments[] is already in emission order, so
+  // a tool call stays exactly where the model emitted it relative to content).
+  const buckets = new Map<number, MessageSegment[]>()
   for (const s of segs) {
     const idx = s.iterationIndex ?? 0
-    if (!buckets.has(idx)) buckets.set(idx, { thinkings: [], tools: [], contents: [] })
-    const b = buckets.get(idx)!
-    if (s.type === 'thinking') b.thinkings.push(s)
-    else if (s.type === 'tool_call') b.tools.push(s)
-    else if (s.type === 'content') b.contents.push(s)
+    if (!buckets.has(idx)) buckets.set(idx, [])
+    buckets.get(idx)!.push(s)
   }
   return [...buckets.entries()]
     .sort(([a], [b]) => a - b)
-    .map(([index, b]) => ({
+    .map(([index, items]) => ({
       key: `iter-${index}`,
       index,
-      empty: b.thinkings.length === 0 && b.tools.length === 0 && b.contents.length === 0,
-      ...b,
+      empty: items.length === 0,
+      items,
     }))
 })
 
@@ -1054,6 +1276,20 @@ const isIncomplete = computed<boolean>(() => {
 const isEvidenceInsufficient = computed<boolean>(() => {
   if (props.message.role !== 'assistant') return false
   return parsedMetadata.value?.finishReason === 'evidence_insufficient'
+})
+
+/**
+ * Backend runtime warnings for this turn (metadata.warnings) — e.g. the
+ * tool-call loop guard flagging repeated identical failures or a forced
+ * wrap-up. Strings arrive pre-localized from the backend; live streaming
+ * pushes them via the 'warning' SSE event and history reload reads the
+ * persisted metadata, so both paths converge here.
+ */
+const runtimeWarnings = computed<string[]>(() => {
+  if (props.message.role !== 'assistant') return []
+  const raw = parsedMetadata.value?.warnings
+  if (!Array.isArray(raw)) return []
+  return raw.filter((w: unknown): w is string => typeof w === 'string' && w.trim().length > 0)
 })
 
 /**
@@ -1167,7 +1403,11 @@ const executionPhaseLabel = computed(() => {
   }
   if (planMeta.value) {
     const done = planMeta.value.stepResults?.filter(r => r?.status === 'completed').length || 0
-    return `Plan-Execute (${done}/${planMeta.value.steps.length})`
+    // Guard steps: a plan payload can arrive with steps undefined (mid-stream /
+    // malformed metadata). An unguarded .length here throws during render, which
+    // blanks the whole message subtree until a full remount (page refresh) — the
+    // "chat goes blank on switch, refresh fixes it" bug. Mirror the ?. used below.
+    return `Plan-Execute (${done}/${planMeta.value.steps?.length ?? 0})`
   }
   if (toolCallsMeta.value.length) {
     const done = toolCallsMeta.value.filter(t => t.status === 'completed').length
@@ -1757,6 +1997,29 @@ watch(isGenerating, (generating) => {
   white-space: nowrap;
 }
 
+.action-tokens {
+  font-size: 11px;
+  color: var(--mc-text-tertiary, #94a3b8);
+  margin-left: 4px;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: var(--mc-fill-2, rgba(100, 116, 139, 0.08));
+  font-family: var(--mc-mono-font, ui-monospace, "SF Mono", Menlo, monospace);
+  user-select: text;
+  white-space: nowrap;
+}
+
+/* The token chip is a popover trigger button — keep the chip look, add affordance. */
+.usage-trigger {
+  border: none;
+  cursor: pointer;
+  line-height: inherit;
+}
+.usage-trigger:hover {
+  color: var(--mc-text-secondary, #64748b);
+  background: var(--mc-fill-3, rgba(100, 116, 139, 0.14));
+}
+
 .action-routing {
   font-size: 11px;
   color: var(--mc-primary, #d96d46);
@@ -1864,6 +2127,39 @@ watch(isGenerating, (generating) => {
 .error-card__retry:hover {
   background: color-mix(in srgb, var(--mc-danger) 15%, var(--mc-bg-elevated));
   border-color: color-mix(in srgb, var(--mc-danger) 50%, transparent);
+}
+
+/* ==================== 运行时警示条（循环守卫等 metadata.warnings） ==================== */
+.runtime-warnings {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 8px;
+}
+
+.runtime-warning-chip {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  padding: 6px 10px;
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--mc-warning, #d97706) 8%, var(--mc-bg-elevated));
+  border: 1px solid color-mix(in srgb, var(--mc-warning, #d97706) 25%, transparent);
+  font-size: 12px;
+  line-height: 1.5;
+  max-width: 560px;
+  color: var(--mc-text-secondary);
+}
+
+.runtime-warning-chip__icon {
+  flex-shrink: 0;
+  margin-top: 2px;
+  font-size: 13px;
+  color: var(--mc-warning, #d97706);
+}
+
+.runtime-warning-chip__text {
+  word-break: break-word;
 }
 
 /* ==================== INCOMPLETE 截断卡片（重复检测 / thinking-only 软上限） ==================== */
@@ -2179,6 +2475,16 @@ watch(isGenerating, (generating) => {
 .message-attachment__icon {
   flex-shrink: 0;
   opacity: 0.76;
+}
+
+.message-attachment__download {
+  flex-shrink: 0;
+  opacity: 0.6;
+  transition: opacity 0.15s;
+}
+
+.message-attachment__download:hover {
+  opacity: 1;
 }
 
 /* ==================== Markdown 样式 ==================== */
@@ -2507,5 +2813,110 @@ watch(isGenerating, (generating) => {
   .error-card {
     max-width: 100%;
   }
+}
+</style>
+
+<!-- Unscoped: the usage popover renders into <body> via Element Plus popper,
+     so scoped selectors can't reach it. Classes are mc-usage-* prefixed. -->
+<style>
+.mc-usage-popover.el-popover {
+  padding: 12px 14px;
+}
+.mc-usage-panel {
+  font-size: 12px;
+  color: var(--mc-text-secondary, #64748b);
+}
+.mc-usage-header {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+.mc-usage-title {
+  font-weight: 600;
+  font-size: 13px;
+  color: var(--mc-text-primary, #1e293b);
+  flex: 1;
+}
+.mc-usage-total-label {
+  color: var(--mc-text-tertiary, #94a3b8);
+}
+.mc-usage-total {
+  font-weight: 700;
+  font-family: var(--mc-mono-font, ui-monospace, "SF Mono", Menlo, monospace);
+  color: var(--mc-text-primary, #1e293b);
+}
+.mc-usage-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 0;
+}
+.mc-usage-row-main .mc-usage-label {
+  color: var(--mc-text-primary, #1e293b);
+  font-weight: 500;
+}
+.mc-usage-row-sub {
+  padding-left: 14px;
+}
+.mc-usage-label {
+  flex: 1;
+}
+.mc-usage-label-indent {
+  padding-left: 14px;
+}
+.mc-usage-value {
+  font-family: var(--mc-mono-font, ui-monospace, "SF Mono", Menlo, monospace);
+  color: var(--mc-text-primary, #1e293b);
+}
+.mc-usage-divider {
+  border-top: 1px dashed var(--mc-border-2, #e2e8f0);
+  margin: 6px 0;
+}
+.mc-usage-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 2px;
+  flex: none;
+  display: inline-block;
+}
+.mc-dot-input  { background: #3b82f6; }
+.mc-dot-output { background: #a855f7; }
+.mc-dot-hit    { background: #10b981; }
+.mc-dot-miss   { background: #f43f5e; }
+.mc-dot-write  { background: #eab308; }
+.mc-usage-hit-icon {
+  flex: none;
+  font-size: 11px;
+}
+.mc-usage-hit-rate {
+  color: #10b981;
+  font-weight: 700;
+}
+.mc-usage-bar {
+  display: flex;
+  height: 6px;
+  border-radius: 3px;
+  overflow: hidden;
+  background: var(--mc-fill-2, rgba(100, 116, 139, 0.08));
+  margin: 6px 0 6px;
+}
+.mc-usage-bar i {
+  display: block;
+  height: 100%;
+}
+.mc-bar-hit   { background: #10b981; }
+.mc-bar-write { background: #eab308; }
+.mc-bar-miss  { background: #f43f5e; }
+.mc-usage-legend {
+  display: flex;
+  gap: 12px;
+  font-size: 11px;
+  color: var(--mc-text-tertiary, #94a3b8);
+}
+.mc-usage-legend span {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
 }
 </style>
