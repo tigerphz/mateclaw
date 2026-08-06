@@ -1263,7 +1263,7 @@ class AuthServiceIntegrationTest {
     @Transactional
     void firstTimeUserCreatesPersonalWorkspace() {
         UserEntity user = authService.findOrCreateFromGateway(
-            "ceshi3", "hblocal-cloud", "测试", "test@asiainfo.com", "user");
+            "ceshi3", "hblocal-cloud", "测试", "test@qq.com", "user");
 
         // 1. 用户建好
         assertNotNull(user.getId());
@@ -1299,7 +1299,7 @@ class GatewayJwtAuthFilterTest {
         String jwt = Jwts.builder()
             .setSubject("ceshi3")
             .claim("nick_name", "测试")
-            .claim("email", "test@asiainfo.com")
+            .claim("email", "test@qq.com")
             .claim("role", "user")
             .setExpiration(new Date(System.currentTimeMillis() + 60_000))
             .signWith(SignatureAlgorithm.HS512, TEST_SECRET)
