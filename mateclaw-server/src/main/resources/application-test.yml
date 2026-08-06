@@ -13,10 +13,10 @@ spring:
     # treat the connection as utf8mb4, force the connection collation via
     # connectionCollation=utf8mb4_unicode_ci — that is what prevents the
     # `Data truncation: Incorrect string value` errors on emoji/CJK ext.
-    url: jdbc:mysql://10.30.61.23:2883/hblocal?useUnicode=true&characterEncoding=utf8&zeroDateTimeBehavior=CONVERT_TO_NULL&useSSL=true&serverTimezone=GMT%2B8
+    url:
     driver-class-name: com.mysql.cj.jdbc.Driver
-    username: ${DB_USERNAME:toptea@dbbomcgja#obbomcitsm}
-    password: ${DB_PASSWORD:Toptea!Q3e}
+    username: ${DB_USERNAME:}
+    password: ${DB_PASSWORD:}
 
   flyway:
     enabled: false

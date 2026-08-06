@@ -1,0 +1,15 @@
+spring:
+  application:
+    name: bomclaw-server
+  profiles:
+    active: @profileActive@
+  cloud:
+    nacos:
+      discovery:
+        server-addr: @nacosAddress@
+        namespace: @nacosNameSpace@
+      config:
+        server-addr: @nacosAddress@
+        namespace: @nacosNameSpace@
+        file-extension: yml
+

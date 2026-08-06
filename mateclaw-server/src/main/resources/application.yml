@@ -4,8 +4,6 @@ server:
     context-path: /
 
 spring:
-  application:
-    name: mateclaw-server
   messages:
     basename: messages
     encoding: UTF-8
@@ -16,8 +14,6 @@ spring:
   threads:
     virtual:
       enabled: true
-  profiles:
-    active: @profileActive@
 
   # 数据源（默认 H2，生产切换为 mysql 或 kingbase profile）
   datasource:

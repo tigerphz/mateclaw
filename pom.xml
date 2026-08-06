@@ -75,6 +75,9 @@
         <maven-dependency-plugin.version>3.8.1</maven-dependency-plugin.version>
         <maven-surefire-plugin.version>3.5.5</maven-surefire-plugin.version>
         <flatten-maven-plugin.version>1.7.3</flatten-maven-plugin.version>
+
+        <spring-cloud.version>2025.0.1</spring-cloud.version>
+        <spring-cloud-alibaba.version>2025.0.0.0</spring-cloud-alibaba.version>
     </properties>
 
     <dependencyManagement>
@@ -324,6 +327,22 @@
                 <artifactId>pebble</artifactId>
                 <version>${pebble.version}</version>
             </dependency>
+
+            <dependency>
+                <groupId>org.springframework.cloud</groupId>
+                <artifactId>spring-cloud-dependencies</artifactId>
+                <version>${spring-cloud.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+            <dependency>
+                <groupId>com.alibaba.cloud</groupId>
+                <artifactId>spring-cloud-alibaba-dependencies</artifactId>
+                <version>${spring-cloud-alibaba.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+
         </dependencies>
     </dependencyManagement>
 
@@ -410,36 +429,56 @@
             <id>maven-central</id>
             <name>Maven Central</name>
             <url>https://repo.maven.apache.org/maven2</url>
-            <releases><enabled>true</enabled></releases>
-            <snapshots><enabled>false</enabled></snapshots>
+            <releases>
+                <enabled>true</enabled>
+            </releases>
+            <snapshots>
+                <enabled>false</enabled>
+            </snapshots>
         </repository>
         <repository>
             <id>google-maven-central</id>
             <name>Google Maven Central Mirror</name>
             <url>https://maven-central.storage-download.googleapis.com/maven2</url>
-            <releases><enabled>true</enabled></releases>
-            <snapshots><enabled>false</enabled></snapshots>
+            <releases>
+                <enabled>true</enabled>
+            </releases>
+            <snapshots>
+                <enabled>false</enabled>
+            </snapshots>
         </repository>
         <repository>
             <id>aliyun-public</id>
             <name>Aliyun Public</name>
             <url>https://maven.aliyun.com/repository/public</url>
-            <releases><enabled>true</enabled></releases>
-            <snapshots><enabled>false</enabled></snapshots>
+            <releases>
+                <enabled>true</enabled>
+            </releases>
+            <snapshots>
+                <enabled>false</enabled>
+            </snapshots>
         </repository>
         <repository>
             <id>spring-milestones</id>
             <name>Spring Milestones</name>
             <url>https://repo.spring.io/milestone</url>
-            <releases><enabled>true</enabled></releases>
-            <snapshots><enabled>false</enabled></snapshots>
+            <releases>
+                <enabled>true</enabled>
+            </releases>
+            <snapshots>
+                <enabled>false</enabled>
+            </snapshots>
         </repository>
         <repository>
             <id>aliyun-spring</id>
             <name>Aliyun Spring Mirror</name>
             <url>https://maven.aliyun.com/repository/spring</url>
-            <releases><enabled>true</enabled></releases>
-            <snapshots><enabled>false</enabled></snapshots>
+            <releases>
+                <enabled>true</enabled>
+            </releases>
+            <snapshots>
+                <enabled>false</enabled>
+            </snapshots>
         </repository>
     </repositories>
 
@@ -449,59 +488,73 @@
             <id>maven-central</id>
             <name>Maven Central</name>
             <url>https://repo.maven.apache.org/maven2</url>
-            <releases><enabled>true</enabled></releases>
-            <snapshots><enabled>false</enabled></snapshots>
+            <releases>
+                <enabled>true</enabled>
+            </releases>
+            <snapshots>
+                <enabled>false</enabled>
+            </snapshots>
         </pluginRepository>
         <pluginRepository>
             <id>google-maven-central</id>
             <name>Google Maven Central Mirror</name>
             <url>https://maven-central.storage-download.googleapis.com/maven2</url>
-            <releases><enabled>true</enabled></releases>
-            <snapshots><enabled>false</enabled></snapshots>
+            <releases>
+                <enabled>true</enabled>
+            </releases>
+            <snapshots>
+                <enabled>false</enabled>
+            </snapshots>
         </pluginRepository>
         <pluginRepository>
             <id>aliyun-public</id>
             <name>Aliyun Public</name>
             <url>https://maven.aliyun.com/repository/public</url>
-            <releases><enabled>true</enabled></releases>
-            <snapshots><enabled>false</enabled></snapshots>
+            <releases>
+                <enabled>true</enabled>
+            </releases>
+            <snapshots>
+                <enabled>false</enabled>
+            </snapshots>
         </pluginRepository>
     </pluginRepositories>
 
     <!-- Optional profile for faster Maven resolution from mainland China. -->
-<!--    <profiles>-->
-<!--        <profile>-->
-<!--            <id>aliyun-first</id>-->
-<!--            <repositories>-->
-<!--                <repository>-->
-<!--                    <id>aliyun-public-first</id>-->
-<!--                    <url>https://maven.aliyun.com/repository/public</url>-->
-<!--                    <releases><enabled>true</enabled></releases>-->
-<!--                    <snapshots><enabled>false</enabled></snapshots>-->
-<!--                </repository>-->
-<!--                <repository>-->
-<!--                    <id>aliyun-spring-first</id>-->
-<!--                    <url>https://maven.aliyun.com/repository/spring</url>-->
-<!--                    <releases><enabled>true</enabled></releases>-->
-<!--                    <snapshots><enabled>false</enabled></snapshots>-->
-<!--                </repository>-->
-<!--            </repositories>-->
-<!--            <pluginRepositories>-->
-<!--                <pluginRepository>-->
-<!--                    <id>aliyun-public-first</id>-->
-<!--                    <url>https://maven.aliyun.com/repository/public</url>-->
-<!--                    <releases><enabled>true</enabled></releases>-->
-<!--                    <snapshots><enabled>false</enabled></snapshots>-->
-<!--                </pluginRepository>-->
-<!--            </pluginRepositories>-->
-<!--        </profile>-->
-<!--    </profiles>-->
+    <!--    <profiles>-->
+    <!--        <profile>-->
+    <!--            <id>aliyun-first</id>-->
+    <!--            <repositories>-->
+    <!--                <repository>-->
+    <!--                    <id>aliyun-public-first</id>-->
+    <!--                    <url>https://maven.aliyun.com/repository/public</url>-->
+    <!--                    <releases><enabled>true</enabled></releases>-->
+    <!--                    <snapshots><enabled>false</enabled></snapshots>-->
+    <!--                </repository>-->
+    <!--                <repository>-->
+    <!--                    <id>aliyun-spring-first</id>-->
+    <!--                    <url>https://maven.aliyun.com/repository/spring</url>-->
+    <!--                    <releases><enabled>true</enabled></releases>-->
+    <!--                    <snapshots><enabled>false</enabled></snapshots>-->
+    <!--                </repository>-->
+    <!--            </repositories>-->
+    <!--            <pluginRepositories>-->
+    <!--                <pluginRepository>-->
+    <!--                    <id>aliyun-public-first</id>-->
+    <!--                    <url>https://maven.aliyun.com/repository/public</url>-->
+    <!--                    <releases><enabled>true</enabled></releases>-->
+    <!--                    <snapshots><enabled>false</enabled></snapshots>-->
+    <!--                </pluginRepository>-->
+    <!--            </pluginRepositories>-->
+    <!--        </profile>-->
+    <!--    </profiles>-->
 
     <profiles>
         <profile>
             <id>dev</id>
             <properties>
                 <profileActive>dev</profileActive>
+                <nacosNameSpace>1587d7dc-0e2b-4837-875c-430c3bcbff4f</nacosNameSpace>
+                <nacosAddress>192.168.164.163:8848</nacosAddress>
             </properties>
             <activation>
                 <activeByDefault>true</activeByDefault>
@@ -511,12 +564,16 @@
             <id>test</id>
             <properties>
                 <profileActive>test</profileActive>
+                <nacosNameSpace>42b87381-1763-48da-a2e7-4cf02b8553fe</nacosNameSpace>
+                <nacosAddress>10.30.61.25:8848</nacosAddress>
             </properties>
         </profile>
         <profile>
             <id>prod</id>
             <properties>
                 <profileActive>prod</profileActive>
+                <nacosNameSpace>42b87381-1763-48da-a2e7-4cf02b8553fe</nacosNameSpace>
+                <nacosAddress>10.25.11.212:8848</nacosAddress>
             </properties>
         </profile>
     </profiles>
