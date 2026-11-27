@@ -20,7 +20,7 @@ spring:
     virtual:
       enabled: true
   profiles:
-    active: dev
+    active: @profileActive@
 
   # 数据源（默认 H2，生产切换为 mysql 或 kingbase profile）
   datasource:
