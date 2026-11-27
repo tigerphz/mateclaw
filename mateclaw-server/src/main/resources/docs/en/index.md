@@ -4,7 +4,7 @@ layout: home
 hero:
   name: MateClaw
   text: The personal AI your IT department can actually sign off on.
-  tagline: Other personal AI agents are built for one person. MateClaw is built for a team — multi-user workspaces, approval-gated sensitive actions, full audit trail, production-grade health monitoring. One JAR on your own machine. Zero data egress.
+  tagline: Other personal AI agents are built for one person. MateClaw is built for a team — multi-user workspaces, approval-gated sensitive actions, full audit trail, production-grade health monitoring. One self-hosted JAR; you control persisted data and outbound integration boundaries.
   image:
     src: /logo.png
     alt: MateClaw
@@ -18,14 +18,26 @@ hero:
     - theme: alt
       text: GitHub
       link: https://github.com/mateaix/mateclaw
+    - theme: alt
+      text: 3.1.0 Release Notes
+      link: /en/releases/3.1.0
 
 features:
+  - icon: ⚙️
+    title: 3.1.0 — Skill governance and execution reliability
+    details: Withdraw individual lessons, preview restores, edit memory precisely and quote answers into follow-ups. Improve context/media recovery, tool results, Wiki citations and channel delivery. Current dependencies are Boot 4.1.2, Spring AI 2.0.2 and AgentScope 2.0.5.
+  - icon: ✅
+    title: 2.3.0 — Managed JSON acceptance
+    details: Users select required top-level fields; the server binds checks to current requirements and immutable JSON versions. Execution evidence defaults to observation, and ordinary artifact diagnostics do not replace acceptance bindings.
+  - icon: ⚙️
+    title: Employee runtimes, not one Agent loop
+    details: 2.2.0 uses a shared Runtime Contract to decouple employee identity from execution. Native and DeepSeek Harness share conversations, workspaces, tool governance, and event projection; durable Goals recover across requests and backend restarts, while A2A connects external agents.
   - icon: 🧑‍💼
     title: Digital employees, not chatbots
-    details: You hire coworkers, not a chat box. Each one has a role, a goal, a backstory, a pixel-art avatar, and a color of their own — five career templates ship ready to use. ReAct + Plan-and-Execute, parallel delegation between employees.
+    details: You hire coworkers, not a chat box. Each one has a role, a goal, a backstory, a pixel-art avatar, and a color of their own — six built-in templates ship ready to use. ReAct + Plan-and-Execute, parallel delegation between employees.
   - icon: 🤝
     title: Teams, not lone wolves
-    details: Build a team — the lead breaks a goal into tasks on a shared board, members execute in parallel, dependencies orchestrate themselves, prerequisite results hand off automatically, and settled work announces back for synthesis. Leases, cancel-interrupt, approval gates, deliverables and timelines — as of 2.0.0, a crew works around one board.
+    details: One team request becomes one Team Run — objective, task DAG, worker execution, final synthesis, and deliverables stay together. Chat delivers, Agents observes, and Teams governs; 2.2.0 further hardens checkpoint recovery and deliverable completion gates.
   - icon: 🧩
     title: Skills are the skeleton, not a plugin
     details: One SKILL.md plus one LESSONS.md that grows with use. Eight starter templates, a five-step creation wizard, pre-flight checks before install. MCP and ACP bridges — even Claude Code and Codex show up as employees.

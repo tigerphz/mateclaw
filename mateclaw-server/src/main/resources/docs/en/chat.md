@@ -1,5 +1,11 @@
 # Chat & Messaging
 
+## 3.1.0: quote answers and inspect run outcomes
+
+Select body text within a completed answer and use the quote action to add it to a follow-up draft while preserving existing draft text. Browser titles and favicons reflect conversation run status.
+
+Shell records show command intent and actual execution outcomes. Nonzero exits, timeouts and cancellations are not presented as successful, including historical records. Output-limited answers retain incomplete status, and stopping generation preserves token usage already reported by the provider.
+
 Chat is where you actually work. Everything else in MateClaw — agents, tools, memory, wiki, channels — exists so that what happens inside this box can be good.
 
 This page is about what that box actually does. Not the REST endpoint. Not the SSE event schema. What you see, what it does for you, and why the interaction design is what it is. (The API part is at the bottom for integrators who need it.)
@@ -48,6 +54,10 @@ Long tasks (multi-step plans, multi-agent collaboration) used to mean scrolling 
 - **Live sub-agent status** — delegated sub-agents render as a live **tree**: name, tools called, running / completed / error / stalled state; multi-level delegation expands layer by layer.
 
 The rail **collapses to a badged strip**; below 1280px it degrades to a **floating drawer** so it never squeezes the conversation column. It's pure frontend with zero new endpoints, reusing the existing SSE event stream — so the delegation tree still appears inline in the message too; the rail just lifts the "current / active" overview into a persistent place.
+
+::: tip Observing long tasks
+Run Overview is a live projection of SSE events, not the authoritative async-task store. After a refresh, reconnect, or for a background delegation started earlier, a child may be temporarily absent from the tree; confirm terminal state with `taskOutput(taskId)` from the spawning conversation. Running `progress` may also remain at 0 and jump directly to 100 at termination, so use tool calls, plan checklists, and final artifacts to judge actual completion.
+:::
 
 ---
 
@@ -112,7 +122,8 @@ Images, audio/video and 3D models always previewed inline — but a Word report 
 - **Click to preview**: pdf / docx / xlsx / html / markdown / txt / code files open in a glass-styled preview layer from the attachment card — uploaded and AI-generated alike.
 - **Pure client-side rendering**: PDF, Word and Excel parse and render in the browser — nothing leaves your machine, no external preview service, the single-JAR and desktop packaging story is unchanged.
 - **Server fallback for the stubborn formats**: pptx and legacy binary Office (doc / xls / ppt) are converted to PDF server-side before preview; if the converter (LibreOffice) isn't present, they degrade gracefully to download — no error, no hang.
-- **Safe HTML preview**: rendered in a sandboxed iframe — interactive pages and charts fully work (scripts run), but the iframe sits in an opaque origin and cannot read the app's login state or local storage.
+- **In-chat HTML preview**: HTML fetched with authorization is rendered in an opaque-origin sandboxed iframe. Scripts are allowed to support interactive pages and charts; app same-origin privileges are not granted. This does not guarantee compatibility with every script, network resource, or browser.
+- **Direct generated-file viewing**: opening an HTML/SVG response from `/api/v1/files/generated/{id}` uses a stricter policy: scripts and forms are blocked, with permitted static styles and media retained. Use the in-chat HTML preview for pages that depend on JavaScript; these two viewing paths have different policies.
 
 ### Primary model can't see images? "Multimodal sidecar" routing
 
@@ -237,10 +248,10 @@ Two global shortcuts let you jump between conversations without touching the mou
 
 | Shortcut | Action |
 |----------|--------|
-| `Ctrl/Cmd + K` | Open the employee picker to jump to any chat |
-| `Ctrl/Cmd + N` | Start a new conversation |
+| `Alt + K` | Open the employee picker to jump to any chat |
+| `Alt + N` | Start a new conversation |
 
-`Ctrl+N` does not fire while you're typing in an input or textarea — its native behavior is left alone.
+`Alt+K` and `Alt+N` do not fire while you're typing in an input or textarea — their native behavior is left alone.
 
 ### Session Admin page
 
@@ -259,7 +270,7 @@ This page exists for the "lots of conversations" case:
 ### Shared employee picker
 
 ::: tip Added in 1.4.0
-A single shared picker dialog is reused in three places: the sidebar, the `Ctrl+K` shortcut, and the new-conversation modal.
+A single shared picker dialog is reused in three places: the sidebar, the `Alt+K` shortcut, and the new-conversation modal.
 :::
 
 All three entry points open the **same dialog** with identical behavior. Agent icons inside it are **color-coded per employee**, so in a multi-employee workspace you can tell who's who at a glance.
@@ -386,9 +397,32 @@ curl -X DELETE http://localhost:18088/api/v1/conversations/conv-abc123 \
 
 ---
 
+## Thinking visibility and linear trajectories (2.1.0+)
+
+2.1.0 turns thinking from one ambiguous block into segments ordered by execution:
+
+- inline `<think>` content is extracted live and kept separate from the final answer;
+- each ReAct iteration stays where it occurred, so tool calls and observations do not drift into the next round;
+- wall-clock start/end times produce real duration and phase feedback;
+- Workspace admins use “Show thinking” to control rendering and “Show all iterations” to switch between every round and only the answer-producing round;
+- `mate.agent.reasoning.retention=all|terminal` controls server-side persistence;
+- a conversation owner can request `GET /api/v1/conversations/{conversationId}/trajectory` for a plain-text export of user input, reasoning, tool calls, observations, and the final answer in execution order. Durations come from segment bounds and appear in the UI; the current text export does not include them.
+
+Provisional narration before a tool call becomes `superseded` when real output arrives. The current chat UI renders it inline, while trajectory output preserves it with `content superseded="true"`. Intermediate Team Run announcements fold into the run card instead of becoming repeated final replies.
+
+### Batch conversation deletion
+
+Sessions can batch-delete up to 200 selected conversations. The server deduplicates ids, checks ownership per item, and deletes only conversations the current user may operate. `team_worker` conversations stay out of the normal sidebar, so they do not appear in sidebar batch selection.
+
+---
+
 ## Next
 
 - [Agents](./agents) — what's actually doing the thinking
 - [Memory](./memory) — what persists across conversations
 - [Channels](./channels) — every other place chat can happen
 - [LLM Wiki](./wiki) — what the agent can read while answering
+
+## Structured tool results (3.0.0)
+
+Structured MCP results are displayed separately below the final answer. Ordinary tool output is not automatically appended to answer text; call IDs and structured content remain in streaming events and history. Images resolve from conversation storage and directory attachments retain directory information.

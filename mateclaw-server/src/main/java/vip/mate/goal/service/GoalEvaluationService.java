@@ -6,10 +6,15 @@ import org.springframework.ai.chat.messages.Message;
 import org.springframework.ai.chat.messages.SystemMessage;
 import org.springframework.ai.chat.messages.UserMessage;
 import org.springframework.ai.chat.model.ChatModel;
+import org.springframework.ai.chat.metadata.FinishReasonCategory;
 import org.springframework.ai.chat.model.ChatResponse;
 import org.springframework.ai.chat.prompt.ChatOptions;
 import org.springframework.ai.chat.prompt.Prompt;
 import org.springframework.ai.converter.BeanOutputConverter;
+import tools.jackson.core.StreamReadFeature;
+import tools.jackson.databind.DeserializationFeature;
+import tools.jackson.databind.cfg.EnumFeature;
+import tools.jackson.databind.json.JsonMapper;
 import org.springframework.ai.evaluation.EvaluationRequest;
 import org.springframework.ai.evaluation.EvaluationResponse;
 import org.springframework.ai.evaluation.Evaluator;
@@ -64,12 +69,20 @@ public class GoalEvaluationService implements Evaluator {
 
     /**
      * Token budget for the evaluator response. Reasoning-mode models consume
-     * a chunk of this on internal thinking before emitting JSON; 2000 leaves
-     * comfort for the reasoning trace plus the small object we need.
+     * internal thinking before emitting JSON. Keep the old limit in OFF/managed
+     * flows; ordinary enabled goals need bounded headroom after observed LENGTH exits.
      */
     private static final int MAX_OUTPUT_TOKENS = 2000;
+    private static final int ENABLED_OUTPUT_TOKENS = 4096;
+    private vip.mate.decision.config.DecisionProperties decisionProperties;
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    public void setDecisionProperties(vip.mate.decision.config.DecisionProperties properties) {
+        this.decisionProperties = properties;
+    }
+
     private static final int MAX_CONVERSATION_CHARS = 6_000;
     private static final int MAX_TERMINAL_ANSWER_CHARS = 4_000;
+    private static final int MAX_SUCCESS_CHECK_CHARS = 4_000;
     private static final int MIN_BOOTSTRAP_CRITERIA = 1;
     private static final int MAX_BOOTSTRAP_CRITERIA = 8;
     /** Skip-retry template — the goal node has its own try/catch. */
@@ -80,10 +93,8 @@ public class GoalEvaluationService implements Evaluator {
     private final ProviderChatModelFactory chatModelFactory;
     private final ObjectMapper objectMapper;
 
-    private final BeanOutputConverter<GoalCriteriaDraft> draftConverter =
-            new BeanOutputConverter<>(GoalCriteriaDraft.class);
-    private final BeanOutputConverter<GoalChecklistVerdict> verdictConverter =
-            new BeanOutputConverter<>(GoalChecklistVerdict.class);
+    private final BeanOutputConverter<GoalCriteriaDraft> draftConverter;
+    private final BeanOutputConverter<GoalChecklistVerdict> verdictConverter;
 
     public GoalEvaluationService(GoalProperties properties,
                                  ModelConfigService modelConfigService,
@@ -93,6 +104,18 @@ public class GoalEvaluationService implements Evaluator {
         this.modelConfigService = modelConfigService;
         this.chatModelFactory = chatModelFactory;
         this.objectMapper = objectMapper;
+        // Preserve converter tolerance for extra fields, but never silently
+        // choose the last value of an ambiguous model-produced JSON key.
+        // The AI2 converter owns a Jackson3 boundary; stored application data remains Jackson2.
+        JsonMapper evaluatorJson = JsonMapper.builder()
+                .disable(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES)
+                .disable(DeserializationFeature.FAIL_ON_NULL_FOR_PRIMITIVES)
+                .enable(EnumFeature.READ_UNKNOWN_ENUM_VALUES_AS_NULL)
+                .enable(DeserializationFeature.FAIL_ON_TRAILING_TOKENS)
+                .enable(StreamReadFeature.STRICT_DUPLICATE_DETECTION)
+                .build();
+        this.draftConverter = new BeanOutputConverter<>(GoalCriteriaDraft.class, evaluatorJson);
+        this.verdictConverter = new BeanOutputConverter<>(GoalChecklistVerdict.class, evaluatorJson);
     }
 
     /**
@@ -122,6 +145,7 @@ public class GoalEvaluationService implements Evaluator {
 
         List<GoalCriterion> existing = GoalCriteriaCodec.parse(goal.getCriteria(), objectMapper);
         boolean bootstrap = existing.isEmpty();
+        long evaluationRevision = goal.getEvaluationRevision();
 
         long start = System.currentTimeMillis();
         try {
@@ -131,31 +155,50 @@ public class GoalEvaluationService implements Evaluator {
                     + "\n\n" + format;
 
             List<Message> messages = new ArrayList<>(2);
-            messages.add(new SystemMessage(bootstrap ? BOOTSTRAP_SYSTEM_PROMPT : VERDICT_SYSTEM_PROMPT));
+            messages.add(new SystemMessage(bootstrap ? BOOTSTRAP_SYSTEM_PROMPT
+                    : Boolean.TRUE.equals(goal.getPersistentExecution())
+                            ? PERSISTENT_VERDICT_SYSTEM_PROMPT : VERDICT_SYSTEM_PROMPT));
             messages.add(new UserMessage(userPrompt));
 
             ChatOptions options = ChatOptions.builder()
                     .temperature(0.1)
-                    .maxTokens(MAX_OUTPUT_TOKENS)
+                    .maxTokens(decisionProperties != null && !goal.isJsonAcceptanceRequired()
+                            && decisionProperties.modeFor(vip.mate.decision.api.DecisionType.GOAL_CONTINUATION)
+                                != vip.mate.decision.api.DecisionMode.OFF
+                            ? ENABLED_OUTPUT_TOKENS : MAX_OUTPUT_TOKENS)
                     .build();
 
             ChatResponse response = chatModel.call(new Prompt(messages, options));
             long elapsed = System.currentTimeMillis() - start;
 
+            if (response != null && response.getResult() != null) {
+                FinishReasonCategory category = response.getResult().getMetadata().getFinishReasonCategory();
+                if (category == FinishReasonCategory.TRUNCATED || category == FinishReasonCategory.FILTERED
+                        || category == FinishReasonCategory.TOOL_CALL) {
+                    return GoalEvaluationResult.fallbackAfterCall("incomplete_response", model.getModelName(), elapsed)
+                            .withEvaluationRevision(evaluationRevision);
+                }
+            }
             String body = extractText(response);
             if (body == null || body.isBlank()) {
-                log.warn("[GoalEvaluation] empty response from evaluator model={}", model.getModelName());
+                log.warn("[GoalEvaluation] empty response: model={}, finishReason={}, totalTokens={}, elapsedMs={}",
+                        model.getModelName(),
+                        response == null || response.getResult() == null ? null : response.getResult().getMetadata().getFinishReason(),
+                        response == null || response.getMetadata() == null || response.getMetadata().getUsage() == null
+                                ? null : response.getMetadata().getUsage().getTotalTokens(), elapsed);
                 // The call was really spent — bill it.
-                return GoalEvaluationResult.fallbackAfterCall("empty_response", model.getModelName(), elapsed);
+                return GoalEvaluationResult.fallbackAfterCall("empty_response", model.getModelName(), elapsed)
+                        .withEvaluationRevision(evaluationRevision);
             }
 
-            return bootstrap
+            return (bootstrap
                     ? parseBootstrap(body, model.getModelName(), elapsed)
-                    : parseVerdict(body, existing, model.getModelName(), elapsed);
+                    : parseVerdict(body, existing, model.getModelName(), elapsed))
+                    .withEvaluationRevision(evaluationRevision);
         } catch (Throwable t) {
             long elapsed = System.currentTimeMillis() - start;
             log.warn("[GoalEvaluation] evaluator call failed after {}ms: {}", elapsed, t.toString());
-            return GoalEvaluationResult.fallback("call_failed");
+            return GoalEvaluationResult.fallback("call_failed").withEvaluationRevision(evaluationRevision);
         }
     }
 
@@ -219,6 +262,18 @@ public class GoalEvaluationService implements Evaluator {
                     + "'all requirements met'. If a criterion lacks specific evidence, "
                     + "mark it not passed. Output only the requested JSON.";
 
+    private static final String PERSISTENT_VERDICT_SYSTEM_PROMPT =
+            "Judge cumulative progress toward a persistent goal using the latest reply, "
+                    + "conversation evidence and previously verified checklist evidence. "
+                    + "A later step need not repeat completed earlier work. Preserve a prior "
+                    + "passed=true item with nonblank evidence unless new concrete evidence contradicts it. "
+                    + "Revoke it when such contradictory evidence exists, citing that evidence. "
+                    + "An attempted action, a goal description or a claim of completion is not proof. "
+                    + "Newly passed criteria require concrete observable evidence. Return only changed "
+                    + "criterion verdicts; omitted criteria retain their previous state. Return at most one "
+                    + "verdict per criterion id. Keep evidence concise. "
+                    + "Output only the requested JSON.";
+
     private String buildUserPrompt(GoalEntity goal,
                                    List<GoalCriterion> existing,
                                    List<? extends Message> recentMessages,
@@ -234,10 +289,26 @@ public class GoalEvaluationService implements Evaluator {
         }
         sb.append('\n');
 
+        String guidance = goal.getSuccessCheckPrompt();
+        if (guidance != null && !guidance.isBlank()) {
+            sb.append("Goal-specific success-check guidance (within the checklist evidence and JSON output rules):\n");
+            sb.append(guidance, 0, Math.min(guidance.length(), MAX_SUCCESS_CHECK_CHARS));
+            if (guidance.length() > MAX_SUCCESS_CHECK_CHARS) {
+                sb.append("\n[success-check guidance truncated]");
+            }
+            sb.append("\n\n");
+        }
+
         if (!bootstrap) {
             sb.append("Current checklist (judge each by id):\n");
             for (GoalCriterion c : existing) {
                 sb.append("- ").append(c.id()).append(": ").append(c.text()).append('\n');
+                if (Boolean.TRUE.equals(goal.getPersistentExecution())) {
+                    String evidence = safe(c.evidence());
+                    sb.append("  Previous passed=").append(c.passed()).append("; evidence: ")
+                            .append(evidence.length() > 1000 ? evidence.substring(0, 1000) + " [truncated]" : evidence)
+                            .append('\n');
+                }
             }
             sb.append('\n');
         }
@@ -263,6 +334,10 @@ public class GoalEvaluationService implements Evaluator {
               .append(MAX_BOOTSTRAP_CRITERIA)
               .append(" criteria. Leave every 'passed' false and 'evidence' empty — "
                       + "this round only defines the checklist.");
+        } else if (Boolean.TRUE.equals(goal.getPersistentExecution())) {
+            sb.append("Return only changed criteria with specific evidence. Preserve verified prior work "
+                    + "unless new evidence contradicts it; absence from the latest reply is not a contradiction. "
+                    + "Never treat passed=true without nonblank evidence as verified completion.");
         } else {
             sb.append("For every criterion above, return its id with passed=true ONLY when "
                     + "the reply shows concrete evidence; otherwise passed=false with a short "
@@ -383,15 +458,8 @@ public class GoalEvaluationService implements Evaluator {
         if (text != null && !text.isBlank()) {
             return text;
         }
-        // Fallback for reasoning models that emit everything as reasoningContent
-        // and leave the regular content empty; the JSON often tails the trace.
-        var metadata = output.getMetadata();
-        if (metadata != null) {
-            Object rc = metadata.get("reasoningContent");
-            if (rc instanceof String s && !s.isBlank()) {
-                return s;
-            }
-        }
+        String reasoning = vip.mate.llm.chatmodel.AssistantMessageParts.reasoningText(output);
+        if (reasoning != null && !reasoning.isBlank()) return reasoning;
         return text;
     }
 

@@ -1,5 +1,12 @@
 <div align="center">
 
+> **3.1.0 stable release · 2026-11-19**. Java 21 / Spring Boot 4.1.2 / Spring AI 2.0.2 / AgentScope Java 2.0.5.
+> Reviewable skill lessons, snapshot restore previews, precise memory edits, clearer chat status and more reliable model/tool execution.
+> **dev (3.2.0-SNAPSHOT)**: Java 21 / Spring Boot 4.2.0 / Spring AI 2.1.0 / AgentScope Java 2.0.5.
+
+> [3.1.0 release notes](mateclaw-server/src/main/resources/docs/en/changelog.md) · [Version history](CHANGELOG.md) · [Downloads](https://github.com/mateaix/mateclaw/releases)
+
+
 <p align="center">
   <img src="mateclaw-ui/public/logo/mateclaw_logo_s.png" alt="MateClaw Logo" width="120">
 </p>
@@ -8,14 +15,14 @@
 
 <p align="center"><b>Your second brain</b></p>
 
-<p align="center"><sub><b>Agent Harness · Spring Boot inside · One JAR to ship</b></sub></p>
+<p align="center"><sub><b>Pluggable Agent Runtime · Native + DSH · Spring Boot inside</b></sub></p>
 
 [![GitHub Repo](https://img.shields.io/badge/GitHub-Repo-black.svg?logo=github)](https://github.com/mateaix/mateclaw)
 [![Documentation](https://img.shields.io/badge/Docs-Website-green.svg?logo=readthedocs&label=Docs)](https://claw.mate.vip/docs)
 [![Live Demo](https://img.shields.io/badge/Demo-Online-orange.svg?logo=vercel&label=Demo)](https://claw-demo.mate.vip)
 [![Website](https://img.shields.io/badge/Website-claw.mate.vip-blue.svg?logo=googlechrome&label=Site)](https://claw.mate.vip)
 [![Java Version](https://img.shields.io/badge/Java-21+-blue.svg?logo=openjdk&label=Java)](https://adoptium.net/)
-[![Spring Boot](https://img.shields.io/badge/Spring%20Boot-3.5-brightgreen.svg?logo=springboot)](https://spring.io/projects/spring-boot)
+[![Spring Boot](https://img.shields.io/badge/Spring%20Boot-4.2.0-brightgreen.svg?logo=springboot)](https://spring.io/projects/spring-boot)
 [![Vue](https://img.shields.io/badge/Vue-3-4FC08D.svg?logo=vuedotjs)](https://vuejs.org/)
 [![Last Commit](https://img.shields.io/github/last-commit/mateaix/mateclaw)](https://github.com/mateaix/mateclaw)
 [![License](https://img.shields.io/badge/license-Apache--2.0-red.svg?logo=opensourceinitiative&label=License)](LICENSE)
@@ -30,17 +37,46 @@
 
 ---
 
+> **3.1.0 — Reviewable skills and more reliable execution.** Review or withdraw individual lessons, inspect a snapshot restore before applying it, and quote selected answers into follow-up drafts. Model context recovery, tool outcomes, Wiki citations and channel delivery are hardened. [Release and upgrade notes](https://claw.mate.vip/docs/en/releases/3.1.0).
+
+---
+
 > **Other personal AI agents are built for one person. MateClaw is the one your IT department can actually sign off on.**
 >
-> Multi-user workspaces. Approval-gated sensitive actions. Full audit trail. Spring Boot Actuator health monitoring. Per-channel error isolation so one chat platform's outage doesn't take down the rest. One JAR on your own machine, zero data egress.
+> Multi-user workspaces. Approval-gated sensitive actions. Full audit trail. Spring Boot Actuator health monitoring. Per-channel error isolation so one chat platform's outage doesn't take down the rest. One JAR in your environment; you control persisted data, and task content is sent only to model, channel, or tool services you explicitly configure.
 >
-> **And underneath, a real agent harness.** ReAct + Plan-and-Execute on a StateGraph runtime — not a one-shot RAG call dressed up. Tools, Skills, MCP, and ACP converge on one registry with per-employee binding. Sensitive tool calls flow through an approval gate you can actually inspect. Multi-vendor failover keeps the loop running when a provider doesn't.
+> **And underneath, a real Agent Runtime.** An employee is no longer welded to one reasoning loop. Choose the native AgentScope runtime for ReAct, Plan-and-Execute, Goals, and Team Runs, or run DeepSeek Harness as a managed external loop over SDK JSON-RPC. Both paths converge on the same conversations, workspace boundaries, Tool Guard, event projection, and lifecycle controls.
 
 Most AI tools die when their vendor has a bad day. Most forget you the moment the tab closes. Most give you a chatbox and call it a product.
 
-**MateClaw is the whole widget.** One deployment. Reasoning, knowledge, memory, tools, channels — built together, not bolted on. And when your primary model goes down, the next one picks up mid-sentence.
+**MateClaw is the whole widget.** One deployment. Reasoning, knowledge, memory, tools, channels — built together, not bolted on. And when your primary model is unavailable, the next healthy provider retries the current request.
 
 ---
+
+## On dev: reusable employees and governed teams
+
+The following additions are on `dev` / `3.2.0-SNAPSHOT`; they are not part of the published 3.1.0 release:
+
+- **Save an employee as a template:** capture a native employee's configuration in a workspace snapshot, select shared configuration documents, and recruit another employee under a new name. Inheritance, explicit opt-outs, and selected bindings are preserved; custom recruitment checks dependencies before creation. The six built-in templates retain their existing behavior. [Employee templates](mateclaw-server/src/main/resources/docs/en/agents.md)
+- **Opt-in coordinator mode:** in **Teams → team → Members**, workspace admins can make a native lead focus on dispatch, follow-up, and synthesis. Team-board handoff remains available; generic delegation, business tools, and provider-native search are restricted without overwriting saved capability bindings. [Team coordination](mateclaw-server/src/main/resources/docs/en/teams.md)
+- **Chat with a team:** start a fresh lead conversation directly from its team card or detail page. The action respects chat access and lead availability.
+- **Task briefings and member mentions:** new tasks save the objective, description, acceptance criteria, and constraints for reuse on retries. Lead chats show member roles and status; `@` expresses a preference while delegation stays on the task board.
+- **Roster protection:** unfinished tasks block member removal and employee/team deletion. A lead cannot be deleted until its team is deleted. One employee belongs to one team at a time, including paused teams; removed or deleted assignees cannot be retried from failed history.
+
+Workspace snapshots currently support native employees in the same workspace, not DSH cloning or cross-workspace export. See [Unreleased changes](CHANGELOG.md#unreleased) for upgrade notes.
+
+## What changes in 3.1.0
+
+Changes since [3.0.0](https://claw.mate.vip/docs/en/releases/3.0.0), grouped by what you can use:
+
+- **Skills and memory:** review and withdraw individual lessons, preview snapshot restoration, install skills asynchronously with cancellation, and preserve exact memory sections without cross-conversation edits.
+- **Chat and tool visibility:** quote selected answer text into follow-up drafts; see conversation status in the browser title and favicon, command-intent titles, actual shell failures and accurate stopped-run token usage.
+- **More reliable execution:** recover context overflow and oversized historical media, validate model parameters before saving, bound provider concurrency, preserve timeout overrides, and cap cumulative team-dispatch budgets.
+- **Knowledge and documents:** extract entities from one Wiki source, reconcile citations across retrievals, continue reasoning after document generation, and preserve Markdown table values, file newline styles and binary skill attachments.
+- **Channels and DSH:** split long DingTalk Markdown, validate delivery acknowledgements and preserve Feishu attachment names. DSH `0.2.2-rc.1` is an optional Node.js 24.9+ (24.x) candidate; the default remains `0.2.0-rc.1`.
+- **Current stack:** Spring Boot **4.2.0**, Spring AI **2.1.0**, AgentScope Java **2.0.5** and MyBatis Plus **3.5.18.1**. Native ReAct and plan-step loops retain MateClaw's approvals, permissions, Goal acceptance and persistence.
+
+Use Java 21 for source builds. Back up the database, workspace, plugins and configuration before migration; use that backup for rollback. [Architecture and upgrade notes](mateclaw-server/src/main/resources/docs/en/changelog.md) · [Model budget rules](mateclaw-server/src/main/resources/docs/en/models.md)
 
 ## Three things that make it different
 
@@ -48,7 +84,7 @@ Most AI tools die when their vendor has a bad day. Most forget you the moment th
 
 Primary key expired. Vendor returns 401. Network blip. Quota drained.
 
-Other tools hand you a red error card. MateClaw routes to the next healthy provider — DashScope, OpenAI, Anthropic, Gemini, DeepSeek, Kimi, Ollama, LM Studio, MLX, 14+ in total — and the user sees the reply finish. A provider health tracker parks bad vendors in a cooldown window so they don't waste seconds on every turn.
+Other tools hand you a red error card. MateClaw tries the next healthy provider in configured order — including built-in and OpenAI-compatible options such as DashScope, OpenAI, Anthropic, Gemini, DeepSeek, Kimi, Ollama, LM Studio, and MLX — and attempts to recover the current request. It returns an error only when the available chain is exhausted. A provider health tracker parks bad vendors in a cooldown window so they don't waste seconds on every turn.
 
 You don't write a retry script. You drag providers into priority order in **Settings → Models** and watch the health dashboard fill with green dots as requests route around failures in real time.
 
@@ -56,7 +92,7 @@ You don't write a retry script. You drag providers into priority order in **Sett
 
 Upload a PDF, a batch of markdown, a scraped page — raw material in.
 
-MateClaw's **LLM Wiki** digests it into structured pages, builds `[[links]]` between them, and remembers where every sentence came from. Click a citation, see the exact source chunk. Ask a question, the page you get is stitched from the right chunks — with references you can verify.
+MateClaw's **LLM Wiki** digests it into structured pages, builds `[[links]]` between them, and preserves traceable citations for generated content. Open the citation drawer to inspect the corresponding source chunk and verify page or answer references.
 
 This is the difference between a warehouse and a library.
 
@@ -79,10 +115,20 @@ Same brain. Same memory. Same tools. Different doors.
 ## What's in the box
 
 ### Digital employees, not chatbots
-You hire coworkers, not chat boxes. Each one has a **Role**, a **Goal**, a **Backstory**, a pixel-art avatar, and a color of their own — five career templates ship ready (Product Researcher · Customer Support · Knowledge Curator · Data Analyst · Executive Assistant). **ReAct** drives iterative reasoning, **Plan-and-Execute** decomposes complex multi-step work, employees can delegate to one another in parallel. Dynamic context pruning, smart truncation, stale-stream cleanup — the boring stuff that makes long conversations actually work.
+You hire coworkers, not chat boxes. Each one has a **Role**, a **Goal**, a **Backstory**, a runtime, a pixel-art avatar, and a color of their own — six built-in templates ship ready (General Assistant · Product Assistant · Research Analyst · Customer Support · Data Analyst · Code Reviewer). Employee identity and governance stay stable even when the execution engine changes.
 
-### Agent Teams (2.0.0+)
-One lead, a crew of employees, one **shared task board**. Tell the lead a goal and it breaks the goal into tasks on the board (`blockedBy` declares dependencies); the dispatch engine hands tasks to members in parallel, prerequisite results hand off to downstream tasks automatically, and settled results are announced back to the lead for synthesis. Execution leases + heartbeats eliminate double execution, **cancel actually interrupts** a running member session, and sensitive tasks park at `in_review` for a human. Deliverables (docx / pptx / xlsx / pdf) register on tasks for download, timelines record everything, and you can jump into any member's child conversation to watch it execute word by word. A Plan-Execute lead hands its **whole plan over to the board** — a lead that can plan turns planning into orchestration.
+### Agent Runtime: native or DSH (2.2.0+)
+The `AgentRuntimeProvider` contract separates an employee from the engine that runs its turn. The **native runtime** keeps ReAct, Plan-and-Execute, persistent Goals, and Team Runs inside MateClaw. The **DSH runtime** launches the official `dsh --profile sdk` CLI and normalizes its thinking, text, tools, usage, completion, and cancellation events. Managed installation pins `0.2.0-rc.1` (alternative: `0.1.7-rc.2`) with reviewed npm locks and Node.js 22/24. The additional opt-in `0.2.2-rc.1` candidate requires Node.js 24.9+ (24.x), restores file observation guards, and binds configured model capacities. An opt-in `0.2.1-rc.2` candidate adds SDK compatibility updates; macOS arm64 installation, handshake and short real-model/tool checks passed, while default selection stays unchanged. Upgrades copy runtime homes, check the candidate, and switch a retained generation; rollback restores the previous home/configuration without merging newer sessions. Package and real-model adapter checks passed on macOS arm64; Linux x64 and persisted V3→V4 history migration remain unverified. [Configure DeepSeek Harness →](https://claw.mate.vip/docs/en/deepseek-harness)
+
+### Durable long tasks: checkpoint, restart, continue (2.2.0+)
+Persistent Goals turn work that takes hours into bounded, recoverable segments. The database preserves the goal checklist, continuation state, attempts, cooldowns, leases, and user input accepted while the worker is busy. After a single backend instance restarts, the supervisor reconciles the interrupted attempt, reads persisted checkpoints and artifacts, and schedules the next safe segment instead of asking you to repeat the task.
+
+For file-producing work, ask the employee to keep a progress ledger, append small verifiable units, inspect the existing tail after recovery, and complete the Goal only after reproducible acceptance checks pass. The runtime does not promise exactly-once behavior for arbitrary external side effects; payments, sends, publishes, and destructive calls still need provider idempotency or review. [Run and verify durable Goals →](https://claw.mate.vip/docs/en/goals)
+
+> Prompt pattern: “Create a persistent Goal first. Save the plan and progress in the workspace, write in small checkpoints, resume from existing evidence after errors or restart, and call `completeGoal` only after every criterion has verifiable evidence.”
+
+### Team Runs (2.1.0+)
+One request, one durable **Team Run**. A stable `runId` links the user's objective, task DAG, worker executions, final synthesis, and deliverables. Chat is the outcome surface, Agents Live groups the workers for real-time observation, and Teams owns history and governance — all three consume the same server projection. Worker conversations no longer flood the normal sidebar; summaries and files lead, while tasks, evidence, approvals, and read-only worker records drill down on demand. Underneath, the 2.0 shared board still provides dependency orchestration, parallel dispatch, prerequisite hand-off, execution leases, cancel-interrupt, and human approval gates.
 
 ### Knowledge & memory
 - **LLM Wiki** — raw materials digest into linked pages with citations; the **hot cache** auto-injects into every employee's system prompt. **Transformations engine** (1.3.0+) turns the Wiki from a search index into a processing pipeline
@@ -90,7 +136,7 @@ One lead, a crew of employees, one **shared task board**. Tell the lead a goal a
 - **Memory lifecycle** — post-conversation extraction, scheduled consolidation, Dreaming workflows. Workflows can also write directly into an employee's `MEMORY.md` via the `write_memory` step
 
 ### Skills · MCP · ACP — three ways to extend capability
-- **SKILL.md packages** — manifest + prompt + tool list + **LESSONS.md (gets smarter the more you use it)**. Eight starter templates plus a five-step creation wizard, with **Pre-flight checks** that tell you what's missing before install
+- **SKILL.md packages** — manifest + prompt + tool list + **LESSONS.md**. In 2.1, reflection and cross-session recurring-request mining can produce reusable improvements; routine promotion, constrained auto-binding, curator handover/governance, origin policy, snapshots, and restore points keep evolution observable, workspace-scoped, and reversible. Eight starter templates plus a five-step creation wizard, with **Pre-flight checks** before install
 - **MCP** — stdio / SSE / Streamable HTTP, plug into any external tool server. **Per-employee binding** (1.3.0+) means a tool you install for one employee doesn't bleed into another's toolbox
 - **ACP** — bring top-tier coding agents like Claude Code and Codex in as employees, auto-bridged to skill cards with wrapper tools
 - **Tool Guard** — RBAC + approval flow + path protection. Capability needs boundaries
@@ -101,7 +147,7 @@ One lead, a crew of employees, one **shared task board**. Tell the lead a goal a
 - **Wiki Transformations** — Wiki stops being retrieval-only. User-authored templates run against raw materials or existing pages, with cross-material map-reduce aggregation, reverse-citation extraction, JSON output mode, and per-template model picker
 
 ### You see what every employee is doing
-**Admin Runtime Console** (`Settings → System → Runtime`) — who's running, what step they're on, how many tokens, one-click force-recycle when stuck. Streaming is staged honestly (thinking / tool / answer), per-event SSE IDs make reconnects safe, multi-employee delegation no longer fights itself, long tasks demand evidence-grounded answers.
+**Admin Runtime Console** (`Settings → System → Runtime`) — who's running, which runtime provider owns the turn, what step it is on, how many tokens it uses, and one-click force-recycle when stuck. Native and DSH events enter the same thinking / tool / answer projection; completion, failure, usage, and cancellation retain consistent lifecycle semantics. Per-event SSE IDs make reconnects safe, and Team Runs group member work under one live execution.
 
 ### Multimodal creation
 Text-to-speech · Speech-to-text · Image · Music · Video · 3D. First-class, not add-ons. **Sidecar routing** (1.3.0+) means a text-only main model + an image attachment no longer dead-ends — a configured vision model describes the image, and the main model answers. **Image edit** lands too: refer to an earlier conversation attachment by `msg:<id>:<idx>` and ask the model to recolor or restyle it. Four **document-generation tools** (`DocxRenderTool` / `XlsxRenderTool` / `PptxRenderTool` / `PdfRenderTool`) render Markdown straight to Office files inside the JVM — no subprocess, no Office install.
@@ -110,15 +156,15 @@ Text-to-speech · Speech-to-text · Image · Music · Video · 3D. First-class, 
 A flagship *scene*, not a tool — a seeded "Content Studio" employee turns one sentence into a publishable post: pick-topic → research → draft → illustrate → **de-AI** → lay out → deliver. **WeChat Official Account (公众号)** articles land in your draft box as inline-style HTML with body images uploaded into WeChat; **Xiaohongshu (小红书)** notes package as ≥3 vertical 3:4 cards with an online preview. De-AI-ification runs against a **measurable AI-trace score**; every delivery is compliance-scanned and logged to a **content calendar** that dedups by topic fingerprint.
 
 ### Enterprise-ready
-RBAC + JWT. **Personal Access Tokens** for headless scripts and CI. **HMAC-SHA-256 outbound webhook signing**. **Distributed Cron lock** so multi-instance deployments don't double-fire. Full audit trail. Flyway-managed schema that auto-heals on upgrade. One JAR to ship. MySQL in production, H2 for dev — nothing to change in your code.
+RBAC + JWT. **Personal Access Tokens** for headless scripts and CI. **HMAC-SHA-256 outbound webhook signing**. **Distributed Cron lock** so multi-instance deployments don't double-fire. Full audit trail. Flyway-managed schema. One JAR to ship. H2 for development; the public Docker stack defaults to PostgreSQL 16, the MySQL profile remains supported, and the Kingbase driver is opt-in.
 
 ---
 
 ## AI is becoming infrastructure
 
-On March 2, 2026, Claude went dark for 4 hours across API, web, and mobile. Three weeks later, another 5 hours. Every company that bet their AI strategy on a single vendor spent those outages staring at red error cards.
+Model providers rate-limit, networks fail, keys expire, and services become temporarily unavailable. Betting every AI capability on one provider turns an upstream incident into your own outage.
 
-This is the same shift databases went through around 2010 and cloud went through around 2018: the winning layer stops being tied to one supplier. **57% of companies now run AI agents in production.** None of them want one vendor's bad day to become their bad day.
+Once AI enters production, the stable layer should not be tied to one model supplier or one Agent loop. MateClaw absorbs model uncertainty through provider priorities, health tracking, cooldown, and failover, then places native and external execution engines behind one governed Agent Runtime contract.
 
 **MateClaw is that layer — built the Spring Boot way.**
 
@@ -138,7 +184,7 @@ This is the same shift databases went through around 2010 and cloud went through
 
 **OpenClaw and Hermes Agent are excellent personal AI platforms** — pick either if you're running one user on one laptop, building your own agent from CLI, and treating everything as config files to hand-tune. Both have bigger communities than MateClaw today.
 
-**MateClaw is the version built for teams.** RBAC per digital employee, per model, per tool. An approval flow that pauses risky actions for review. Full audit trail. The Admin Runtime Console gives one operator real-time visibility into 50 employees running across 14 vendors — stuck? force-recycle in one click. Spring Boot inside — drop-in for any Java shop already running production services.
+**MateClaw is the version built for teams.** Digital employees, models, and tools sit behind permissions and workspace boundaries. Approval flows can pause risky actions for review, and key operations enter the audit trail. The Admin Runtime Console centralizes active employee and provider state with force-recycle for stuck runs. Spring Boot inside — a natural fit for Java shops already running production services.
 
 Same "whole widget" philosophy. Different center of gravity.
 
@@ -148,20 +194,31 @@ Same "whole widget" philosophy. Different center of gravity.
 
 ```bash
 # Backend
-cd mateclaw-server
-mvn spring-boot:run           # http://localhost:18088
+# Java 21 and Maven required. Create a local JWT secret once and reuse it on restart.
+[ -f .env.local ] || (umask 077; printf 'JWT_SECRET=%s\n' "$(openssl rand -hex 48)" > .env.local)
+set -a
+source .env.local
+set +a
+# From the repository root; use its configured models and workspace
+mvn -pl mateclaw-plugin-api -am install -DskipTests
+SPRING_DATASOURCE_URL="jdbc:h2:file:$PWD/data/mateclaw;MODE=MySQL;DATABASE_TO_LOWER=TRUE;CASE_INSENSITIVE_IDENTIFIERS=TRUE" \
+MATECLAW_WORKSPACE_SANDBOX_ROOT="$PWD/data/workspace" \
+mvn -pl mateclaw-server spring-boot:run  # http://localhost:18088
 
-# Frontend
+# Frontend (new terminal, from the repository root)
 cd mateclaw-ui
-pnpm install && pnpm dev      # http://localhost:5173
+npm install && npm run dev -- --host 127.0.0.1    # http://localhost:5173
 ```
 
-Login: `admin` / `admin123`
+On a fresh database, log in with `admin` / `admin123`, change the password, then configure a model in **Settings → Models**. Existing model settings are read from the root `data/` database; starting against `mateclaw-server/data/` opens a different database. Keep `.env.local` private and set a non-empty `JWT_SECRET` of at least 32 UTF-8 bytes.
+
+For contribution branches and PRs, use `dev`; `main` tracks stable releases. [User manual](https://claw.mate.vip/docs/en/user-guide) · [Deployment and upgrades](https://claw.mate.vip/docs/en/docker-deploy).
 
 ### Docker
 
 ```bash
 cp .env.example .env
+# Edit .env: set JWT_SECRET and replace both database example passwords.
 docker compose up -d          # http://localhost:18080
 ```
 
@@ -190,11 +247,14 @@ Download from [GitHub Releases](https://github.com/mateaix/mateclaw/releases). B
 
 ```
 mateclaw/
-├── mateclaw-server/        Spring Boot 3.5 backend (Spring AI Alibaba, StateGraph runtime)
+├── mateclaw-server/        Spring Boot 4.2.0 backend (Agent Runtime contract, native AgentScope + DSH)
 ├── mateclaw-ui/            Vue 3 + TypeScript admin SPA (built into the server JAR)
+├── mateclaw-desktop/       Electron desktop app (local-embedded / remote-centralized)
 ├── mateclaw-webchat/       Embeddable chat widget (UMD / ES bundles)
 ├── mateclaw-plugin-api/    Java SDK for third-party capability plugins
 ├── mateclaw-plugin-sample/ Reference plugin implementation
+├── mateclaw-plugin-mem0/   Optional Mem0 memory-provider plugin
+├── mateclaw-plugin-search-sample/ Search Provider SPI example
 ├── docker-compose.yml
 └── .env.example
 ```
@@ -205,11 +265,11 @@ Desktop binaries ship via [GitHub Releases](https://github.com/mateaix/mateclaw/
 
 | Layer | Technology |
 |---|---|
-| Backend | Spring Boot 3.5 · Spring AI Alibaba 1.1 · MyBatis Plus · Flyway |
-| Digital Employee Runtime | StateGraph · ReAct + Plan-Execute · Role / Goal / Backstory · LESSONS self-evolution · Team task board (2.0.0+) |
+| Backend | Spring Boot 4.2.0 · Spring AI 2.1.0 · AgentScope Java 2.0.5 · MyBatis Plus · Flyway |
+| Agent Runtime | `AgentRuntimeProvider` contract · Native AgentScope (ReAct + Plan-Execute) · managed DSH JSON-RPC runtime · normalized events / lifecycle / usage · Tool Guard |
 | Orchestration | Workflow (7 step modes · Pebble DSL) · Triggers (6 pattern types · event governance) · Wiki Transformations (1.3.0+) |
 | Capability Extension | SKILL.md packages · MCP (stdio / SSE / HTTP · per-agent binding) · ACP bridge (Claude Code / Codex) |
-| Database | H2 (dev) · MySQL 8.0+ (prod) |
+| Database | H2 (dev) · PostgreSQL 16 (Docker default) · MySQL 8.0+ (supported) · Kingbase (opt-in driver) |
 | Auth | Spring Security + JWT |
 | Frontend | Vue 3 · TypeScript · Vite · Element Plus · TailwindCSS 4 |
 | Desktop | Electron · electron-updater · JRE 21 (bundled) |
@@ -221,9 +281,43 @@ Desktop binaries ship via [GitHub Releases](https://github.com/mateaix/mateclaw/
 
 Full docs at **[claw.mate.vip/docs](https://claw.mate.vip/docs)** — setup, architecture, each subsystem, API reference.
 
-## Roadmap
+## Release history
 
-**v2.0.0 (shipped 2026-07-26)** — from "one person who gets things done" to "a team that collaborates": **Agent Teams** become a standing roster around a shared task board:
+**v3.1.0 (released) · 2026-11-19** — skill lesson governance, restore previews, precise memory editing, conversation status, and model/tool/context reliability. [3.1.0 notes](https://claw.mate.vip/docs/en/releases/3.1.0).
+
+**v3.0.0 · 2026-10-26** — Java 21, Boot 4, Spring AI 2 and native AgentScope execution architecture. [3.0.0 notes](https://claw.mate.vip/docs/en/releases/3.0.0).
+
+**v2.3.0 (released 2026-09-20) — JSON acceptance and execution evidence for persistent Goals.** Users can configure required JSON fields and bind checks to current requirements and immutable artifact versions. This release also adds controlled worker intervention and skill document/folder uploads, with fixes for DSH history and output budgets, vLLM reasoning, and SSE framing.
+
+- **Managed JSON acceptance**: users select required fields; the server stores immutable JSON versions, binds checks to requirement revisions and slot generations, and rechecks them at Goal completion.
+- **Execution evidence**: observe mode records execution and artifacts by default; on-demand version and JSON field diagnostics do not establish Goal acceptance.
+- **Worker intervention**: handle worker tool approvals, denial, and feedback from team details while retaining conversation governance and exclusive execution.
+- **Skill uploads**: upload documents, binary files, and folders with directory structure preserved; each file is limited to 10 MiB.
+- **Reliability fixes**: bounded DSH history/output tokens, vLLM thinking control, SSE line-ending support, bounded spreadsheet extraction, and tool timeouts.
+
+[↗ v2.3.0](https://claw.mate.vip/docs/en/releases/2.3.0)
+
+**v2.2.0 (shipped 2026-08-29)** — from one built-in reasoning loop to **a pluggable and recoverable Agent Runtime**:
+
+- **Runtime contract** — provider registry, session factory, capability validation, normalized event stream, lifecycle, usage, and UI projection decouple employees from execution engines
+- **DeepSeek Harness runtime** — managed installation and configuration, authenticated JSON-RPC process bridge, Cordis composition, cancellable streaming, isolated child environment, and host-governed tool dispatch
+- **Durable long work** — bounded Goal segments, persisted continuation and input queues, attempts, cooldown, retry, leases, restart recovery, and explicit pause / resume semantics
+- **Agent interoperability** — inbound and outbound A2A with Agent Cards, JSON-RPC / SSE tasks, authentication, idempotency, and guarded network boundaries
+- **Runtime hardening** — tighter workspace ownership, reliable Team Run recovery and deliverable gates, plus consistent long-form output and input handling across approval, stop, and recovery
+
+Full story in the [v2.2.0 release notes](https://claw.mate.vip/docs/en/releases/2.2.0).
+
+**v2.1.0 (shipped 2026-08-15)** — from “a board full of tasks” to **one governable team run**:
+
+- **Unified Team Runs** — one `runId` links request, task DAG, worker conversations, events, final synthesis, and deliverables; Chat delivers outcomes, Agents observes live work, Teams governs history
+- **Closed skill evolution** — reflection + recurring-request mining + promotion + constrained auto-binding + curator governance + snapshots/restore, conservative by default and isolated per workspace
+- **Replayable execution** — live `<think>` extraction, every reasoning iteration in emission order with real duration, superseded narration, and linear trajectory export
+- **Capabilities reach operations** — proactive IM push, targeted Cron delivery, model-specific context windows, progressive tool disclosure, and tool-backed action completion
+- **Reliability pass** — hardened browser refs/navigation/waits, WebChat/SSE cleanup and upstream idle timeout, Feishu progress, Qwen3-ASR HTTP, batch session deletion, date-partitioned files, and safe 64-bit ids
+
+Full story in the [v2.1.0 release notes](https://claw.mate.vip/docs/en/releases/2.1.0).
+
+**v2.0.0 (shipped 2026-07-31)** — from "one person who gets things done" to "a team that collaborates": **Agent Teams** become a standing roster around a shared task board:
 
 - **Agent teams and a shared task board** — teams / roles (lead · member · reviewer), an eight-status kanban, `blockedBy` dependency orchestration, member-level parallel dispatch, automatic prerequisite hand-off, settled results waking the lead; the Teams page ships an event-driven live board + activity banner + task timelines + deliverable downloads + manual task creation
 - **An execution chain hardened for long tasks** — execution leases + runtime heartbeats against double execution, cancel that actually interrupts, `in_review` approval gates, retry for failed/stale
@@ -270,12 +364,7 @@ Full story in the [v1.7.0 release notes](https://claw.mate.vip/docs/en/releases/
 
 ## Contributing
 
-```bash
-git clone https://github.com/mateaix/mateclaw.git
-cd mateclaw
-cd mateclaw-server && mvn clean compile
-cd ../mateclaw-ui && pnpm install && pnpm dev
-```
+Fork or clone the repository, follow [Quick start](#quick-start), then see the [contribution guide](mateclaw-server/src/main/resources/docs/en/contributing.md) for code conventions and checks.
 
 ---
 

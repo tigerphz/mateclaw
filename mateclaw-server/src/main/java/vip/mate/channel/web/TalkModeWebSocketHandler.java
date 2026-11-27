@@ -16,6 +16,7 @@ import vip.mate.tts.TtsService;
 import vip.mate.workspace.conversation.ConversationService;
 
 import java.io.IOException;
+import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -105,7 +106,10 @@ public class TalkModeWebSocketHandler extends AbstractWebSocketHandler {
             return;
         }
 
-        byte[] audioData = message.getPayload().array();
+        // Respect the ByteBuffer's position/limit. Calling array() can include
+        // unrelated capacity bytes when a WebSocket container hands us a
+        // sliced or pooled buffer, corrupting the WAV data URL sent to STT.
+        byte[] audioData = copyPayload(message.getPayload());
         log.info("[TalkMode] Received audio: {} bytes", audioData.length);
 
         // 异步处理：STT -> Agent -> TTS
@@ -142,13 +146,15 @@ public class TalkModeWebSocketHandler extends AbstractWebSocketHandler {
             Long talkWsId = talkAgent != null ? talkAgent.getWorkspaceId() : 1L;
             conversationService.getOrCreateConversation(
                     talkSession.conversationId, talkSession.agentId, talkSession.username, talkWsId);
-            conversationService.saveMessage(talkSession.conversationId, "user", transcript, List.of());
+            var savedUser = conversationService.saveMessage(
+                    talkSession.conversationId, "user", transcript, List.of());
 
             // 5. Agent 对话（同步）。Carry the voice user's identity so per-owner
             // memory recall (read) and the post-turn memory write (below) agree
             // on the same owner key.
             vip.mate.agent.context.ChatOrigin talkOrigin = vip.mate.agent.context.ChatOrigin.web(
-                    talkSession.conversationId, talkSession.username, talkWsId, null);
+                    talkSession.conversationId, talkSession.username, talkWsId, null)
+                    .withOriginMessageId(savedUser == null ? null : savedUser.getId());
             AgentService.ChatResult chatResult = agentService.chatWithUsage(
                     talkSession.agentId, transcript, talkSession.conversationId, talkOrigin);
             String reply = chatResult.content();
@@ -224,5 +230,13 @@ public class TalkModeWebSocketHandler extends AbstractWebSocketHandler {
         if (session.isOpen()) {
             session.sendMessage(new TextMessage(objectMapper.writeValueAsString(data)));
         }
+    }
+
+    /** Copy exactly the readable WebSocket payload, independent of backing-array capacity/offset. */
+    static byte[] copyPayload(ByteBuffer source) {
+        ByteBuffer payload = source.slice();
+        byte[] audioData = new byte[payload.remaining()];
+        payload.get(audioData);
+        return audioData;
     }
 }

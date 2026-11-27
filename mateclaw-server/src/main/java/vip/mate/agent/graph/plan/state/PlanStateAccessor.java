@@ -1,6 +1,6 @@
 package vip.mate.agent.graph.plan.state;
 
-import com.alibaba.cloud.ai.graph.OverAllState;
+import vip.mate.agent.runtime.state.RunState;
 import org.springframework.ai.chat.messages.Message;
 import vip.mate.agent.GraphEventPublisher;
 import vip.mate.agent.graph.NodeStreamingChatHelper;
@@ -20,9 +20,9 @@ import static vip.mate.agent.graph.plan.state.PlanStateKeys.*;
  */
 public final class PlanStateAccessor {
 
-    private final OverAllState state;
+    private final RunState state;
 
-    public PlanStateAccessor(OverAllState state) {
+    public PlanStateAccessor(RunState state) {
         this.state = Objects.requireNonNull(state, "state must not be null");
     }
 
@@ -94,6 +94,10 @@ public final class PlanStateAccessor {
         return state.value(FINAL_SUMMARY_THINKING, "");
     }
 
+    public String planThinking() {
+        return state.value(PLAN_THINKING, "");
+    }
+
     public String currentStepThinking() {
         return state.value(CURRENT_STEP_THINKING, "");
     }
@@ -134,6 +138,11 @@ public final class PlanStateAccessor {
 
     public String workingContext() {
         return state.value(WORKING_CONTEXT, "");
+    }
+
+    @SuppressWarnings("unchecked")
+    public Set<String> loadedSkills() {
+        return state.<Set<String>>value(MateClawStateKeys.LOADED_SKILLS).orElse(Set.of());
     }
 
     // ===== 输出构建器 =====
@@ -225,6 +234,10 @@ public final class PlanStateAccessor {
             return put(FINAL_SUMMARY_THINKING, thinking);
         }
 
+        public OutputBuilder planThinking(String thinking) {
+            return put(PLAN_THINKING, thinking);
+        }
+
         public OutputBuilder currentStepThinking(String thinking) {
             return put(CURRENT_STEP_THINKING, thinking);
         }
@@ -243,6 +256,10 @@ public final class PlanStateAccessor {
             return put(MateClawStateKeys.PENDING_EVENTS, events);
         }
 
+        public OutputBuilder loadedSkills(Set<String> names) {
+            return put(MateClawStateKeys.LOADED_SKILLS, names);
+        }
+
         // ---- 阶段标记（写入共享键 MateClawStateKeys.CURRENT_PHASE）----
         public OutputBuilder currentPhase(String phase) {
             return put(MateClawStateKeys.CURRENT_PHASE, phase);
@@ -251,7 +268,7 @@ public final class PlanStateAccessor {
         // ---- Token Usage（写入共享键）----
 
         /** 将本次 LLM 调用的 usage 累加到 state 已有值上 */
-        public OutputBuilder mergeUsage(OverAllState currentState,
+        public OutputBuilder mergeUsage(RunState currentState,
                                         NodeStreamingChatHelper.StreamResult result) {
             int existingPrompt = currentState.value(MateClawStateKeys.PROMPT_TOKENS, 0);
             int existingCompletion = currentState.value(MateClawStateKeys.COMPLETION_TOKENS, 0);
@@ -272,7 +289,7 @@ public final class PlanStateAccessor {
          * 将一个 step 的累计 usage（含 cache / reasoning 分项）加到 state 已有值上。
          * StepExecutionNode 在多个出口路径上写回同一组键，统一走这里避免漏项。
          */
-        public OutputBuilder addStepUsage(OverAllState currentState,
+        public OutputBuilder addStepUsage(RunState currentState,
                                           int promptTokens, int completionTokens,
                                           int cacheReadTokens, int cacheWriteTokens,
                                           int reasoningTokens) {

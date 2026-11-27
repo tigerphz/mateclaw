@@ -143,6 +143,26 @@
         @select="handleSkillSelect"
         @close="handleSlashClose"
       />
+      <div
+        v-if="mentionActive"
+        id="team-mention-list"
+        role="listbox"
+        :aria-label="t('chatTeam.members')"
+        class="team-mention-list"
+      >
+        <button
+          v-for="(member, index) in mentionMatches"
+          :id="`team-mention-${index}`"
+          :key="member.agentId"
+          type="button"
+          role="option"
+          :aria-selected="index === mentionIndex"
+          @mousedown.prevent
+          @click="insertMemberMention(member)"
+        >
+          {{ member.name }}
+        </button>
+      </div>
       <textarea
         ref="textareaRef"
         v-model="inputValue"
@@ -157,7 +177,14 @@
         @compositionend="isComposing = false"
         @focus="onTextareaFocus"
         @blur="onTextareaBlur"
-        @input="autoResize"
+        :aria-expanded="mentionActive"
+        :aria-controls="mentionActive ? 'team-mention-list' : undefined"
+        :aria-activedescendant="
+          mentionActive ? `team-mention-${mentionIndex}` : undefined
+        "
+        @click="updateMentionCursor"
+        @keyup="handleMentionCursorKeyup"
+        @input="handleTextInput"
         @paste="handlePaste"
       ></textarea>
 
@@ -204,11 +231,13 @@
           type="button"
           class="action-btn send-btn"
           :class="sendBtnClass"
-          :disabled="!canSend && !loading"
+          :disabled="props.streamPhase === 'interrupting' || (!canSend && !loading)"
+          :title="sendButtonTitle"
           @click="handleSubmit"
         >
           <!-- 有输入时始终显示发送图标（运行中发送 = interrupt） -->
-          <el-icon v-if="canSend"><Promotion /></el-icon>
+          <el-icon v-if="props.streamPhase === 'interrupting'" class="stop-spinner"><Loading /></el-icon>
+          <el-icon v-else-if="canSend"><Promotion /></el-icon>
           <!-- 运行中无输入：停止图标 -->
           <el-icon v-else-if="loading"><CloseBold /></el-icon>
           <!-- 空闲无输入 -->
@@ -220,7 +249,10 @@
 
     <!-- 底部信息 -->
     <div class="input-footer">
-      <span class="input-hint">{{ hint }}</span>
+      <span class="input-footer__left">
+        <span class="input-hint">{{ hint }}</span>
+        <span v-if="runtimeActionHint" class="input-action-hint">{{ runtimeActionHint }}</span>
+      </span>
       <span v-if="maxLength" class="input-length">
         {{ inputValue.length }}/{{ maxLength }}
       </span>
@@ -241,12 +273,18 @@
 <script setup lang="ts">
 import { ref, computed, nextTick, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
-import { ArrowDown, CloseBold, MagicStick, Microphone, Paperclip, Promotion, Select, Timer, WarningFilled } from '@element-plus/icons-vue'
+import { ArrowDown, CloseBold, Loading, MagicStick, Microphone, Paperclip, Promotion, Select, Timer, WarningFilled } from '@element-plus/icons-vue'
 import { useToolLabel } from '@/composables/useToolLabel'
 import SkillSlashMenu from '@/components/chat/SkillSlashMenu.vue'
 import type { ChatAttachment, PendingApprovalMeta, StreamPhase, QueuedMessage, Skill } from '@/types'
 
+export interface MemberCandidate {
+  agentId: string
+  name: string
+  enabled?: boolean | null
+}
 interface Props {
+  memberCandidates?: MemberCandidate[]
   /** 输入值 */
   modelValue?: string
   /** 占位符 */
@@ -293,6 +331,7 @@ interface Props {
 }
 
 const props = withDefaults(defineProps<Props>(), {
+  memberCandidates: () => [],
   modelValue: '',
   placeholder: '',
   loading: false,
@@ -371,6 +410,76 @@ const fileInputRef = ref<HTMLInputElement | null>(null)
 const isFocused = ref(false)
 const isComposing = ref(false)
 
+const mentionCursor = ref(0),
+  mentionIndex = ref(0),
+  mentionDismissed = ref(false)
+const mentionHandledEvents = new WeakSet<KeyboardEvent>()
+const mentionMatch = computed(() =>
+  /(?:^|\s)@([^@\n]*)$/.exec(props.modelValue.slice(0, mentionCursor.value)),
+)
+const mentionMatches = computed(() =>
+  props.memberCandidates.filter(
+    (m) =>
+      m.enabled === true &&
+      m.name
+        .toLocaleLowerCase()
+        .includes((mentionMatch.value?.[1] || '').toLocaleLowerCase()),
+  ),
+)
+const mentionActive = computed(
+  () =>
+    !!mentionMatch.value &&
+    !mentionDismissed.value &&
+    !!mentionMatches.value.length &&
+    !props.disabled &&
+    !props.pendingApproval,
+)
+function handleTextInput() { updateMentionCursor(); autoResize() }
+function handleMentionCursorKeyup(event: KeyboardEvent) {
+  if (['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key))
+    updateMentionCursor()
+}
+function updateMentionCursor() {
+  mentionCursor.value =
+    textareaRef.value?.selectionStart ?? props.modelValue.length
+  mentionDismissed.value = false
+  mentionIndex.value = 0
+}
+function insertMemberMention(member: MemberCandidate) {
+  if (
+    props.disabled ||
+    props.pendingApproval ||
+    !props.memberCandidates.some(
+      (m) => m.agentId === member.agentId && m.enabled === true,
+    )
+  )
+    return
+  const el = textareaRef.value,
+    cursor = el?.selectionStart ?? props.modelValue.length
+  const match = /(?:^|\s)@([^@\n]*)$/.exec(props.modelValue.slice(0, cursor))
+  const start = match ? cursor - match[1]!.length - 1 : cursor
+  const token = `@${member.name} (agentId: ${member.agentId}) `
+  inputValue.value =
+    props.modelValue.slice(0, start) +
+    token +
+    props.modelValue.slice(el?.selectionEnd ?? cursor)
+  mentionDismissed.value = true
+  nextTick(() => {
+    el?.focus()
+    el?.setSelectionRange(start + token.length, start + token.length)
+    mentionCursor.value = start + token.length
+    autoResize()
+  })
+}
+watch(
+  () =>
+    props.memberCandidates.map((m) => `${m.agentId}:${m.enabled}`).join(','),
+  () => {
+    mentionDismissed.value = true
+    mentionIndex.value = 0
+  },
+)
+
 // ---- Skill slash-command menu ----
 // The menu opens when the whole input is a single "/<query>" token (no spaces
 // yet). Picking a skill rewrites the input to a directive that names the skill,
@@ -396,6 +505,25 @@ watch(slashMatch, (val) => {
 })
 
 function handleSlashKeydown(e: KeyboardEvent) {
+  if (isComposing.value || e.isComposing || e.keyCode === 229) return
+  if (mentionActive.value && !(e.key === 'Enter' && (e.shiftKey || e.ctrlKey || e.metaKey || e.altKey))) {
+    if (['ArrowDown', 'ArrowUp', 'Enter', 'Tab', 'Escape'].includes(e.key)) {
+      e.preventDefault()
+      if (e.key === 'Escape') mentionDismissed.value = true
+      else if (e.key === 'ArrowDown')
+        mentionIndex.value =
+          (mentionIndex.value + 1) % mentionMatches.value.length
+      else if (e.key === 'ArrowUp')
+        mentionIndex.value =
+          (mentionIndex.value + mentionMatches.value.length - 1) %
+          mentionMatches.value.length
+      else {
+        if (e.key === 'Enter') mentionHandledEvents.add(e)
+        insertMemberMention(mentionMatches.value[mentionIndex.value]!)
+      }
+      return
+    }
+  }
   if (!slashActive.value) return
   const menu = slashMenuRef.value
   if (!menu) return
@@ -449,11 +577,14 @@ function handleSkillSelect(skill: Skill) {
 function onTextareaBlur(e: FocusEvent) {
   isFocused.value = false
   const next = e.relatedTarget as HTMLElement | null
+  if (next?.closest('.team-mention-list')) return
   if (next && next.closest && next.closest('.skill-slash-menu')) return
   setTimeout(() => {
     const ae = document.activeElement as HTMLElement | null
     if (ae && ae.closest && ae.closest('.skill-slash-menu')) return
+    if (ae?.closest('.team-mention-list')) return
     slashDismissed.value = true
+    mentionDismissed.value = true
   }, 0)
 }
 
@@ -489,6 +620,7 @@ const canSend = computed(() => {
 
 // 运行中输入的占位符
 const inputPlaceholder = computed(() => {
+  if (props.streamPhase === 'interrupting') return t('chat.streamInterrupting')
   if (props.loading) {
     if (props.queuedMessage) return t('chat.queuedReplace')
     return props.placeholder
@@ -496,8 +628,20 @@ const inputPlaceholder = computed(() => {
   return props.placeholder
 })
 
+const runtimeActionHint = computed(() => {
+  if (props.streamPhase === 'interrupting') return t('chat.streamInterrupting')
+  if (!props.loading) return ''
+  if (props.queuedMessage && !canSend.value) return t('chat.streamQueuedWaitingAction')
+  if (props.queuedMessage && canSend.value) return t('chat.streamReplaceQueuedAction')
+  if (canSend.value) return t('chat.streamQueueAction')
+  return t('chat.streamStopAction')
+})
+
+const sendButtonTitle = computed(() => runtimeActionHint.value || undefined)
+
 // 处理提交
 const handleSubmit = () => {
+  if (props.streamPhase === 'interrupting') return
   // 有排队消息时，点击按钮取消排队
   if (props.queuedMessage && props.queuedMessage.status === 'queued') {
     // 如果输入框为空，取消排队；如果有新输入，替换排队消息
@@ -530,12 +674,16 @@ const handleSubmit = () => {
 // 发送按钮样式
 const sendBtnClass = computed(() => ({
   'is-loading': props.loading && !canSend.value,
+  'is-stopping': props.streamPhase === 'interrupting',
   'is-empty': !canSend.value && !props.loading,
   'is-interrupt': props.loading && canSend.value,
 }))
 
 // 处理回车键
-const handleEnter = () => {
+const handleEnter = (event?: KeyboardEvent) => {
+  if (event && mentionHandledEvents.has(event)) return
+  if (event?.isComposing || event?.keyCode === 229 || mentionActive.value)
+    return
   if (isComposing.value) return
   // When the slash menu is showing matches, Enter confirms the highlighted
   // skill (handled in handleSlashKeydown) instead of submitting the message.
@@ -566,11 +714,11 @@ const openFilePicker = () => {
 const handleFileChange = (event: Event) => {
   const input = event.target as HTMLInputElement
   const files = Array.from(input.files || [])
-  
+
   if (files.length) {
     emit('file-select', files)
   }
-  
+
   // 清空 input 以便重复选择同一文件
   input.value = ''
 }
@@ -604,6 +752,7 @@ const formatFileSize = (size: number) => {
 
 // 暴露方法给父组件
 defineExpose({
+  insertMemberMention,
   focus: () => textareaRef.value?.focus(),
   blur: () => textareaRef.value?.blur(),
   clear: () => {
@@ -618,6 +767,34 @@ defineExpose({
 </script>
 
 <style scoped>
+.team-mention-list {
+  position: absolute;
+  bottom: 100%;
+  left: 0;
+  max-height: 220px;
+  overflow: auto;
+  background: var(--mc-bg-elevated, #fff);
+  border: 1px solid var(--mc-border, #ddd);
+  border-radius: 10px;
+  padding: 6px;
+  z-index: 25;
+  min-width: 220px;
+}
+.team-mention-list button {
+  display: block;
+  width: 100%;
+  border: 0;
+  background: transparent;
+  text-align: left;
+  padding: 8px;
+  color: inherit;
+  cursor: pointer;
+}
+.team-mention-list button[aria-selected='true'] {
+  background: var(--mc-bg-sunken, #eee);
+}
+
+
 .chat-input-wrapper {
   padding: 10px 14px 12px;
   background: var(--mc-bg-elevated, #f8fafc);
@@ -786,6 +963,24 @@ defineExpose({
   cursor: not-allowed;
 }
 
+/* Focus ring. Left unstyled, these fall back to the UA default, whose
+   `outline: auto` draws a thick halo in a colour the browser picks for
+   contrast — a gold ring on the red stop button, which reads as an error
+   state rather than focus. Restyled, not removed: keyboard users need the
+   affordance, so this stays a visible ring in the app's own palette. */
+.action-btn:focus-visible {
+  outline: 2px solid var(--mc-primary, #D97757);
+  outline-offset: 2px;
+}
+
+.send-btn.is-loading:focus-visible {
+  outline-color: var(--mc-danger, #ef4444);
+}
+
+.send-btn.is-interrupt:focus-visible {
+  outline-color: var(--mc-warning, #f59e0b);
+}
+
 .thinking-btn {
   position: relative;
 }
@@ -818,7 +1013,11 @@ defineExpose({
   background: var(--mc-primary-light, rgba(217, 119, 87, 0.08));
 }
 
-.send-btn {
+/* Qualified with .action-btn so the send button outranks the generic
+   `.action-btn:hover` that leaks in from a non-scoped stylesheet elsewhere
+   in the app. Bare `.send-btn` ties with it on specificity and loses on
+   source order, which erased the button's fill on hover. */
+.action-btn.send-btn {
   background: var(--mc-primary, #D97757);
   color: white;
 }
@@ -835,6 +1034,21 @@ defineExpose({
   background: var(--mc-danger-hover, #dc2626);
 }
 
+.send-btn.is-stopping,
+.send-btn.is-stopping:disabled {
+  background: var(--mc-text-tertiary, #94a3b8);
+  opacity: 1;
+  cursor: wait;
+}
+
+.stop-spinner {
+  animation: stop-spin 0.8s linear infinite;
+}
+
+@keyframes stop-spin {
+  to { transform: rotate(360deg); }
+}
+
 .send-btn.is-empty:not(.is-loading) {
   opacity: 0.4;
   cursor: not-allowed;
@@ -845,16 +1059,41 @@ defineExpose({
   display: flex;
   justify-content: space-between;
   align-items: center;
+  gap: 10px;
   margin-top: 6px;
   padding: 0 4px;
+}
+
+.input-footer__left {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
 }
 
 .input-hint {
   font-size: 12px;
   color: var(--mc-text-tertiary, #94a3b8);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.input-action-hint {
+  flex: 0 1 auto;
+  min-width: 0;
+  padding-left: 8px;
+  border-left: 1px solid var(--mc-border, #e2e8f0);
+  color: var(--mc-text-secondary, #64748b);
+  font-size: 12px;
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .input-length {
+  flex: 0 0 auto;
   font-size: 12px;
   color: var(--mc-text-tertiary, #94a3b8);
 }

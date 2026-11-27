@@ -7,6 +7,8 @@ import vip.mate.common.result.R;
 import vip.mate.i18n.I18nService;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
@@ -35,5 +37,29 @@ class GlobalExceptionHandlerTest {
 
         assertEquals(HttpStatus.INTERNAL_SERVER_ERROR, response.getStatusCode());
         assertEquals(500, response.getBody().getCode());
+    }
+
+    @Test
+    void expectedSseDisconnectsAreRecognizedThroughCauseChain() {
+        RuntimeException wrapped = new RuntimeException("wrapper",
+                new java.io.IOException("Servlet container error notification for disconnected client"));
+
+        assertTrue(GlobalExceptionHandler.isExpectedClientDisconnect(wrapped));
+        assertTrue(GlobalExceptionHandler.isExpectedClientDisconnect(
+                new java.io.IOException("Broken pipe")));
+        assertFalse(GlobalExceptionHandler.isExpectedClientDisconnect(
+                new IllegalStateException("unexpected projector failure")));
+    }
+
+    @Test
+    void databaseOutageIsUnavailableWithoutLeakingConnectionDetails() {
+        var request = new org.springframework.mock.web.MockHttpServletRequest("POST", "/api/v1/auth/login");
+        var response = handler.handleException(
+                new org.springframework.dao.DataAccessResourceFailureException("private database path"),
+                request, new org.springframework.mock.web.MockHttpServletResponse());
+
+        assertEquals(HttpStatus.SERVICE_UNAVAILABLE, response.getStatusCode());
+        assertEquals(503, response.getBody().getCode());
+        assertFalse(response.getBody().getMsg().contains("private database path"));
     }
 }

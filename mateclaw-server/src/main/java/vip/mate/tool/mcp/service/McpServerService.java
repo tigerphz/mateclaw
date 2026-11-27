@@ -9,6 +9,7 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.context.event.EventListener;
+import org.springframework.context.event.ContextClosedEvent;
 import org.springframework.stereotype.Service;
 import vip.mate.exception.MateClawException;
 import vip.mate.tool.mcp.event.McpConnectionLostEvent;
@@ -26,6 +27,7 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.regex.Pattern;
 
 /**
@@ -60,9 +62,24 @@ public class McpServerService {
         return t;
     });
 
+    /** Set before bean destruction so transport exit callbacks cannot heal a shutting-down app. */
+    private final AtomicBoolean shuttingDown = new AtomicBoolean(false);
+
+    @EventListener
+    public void onContextClosed(ContextClosedEvent ignored) {
+        beginShutdown();
+    }
+
     @PreDestroy
     public void shutdownConnectExecutor() {
-        connectExecutor.shutdownNow();
+        beginShutdown();
+    }
+
+    private void beginShutdown() {
+        if (shuttingDown.compareAndSet(false, true)) {
+            log.info("MCP reconnect service stopping; new connect/reconnect requests are disabled");
+            connectExecutor.shutdownNow();
+        }
     }
 
     /**
@@ -87,6 +104,11 @@ public class McpServerService {
      */
     @EventListener
     public void onConnectionLost(McpConnectionLostEvent event) {
+        if (shuttingDown.get()) {
+            log.debug("Ignoring MCP connection-lost event during application shutdown: serverId={}, reason={}",
+                    event.serverId(), event.reason());
+            return;
+        }
         Long serverId = event.serverId();
         if (serverId == null) {
             return;
@@ -132,6 +154,20 @@ public class McpServerService {
                 .orderByAsc(McpServerEntity::getName));
     }
 
+    /** Explicit scope: a missing workspace can only see global infrastructure. */
+    public static boolean isVisible(McpServerEntity server, Long workspaceId) {
+        return server != null && (server.getWorkspaceId() == null
+                || server.getWorkspaceId().equals(workspaceId));
+    }
+
+    public List<McpServerEntity> listVisible(Long workspaceId) {
+        return listAll().stream().filter(server -> isVisible(server, workspaceId)).toList();
+    }
+
+    public List<McpServerEntity> listEnabledVisible(Long workspaceId) {
+        return listEnabled().stream().filter(server -> isVisible(server, workspaceId)).toList();
+    }
+
     public McpServerEntity getById(Long id) {
         McpServerEntity entity = mcpServerMapper.selectById(id);
         if (entity == null) {
@@ -169,7 +205,13 @@ public class McpServerService {
     }
 
     public McpServerEntity update(Long id, McpServerEntity updates) {
+        return update(id, updates, getById(id).getWorkspaceId());
+    }
+
+    public McpServerEntity update(Long id, McpServerEntity updates, Long workspaceId) {
         McpServerEntity existing = getById(id);
+
+        existing.setWorkspaceId(workspaceId);
 
         // Merge fields (only update non-null fields)
         if (updates.getName() != null) existing.setName(updates.getName());
@@ -196,6 +238,7 @@ public class McpServerService {
         mcpServerMapper.updateById(existing);
 
         log.info("MCP server updated: name={}, id={}", existing.getName(), id);
+        publishChanged("server-updated");
 
         // Reconnect if enabled, disconnect if disabled. Reconnect runs
         // asynchronously so a slow / unreachable server can't freeze the
@@ -367,6 +410,7 @@ public class McpServerService {
     public McpServerEntity sanitize(McpServerEntity entity) {
         McpServerEntity copy = new McpServerEntity();
         copy.setId(entity.getId());
+        copy.setWorkspaceId(entity.getWorkspaceId());
         copy.setName(entity.getName());
         copy.setDescription(entity.getDescription());
         copy.setTransport(entity.getTransport());
@@ -407,12 +451,18 @@ public class McpServerService {
      * caller's request thread returns at once.
      */
     private void connectAsync(McpServerEntity server) {
+        if (shuttingDown.get()) {
+            return;
+        }
         updateStatus(server.getId(), "connecting", null, 0);
         connectExecutor.submit(() -> connectSync(server));
     }
 
     /** Async counterpart of {@link #reconnectSync}. See {@link #connectAsync}. */
     private void reconnectAsync(McpServerEntity server) {
+        if (shuttingDown.get()) {
+            return;
+        }
         updateStatus(server.getId(), "connecting", null, 0);
         connectExecutor.submit(() -> reconnectSync(server));
     }

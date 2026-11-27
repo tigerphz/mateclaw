@@ -1,5 +1,12 @@
 <div align="center">
 
+> **3.1.0 正式版 · 2026-11-19**。Java 21 / Spring Boot 4.1.2 / Spring AI 2.0.2 / AgentScope Java 2.0.5。
+> 技能经验审阅与撤回、快照恢复预览、精确记忆编辑、清晰的聊天状态，以及更可靠的模型与工具执行。
+> **dev (3.2.0-SNAPSHOT)**: Java 21 / Spring Boot 4.2.0 / Spring AI 2.1.0 / AgentScope Java 2.0.5.
+
+> [3.1.0 更新说明](mateclaw-server/src/main/resources/docs/zh/changelog.md) · [版本历史](CHANGELOG.md) · [下载发行包](https://github.com/mateaix/mateclaw/releases)
+
+
 <p align="center">
   <img src="mateclaw-ui/public/logo/mateclaw_logo_s.png" alt="MateClaw Logo" width="120">
 </p>
@@ -8,14 +15,14 @@
 
 <p align="center"><b>你的超级大脑</b></p>
 
-<p align="center"><sub><b>Agent Harness · Spring Boot 内核 · 一个 JAR 交付</b></sub></p>
+<p align="center"><sub><b>可插拔 Agent Runtime · Native + DSH · Spring Boot 内核</b></sub></p>
 
 [![GitHub 仓库](https://img.shields.io/badge/GitHub-仓库-black.svg?logo=github)](https://github.com/mateaix/mateclaw)
 [![文档](https://img.shields.io/badge/文档-在线-green.svg?logo=readthedocs&label=Docs)](https://claw.mate.vip/docs)
 [![在线演示](https://img.shields.io/badge/演示-在线-orange.svg?logo=vercel&label=Demo)](https://claw-demo.mate.vip)
 [![官网](https://img.shields.io/badge/官网-claw.mate.vip-blue.svg?logo=googlechrome&label=Site)](https://claw.mate.vip)
 [![Java 版本](https://img.shields.io/badge/Java-21+-blue.svg?logo=openjdk&label=Java)](https://adoptium.net/)
-[![Spring Boot](https://img.shields.io/badge/Spring%20Boot-3.5-brightgreen.svg?logo=springboot)](https://spring.io/projects/spring-boot)
+[![Spring Boot](https://img.shields.io/badge/Spring%20Boot-4.2.0-brightgreen.svg?logo=springboot)](https://spring.io/projects/spring-boot)
 [![Vue](https://img.shields.io/badge/Vue-3-4FC08D.svg?logo=vuedotjs)](https://vuejs.org/)
 [![最后提交](https://img.shields.io/github/last-commit/mateaix/mateclaw)](https://github.com/mateaix/mateclaw)
 [![许可证](https://img.shields.io/badge/license-Apache--2.0-red.svg?logo=opensourceinitiative&label=License)](LICENSE)
@@ -30,17 +37,46 @@
 
 ---
 
+> **3.1.0——可审阅的技能经验与更可靠的执行。** 逐条审阅或撤回经验、恢复快照前预览影响、引用回答选文继续提问，同时加固模型上下文恢复、工具结果、Wiki 引用和渠道投递。[更新与升级说明](https://claw.mate.vip/docs/zh/releases/3.1.0)。
+
+---
+
 > **别的 AI 助手是给一个人用的。MateClaw 是公司允许部署的那一个。**
 >
-> 多用户工作空间。敏感操作走审批。完整审计日志。Spring Boot Actuator 健康监控。单个渠道挂掉不影响其他渠道的错误隔离。一个 JAR 包跑在自己机器上，数据不出门。
+> 多用户工作空间。敏感操作走审批。完整审计日志。Spring Boot Actuator 健康监控。单个渠道挂掉不影响其他渠道的错误隔离。一个 JAR 包跑在自己的环境里；持久化数据由你掌控，任务所需内容只会发送到你主动配置的模型、渠道或工具服务。
 >
-> **底下是个真 agent harness。** ReAct + Plan-and-Execute 跑在 StateGraph 运行时上——不是一次 RAG 调用披件外套。工具 · 技能 · MCP · ACP 收敛进同一个注册表，每位员工独立绑定。敏感工具调用走可审计的审批闸门。多厂商故障转移让循环在某家供应商挂掉时也不停。
+> **底下是一套真正的 Agent Runtime。** 员工不再焊死在一套推理循环上：可以用原生 AgentScope 运行 ReAct、Plan-and-Execute、Goal 与 Team Run，也可以通过 SDK JSON-RPC 把 DeepSeek Harness 作为受管理的外部循环。两条路径最终进入同一套会话、工作空间边界、Tool Guard、事件投影与生命周期控制。
 
 大多数 AI 工具一到厂商抽风那天就两手一摊。关一次标签页就忘了你是谁。给你一个聊天框，就敢叫产品。
 
-**MateClaw 是完整的一整套。** 一次部署——推理、知识、记忆、工具、多渠道入口，从第一天就一起设计，不是事后拼接。主模型挂了，下一家接着把这句话说完。
+**MateClaw 是完整的一整套。** 一次部署——推理、知识、记忆、工具、多渠道入口，从第一天就一起设计，不是事后拼接。主模型不可用时，系统会按优先级改由下一家健康供应商重新完成当前请求。
 
 ---
+
+## dev 新增：复用员工配置与受控团队协作
+
+以下功能位于 `dev / 3.2.0-SNAPSHOT`，不属于已发布的 3.1.0 版本：
+
+- **员工保存为模板**：把原生员工的配置保存为工作区快照，选择共享配置文档，再用新名称招聘员工；保留继承默认、显式禁用和显式绑定的含义，自定义模板招聘前检查依赖。6 个内置模板继续沿用原有流程。[员工模板说明](mateclaw-server/src/main/resources/docs/zh/agents.md)
+- **可选协调员模式**：工作区管理员在 **团队 → 指定团队 → 成员** 中开启，让原生负责人专注派工、跟进与汇总。保留团队任务板移交，限制通用委派、业务工具和模型原生搜索，不覆盖原有能力绑定。[团队协作说明](mateclaw-server/src/main/resources/docs/zh/teams.md)
+- **与团队对话**：从团队卡片或详情页直接开启负责人新会话，入口遵守聊天权限与负责人可用状态。
+- **派工说明与成员点名**：新任务固定运行目标、描述、验收标准和限制条件，重试沿用说明；负责人聊天展示成员分工与状态，`@` 只表达派工偏好，仍经任务板执行。
+- **编制保护**：未完成任务会阻止移除成员、删除相关员工或团队；团队存在时不能直接删除负责人。一个员工同时只能属于一个团队，暂停团队也占用归属；历史失败任务不能重试给已移除的执行人。
+
+工作区快照当前支持同一工作区内的原生员工，不支持 DSH 克隆或跨工作区导出。[未发布变更与升级提示](CHANGELOG.md#unreleased)
+
+## 3.1.0 更新内容
+
+以下为 [3.0.0](https://claw.mate.vip/docs/zh/releases/3.0.0) 之后的改动，按使用场景归类：
+
+- **技能与记忆**：逐条审阅、撤回技能经验，恢复快照前预览影响，异步安装技能并支持取消；精确保留记忆章节，避免异步编辑串入其他会话。
+- **聊天与工具可见性**：引用回答选文继续提问；浏览器标题与图标显示会话状态；展示命令意图标题和真实 Shell 失败结果，保留停止回合的 token 用量。
+- **执行可靠性**：恢复上下文溢出和过大的历史媒体，保存前校验模型参数，限制供应商并发，保留工具超时覆盖，并约束团队累计派发预算。
+- **知识与文档**：对单个 Wiki 来源提取实体，多轮检索后对齐引用；生成文档后继续推理，保留 Markdown 表格值、文件换行风格与技能二进制附件。
+- **渠道与 DSH**：拆分钉钉长 Markdown、校验投递回执并保留飞书附件文件名。DSH `0.2.2-rc.1` 是要求 Node.js 24.9+（24.x）的可选候选，默认仍为 `0.2.0-rc.1`。
+- **当前技术栈**：Spring Boot **4.2.0**、Spring AI **2.1.0**、AgentScope Java **2.0.5**、MyBatis Plus **3.5.18.1**。原生 ReAct 和计划单步循环继续遵守 MateClaw 的审批、权限、Goal 验收与持久化边界。
+
+源码构建使用 Java 21。升级前备份数据库、workspace、插件与配置，回滚使用升级前备份。[架构与升级说明](mateclaw-server/src/main/resources/docs/zh/changelog.md) · [模型预算规则](mateclaw-server/src/main/resources/docs/zh/models.md)
 
 ## 三件让它与众不同的事
 
@@ -48,7 +84,7 @@
 
 Key 过期。厂商返回 401。网络抖动。配额耗尽。
 
-别的工具丢你一张红色错误卡。MateClaw 自动切到下一家健康的供应商——DashScope、OpenAI、Anthropic、Gemini、DeepSeek、Kimi、Ollama、LM Studio、MLX，共 14+ 家——用户只会看到回答正常完成。内置的 **Provider Health Tracker** 会把连续失败的供应商放进冷却窗口，避免每一轮对话都白白撞壁。
+别的工具丢你一张红色错误卡。MateClaw 会按配置顺序尝试下一家健康供应商——DashScope、OpenAI、Anthropic、Gemini、DeepSeek、Kimi、Ollama、LM Studio、MLX 等内置或 OpenAI 兼容供应商——尽可能恢复当前请求；仅当可用链路全部失败时才返回错误。内置的 **Provider Health Tracker** 会把连续失败的供应商放进冷却窗口，避免每一轮对话都白白撞壁。
 
 你不用写重试脚本。在 **设置 → 模型** 里把供应商拖成你想要的优先顺序，健康面板实时亮起一排绿点——请求绕着故障流过去。
 
@@ -56,7 +92,7 @@ Key 过期。厂商返回 401。网络抖动。配额耗尽。
 
 上传 PDF、一批 markdown、抓下来的网页——原始材料进去。
 
-MateClaw 的 **LLM Wiki** 把它消化成结构化页面，页面之间自己长出 `[[链接]]`，每一句话都记得来自哪里。点开引用抽屉，就能看到原始 chunk。问一个问题，得到的页面是从对应片段拼出来的——带可核对的出处。
+MateClaw 的 **LLM Wiki** 把它消化成结构化页面，页面之间自己长出 `[[链接]]`，生成内容保留可追踪引用。点开引用抽屉，就能看到对应的原始 chunk；页面与回答中的引用可以回到来源核对。
 
 这是**仓库**和**图书馆**的区别。
 
@@ -79,10 +115,20 @@ MateClaw 的 **LLM Wiki** 把它消化成结构化页面，页面之间自己长
 ## 盒子里有什么
 
 ### 数字员工，不是聊天机器人
-你雇佣员工，不是开聊天框。每位有**角色**、**目标**、**背景故事**，像素艺术头像、专属配色——5 个职业模板（产品研究员 · 客户支持 · 知识管理员 · 数据分析师 · 行政助理）开箱可用。**ReAct** 做迭代推理，**Plan-and-Execute** 做复杂多步任务，员工之间可以并行委派。动态上下文裁剪、智能截断、僵死流清理——让长对话真正能用的那些"不起眼"的基础设施。
+你雇佣员工，不是开聊天框。每位有**角色**、**目标**、**背景故事**、运行时、像素艺术头像与专属配色——6 个内置模板（通用助手 · 产品助理 · 研究分析师 · 客服助理 · 数据分析师 · 代码审查员）开箱可用。即使更换执行引擎，员工身份和治理边界仍保持不变。
 
-### 团队协作（2.0.0+）
-一个 Lead 带一群员工，围着一块**共享任务板**干活。你对 Lead 说一句目标，它拆成任务上板（`blockedBy` 声明依赖）；派发引擎把任务并行分给成员，前置结果自动传给下游，完成结果自动通报回 Lead 汇总。执行租约 + 心跳杜绝双重执行，**取消即中断**正在跑的成员会话，敏感任务停在 `in_review` 等人批。交付物（docx / pptx / xlsx / pdf）登记到任务可下载，任务时间线记录全程，还能跳进任意成员的子会话看它逐字执行。Plan-Execute 型 Lead 的计划**整体移交任务板**——会规划的 Lead，规划能力就是编排能力。
+### Agent Runtime：Native 或 DSH（2.2.0+）
+`AgentRuntimeProvider` contract 将员工与执行引擎分离。**Native Runtime** 在 MateClaw 内运行 ReAct、Plan-and-Execute、Persistent Goal 与 Team Run；**DSH Runtime** 启动官方 `dsh --profile sdk` CLI，统一映射思考、文本、工具、用量、完成与取消事件。受管理安装支持 Node.js 22/24；新增可选 `0.2.2-rc.1` 要求 Node.js 24.9+（24.x），恢复文件观察保护并绑定模型容量。使用受审查 npm 锁文件固定 `0.2.0-rc.1`（另选 `0.1.7-rc.2`）。新增可选 `0.2.1-rc.2` 候选，macOS arm64 安装、握手和短模型/工具任务已验证，默认选择保持不变。升级复制 home、检查候选并切换保留的代次；回滚恢复旧 home/配置，不合并升级后的新会话。实际包及真实模型适配器检查已在 macOS arm64 通过；Linux x64 和持久化 V3→V4 历史迁移仍待验证。[配置 DeepSeek Harness →](https://claw.mate.vip/docs/zh/deepseek-harness)
+
+### 持久长任务：检查点、重启、继续（2.2.0+）
+Persistent Goal 把需要数小时的工作拆成有界、可恢复的执行段。数据库会保存目标清单、continuation 状态、attempt、冷却、lease，以及员工忙碌期间已经接收的用户输入。单后端实例重启后，supervisor 会先核对被中断的 attempt，读取持久检查点和已有产物，再调度下一段安全工作，不要求用户重新描述任务。
+
+对于写文件的任务，应要求员工维护进度账本、以小块追加可验证内容、恢复时先检查文件尾部，并且只有在可复现验收全部通过后才完成 Goal。运行时不承诺任意外部副作用严格一次；付款、发送、发布和破坏性操作仍需使用服务商幂等键或人工复核。[运行并验证持久目标 →](https://claw.mate.vip/docs/zh/goals)
+
+> 提示词模板：“第一步创建持续目标；把计划和进度保存在工作区；按小检查点写入；发生错误或重启后从已有证据继续；只有每条验收标准都有可验证证据时才调用 `completeGoal`。”
+
+### Team Run（2.1.0+）
+一次请求对应一个持久化的 **Team Run**。稳定的 `runId` 串起用户目标、任务 DAG、成员执行、最终汇总与交付物。Chat 是成果交付面，Agents Live 按运行聚合成员并展示实时状态，Teams 管理历史与治理；三处读取同一份服务端投影。成员子会话不再挤进普通会话列表，摘要和文件优先展示，任务、证据、审批与只读成员记录按需下钻。底层继续使用 2.0 的共享任务板，保留依赖编排、并行派发、前置结果传递、执行租约、取消中断和人工审批卡点。
 
 ### 知识与记忆
 - **LLM Wiki** — 原始材料消化成有链接、带引用的结构化页面；**热点缓存**自动注入到员工的 system prompt。**加工器引擎**（1.3.0+）把 Wiki 从"搜索索引"升级为"处理流水线"
@@ -90,7 +136,7 @@ MateClaw 的 **LLM Wiki** 把它消化成结构化页面，页面之间自己长
 - **记忆生命周期** — 对话后自动提取 · 定时整理 · Dreaming 工作流。工作流也可以通过 `write_memory` step 直接写进员工的 `MEMORY.md`
 
 ### 技能 · MCP · ACP — 三种"接外部能力"的方式
-- **SKILL.md 技能包** — 一份 manifest + prompt + 工具列表 + **LESSONS.md（用得越多越聪明）**。8 个起步模板 + 5 步创作向导，安装前自动跑 **Pre-flight 检查**告诉你缺什么
+- **SKILL.md 技能包** — 一份 manifest + prompt + 工具列表 + **LESSONS.md**。2.1 可通过对话反思与跨会话重复请求挖掘形成可复用改进，并以候选晋升、受约束自动绑定、curator 治理、来源策略、快照和恢复点保证过程可观察、按工作空间隔离且可回滚；所有自动能力均由独立开关控制。另有 8 个起步模板、5 步创作向导和安装前 **Pre-flight 检查**
 - **MCP** — stdio / SSE / Streamable HTTP 三种传输，接入任意外部工具服务器。**每位员工独立绑定**（1.3.0+）——一位员工装的工具不会渗到其他人的工具栏里
 - **ACP** — 把 Claude Code、Codex 这种顶级编码 Agent 以"员工"身份接入，桥接成技能卡 + 包装工具
 - **Tool Guard** — RBAC + 审批流 + 文件路径保护。能力必须有边界
@@ -101,24 +147,24 @@ MateClaw 的 **LLM Wiki** 把它消化成结构化页面，页面之间自己长
 - **Wiki 加工器** — Wiki 不再只是被动检索。用户自定义模板对原料或现有页面跑模板，跨原料 map-reduce 聚合，reverse-citation 绑定到源 chunk，JSON 输出 + 可选 JSON Schema，每个模板独立选模型
 
 ### 你看得见每位员工正在干什么
-**Admin 运行时控制台**（`后台 → 系统 → 运行时`）——谁在跑、跑到哪一步、占多少 token、卡住了一键回收。流式分阶段显示（思考 / 工具 / 回答），SSE 每事件 ID 支持安全重连，多员工协作不打架，长任务必须有真实证据才回答。
+**Admin 运行时控制台**（`后台 → 系统 → 运行时`）——谁在跑、当前回合由哪个 runtime provider 承载、跑到哪一步、占多少 token，卡住可一键回收。Native 与 DSH 事件进入同一套思考 / 工具 / 回答投影，完成、失败、用量和取消保持一致的生命周期语义。SSE 每事件 ID 支持安全重连，Team Run 将成员工作聚合到同一次运行下。
 
 ### 多模态创作
 语音合成 · 语音识别 · 图片 · 音乐 · 视频 · 3D。一等公民，不是附加插件。**多模态旁路**（1.3.0+）让纯文本主模型遇到图片附件时自动调用配置好的视觉模型转描述，主对话保持便宜。**图像编辑**也到位：用 `msg:<id>:<idx>` 引用会话里更早的某张图，让模型改色、改风格。**4 个文档生成工具**（`DocxRenderTool` / `XlsxRenderTool` / `PptxRenderTool` / `PdfRenderTool`）在 JVM 内把 Markdown 直接渲染成 Office 文件——不 fork 子进程、不依赖 npm、不需要装 Office。
 
 ### 内容工作室（1.8.0+）
-一个招牌*场景*,不是工具——预置的「内容工作室」员工把一句话变成可发布成品:选题 → 搜集 → 成文 → 配图 → **去 AI 化** → 排版 → 交付。**微信公众号(公众号)** 文章以内联样式 HTML 躺进你的草稿箱,正文图自动上传进微信;**小红书** 笔记打包成 ≥3 张竖版 3:4 卡片并在线预览。去 AI 化对着一个**可度量的 AI 痕迹评分**跑;每次交付都被合规扫描并记进一个按选题指纹去重的**内容日历**。
+一个招牌*场景*，不是工具——预置的「内容工作室」员工把一句话变成可发布成品：选题 → 搜集 → 成文 → 配图 → **去 AI 化** → 排版 → 交付。**微信公众号（公众号）**文章以内联样式 HTML 进入草稿箱，正文图自动上传到微信；**小红书**笔记打包成 ≥3 张竖版 3:4 卡片并在线预览。去 AI 化围绕一个**可度量的 AI 痕迹评分**运行；每次交付都经过合规扫描，并记入按选题指纹去重的**内容日历**。
 
 ### 企业就绪
-RBAC + JWT。**Personal Access Token** 给无人值守脚本和 CI 用。**Webhook 出站 HMAC-SHA-256 签名**。**Cron 分布式锁**多实例不双发。完整审计事件流。Flyway 管理数据库 schema，升级时自愈。一个 JAR 交付。生产用 MySQL，开发用 H2，代码零改动。
+RBAC + JWT。**Personal Access Token** 给无人值守脚本和 CI 使用。**Webhook 出站 HMAC-SHA-256 签名**。**Cron 分布式锁**避免多实例重复执行。完整审计事件流。Flyway 管理数据库 schema。一个 JAR 交付。开发环境可用 H2；公开 Docker 栈默认使用 PostgreSQL 16，同时保留 MySQL profile，Kingbase 驱动为按需启用。
 
 ---
 
 ## AI 正在变成基础设施
 
-2026 年 3 月 2 日，Claude 全球宕机 **4 小时**——API、Web、移动端同时黑屏。三周后又来一次，**5 小时**。每一家把 AI 战略押在单一厂商身上的公司，那几个小时只能盯着红色错误卡。
+模型供应商会限流，网络会抖动，Key 会过期，服务也可能临时不可用。把所有 AI 能力押在单一供应商上，会让上游故障直接变成自己的业务故障。
 
-这和 2010 年数据库走过的路、2018 年云走过的路**是同一个转弯**：赢的那一层，不再绑在一家供应商身上。**57% 的公司已经把 AI agent 推进生产**——没有一家希望某个厂商的坏日子变成自己的坏日子。
+当 AI 进入生产环境，稳定的一层既不应绑定一家模型供应商，也不应绑定一套 Agent loop。MateClaw 用供应商优先级、健康追踪、冷却与故障转移吸收模型侧不确定性，再把 Native 与外部执行引擎收进同一份受治理的 Agent Runtime contract。
 
 **MateClaw 就是那一层——用 Spring Boot 方式盖的。**
 
@@ -138,7 +184,7 @@ RBAC + JWT。**Personal Access Token** 给无人值守脚本和 CI 用。**Webho
 
 **OpenClaw 和 Hermes Agent 是优秀的个人 AI 平台**——如果你是一个人、一台笔记本、习惯从 CLI 搭自己的 agent、所有东西都靠手工配置文件调优，选它们没问题。两家的社区规模今天都大于 MateClaw。
 
-**MateClaw 是那个给团队用的版本。** 每位数字员工、每个模型、每个工具都有 RBAC。危险动作自动暂停等审批。完整审计事件流。Admin 运行时控制台让一个运维能实时看到 50 位员工跑在 14 家供应商上的状态——卡住了一键回收。底座是 Spring Boot——任何一家已经在生产跑 Java 服务的公司可以直接并入。
+**MateClaw 是那个给团队用的版本。** 数字员工、模型与工具都纳入权限和工作空间边界。危险动作可暂停等待审批，关键操作进入审计事件流。Admin 运行时控制台集中展示正在执行的员工与供应商状态，卡住时可回收。底座是 Spring Boot，适合并入已有 Java 服务体系。
 
 **同一套"完整一整套"哲学，不同的重心。**
 
@@ -148,20 +194,31 @@ RBAC + JWT。**Personal Access Token** 给无人值守脚本和 CI 用。**Webho
 
 ```bash
 # 后端
-cd mateclaw-server
-mvn spring-boot:run           # http://localhost:18088
+# 需要 Java 21 与 Maven。首次生成本地 JWT 密钥，重启时复用。
+[ -f .env.local ] || (umask 077; printf 'JWT_SECRET=%s\n' "$(openssl rand -hex 48)" > .env.local)
+set -a
+source .env.local
+set +a
+# 从仓库根目录运行，使用根目录下已配置的模型数据库与工作空间
+mvn -pl mateclaw-plugin-api -am install -DskipTests
+SPRING_DATASOURCE_URL="jdbc:h2:file:$PWD/data/mateclaw;MODE=MySQL;DATABASE_TO_LOWER=TRUE;CASE_INSENSITIVE_IDENTIFIERS=TRUE" \
+MATECLAW_WORKSPACE_SANDBOX_ROOT="$PWD/data/workspace" \
+mvn -pl mateclaw-server spring-boot:run  # http://localhost:18088
 
-# 前端
+# 前端（新终端，从仓库根目录进入）
 cd mateclaw-ui
-pnpm install && pnpm dev      # http://localhost:5173
+npm install && npm run dev -- --host 127.0.0.1    # http://localhost:5173
 ```
 
-默认登录：`admin` / `admin123`
+新数据库默认登录：`admin` / `admin123`。登录后修改密码，并在 **设置 → 模型** 配置模型。已有模型配置从根目录 `data/` 数据库读取；使用 `mateclaw-server/data/` 会打开另一份数据库。不要提交 `.env.local`，其中 `JWT_SECRET` 必须非空且至少包含 32 个 UTF-8 字节。
+
+日常贡献分支和 PR 以 `dev` 为目标，`main` 用于稳定发布。[操作手册](https://claw.mate.vip/docs/zh/user-guide) · [部署与升级](https://claw.mate.vip/docs/zh/docker-deploy)。
 
 ### Docker 部署
 
 ```bash
 cp .env.example .env
+# 编辑 .env：填写 JWT_SECRET，并替换两个数据库示例密码。
 docker compose up -d          # http://localhost:18080
 ```
 
@@ -190,11 +247,14 @@ docker compose up -d          # http://localhost:18080
 
 ```
 mateclaw/
-├── mateclaw-server/        Spring Boot 3.5 后端（Spring AI Alibaba · StateGraph 运行时）
+├── mateclaw-server/        Spring Boot 4.2.0 后端（Agent Runtime contract · Native AgentScope + DSH）
 ├── mateclaw-ui/            Vue 3 + TypeScript 管理 SPA（构建产物打进后端 JAR）
+├── mateclaw-desktop/       Electron 桌面端（本地内嵌 / 远程集中双模式）
 ├── mateclaw-webchat/       网页嵌入式聊天组件（UMD / ES bundle）
 ├── mateclaw-plugin-api/    第三方能力插件的 Java SDK
 ├── mateclaw-plugin-sample/ 参考插件实现
+├── mateclaw-plugin-mem0/   可选 Mem0 记忆 Provider 插件
+├── mateclaw-plugin-search-sample/ 搜索 Provider SPI 示例
 ├── docker-compose.yml
 └── .env.example
 ```
@@ -205,11 +265,11 @@ mateclaw/
 
 | 层次 | 技术 |
 |---|---|
-| 后端 | Spring Boot 3.5 · Spring AI Alibaba 1.1 · MyBatis Plus · Flyway |
-| 数字员工运行时 | StateGraph · ReAct + Plan-Execute · 角色 / 目标 / 背景故事 · LESSONS 自我进化 · 团队任务板（2.0.0+）|
+| 后端 | Spring Boot 4.2.0 · Spring AI 2.1.0 · AgentScope Java 2.0.5 · MyBatis Plus · Flyway |
+| Agent Runtime | `AgentRuntimeProvider` contract · Native AgentScope（ReAct + Plan-Execute）· 受管理的 DSH JSON-RPC runtime · 统一事件 / 生命周期 / 用量 · Tool Guard |
 | 业务编排 | 工作流（7 step mode · Pebble DSL）· 触发器（6 pattern type · 事件治理）· Wiki 加工器（1.3.0+）|
 | 能力扩展 | SKILL.md 包 · MCP（stdio / SSE / HTTP · per-agent 绑定）· ACP 桥接（Claude Code / Codex） |
-| 数据库 | H2（开发）· MySQL 8.0+（生产）|
+| 数据库 | H2（开发）· PostgreSQL 16（Docker 默认）· MySQL 8.0+（支持）· Kingbase（按需驱动）|
 | 认证 | Spring Security + JWT |
 | 前端 | Vue 3 · TypeScript · Vite · Element Plus · TailwindCSS 4 |
 | 桌面端 | Electron · electron-updater · 内嵌 JRE 21 |
@@ -221,9 +281,43 @@ mateclaw/
 
 完整文档 **[claw.mate.vip/docs](https://claw.mate.vip/docs)**——安装、架构、各子系统、API 参考。
 
-## 路线图
+## 版本历史
 
-**v2.0.0（2026-07-26 发布）** — 从"一个能干活的人"到"一支能协作的队伍"：**Agent 团队**成为常设编制，围着一块共享任务板干活：
+**v3.1.0（正式版）· 2026-11-19**——技能经验治理、恢复预览、精确记忆编辑、会话状态，以及模型、工具和上下文可靠性改进。[3.1.0 说明](https://claw.mate.vip/docs/zh/releases/3.1.0)。
+
+**v3.0.0 · 2026-10-26**——Java 21、Boot 4、Spring AI 2 与原生 AgentScope 执行架构升级。[3.0.0 说明](https://claw.mate.vip/docs/zh/releases/3.0.0)。
+
+**v2.3.0（2026-09-20 发布）——持久目标的 JSON 验收与执行证据。** 用户可配置 JSON 必需字段，将检查结果绑定到当前要求和不可变产物版本；同时加入团队成员受控干预、技能文档及文件夹上传，并修复 DSH 历史与输出预算、vLLM 推理内容和 SSE 分帧。
+
+- **托管 JSON 验收**：由用户定义必需字段；服务端保存不可变 JSON 版本，按当前要求修订和槽位代次绑定检查，完成目标时重新校验。
+- **执行证据**：默认观察模式记录执行及产物；按需版本诊断和 JSON 字段诊断不等于目标验收通过。
+- **团队干预**：在团队详情中处理成员工具审批、拒绝或补充反馈，保留成员会话治理和执行互斥。
+- **技能上传**：支持文档、二进制文件及文件夹，保留目录结构；单文件最多 10 MiB。
+- **可靠性修复**：DSH 有界历史及输出 token、vLLM 思考开关、SSE 换行兼容、电子表格提取限制和工具超时。
+
+[↗ v2.3.0](https://claw.mate.vip/docs/zh/releases/2.3.0)
+
+**v2.2.0（2026-08-29 发布）** —— 从一套内置推理循环走向**可插拔、可恢复的 Agent Runtime**：
+
+- **Runtime contract** —— provider registry、session factory、能力校验、统一事件流、生命周期、用量与 UI 投影，让员工身份与执行引擎解耦
+- **DeepSeek Harness runtime** —— 受管理的安装与配置、认证 JSON-RPC 进程桥、Cordis composition、可取消流、子进程环境隔离，以及由宿主治理的工具派发
+- **持久长任务** —— 有界 Goal segment、持久化 continuation / 输入队列、attempt、冷却、重试、租约、重启恢复和显式暂停 / 恢复语义
+- **Agent 互操作** —— A2A 入站与出站、Agent Card、JSON-RPC / SSE task、认证、幂等与受控网络边界
+- **Runtime 加固** —— 工作空间归属进一步收口，Team Run 恢复和交付门更可靠，长文本及审批、停止、恢复期间的输入处理更一致
+
+完整内容见 [v2.2.0 更新记录](https://claw.mate.vip/docs/zh/releases/2.2.0)。
+
+**v2.1.0（2026-08-15 发布）** —— 从“一块摆满任务的看板”到**一次可治理的团队运行**：
+
+- **统一 Team Run** —— 一个 `runId` 串起请求、任务 DAG、成员会话、事件、最终汇总与交付物；Chat 交付成果，Agents 观察实时执行，Teams 管理历史与治理
+- **Skill 自进化闭环** —— 对话反思、重复请求挖掘、候选晋升、受约束自动绑定、curator 治理、快照与恢复；默认保守、显式控制并按工作空间隔离
+- **可回放执行** —— 实时提取内联 `<think>`，每轮推理按发生顺序展示实际耗时，保留被后续工具调用替代的阶段旁白，并可导出线性 trajectory
+- **能力进入日常运营** —— 主动 IM 推送、Cron 定向投递、模型级上下文窗口、渐进式工具披露，以及基于实际工具调用结果的行动完成检查
+- **可靠性加固** —— 浏览器 ref / 导航 / 等待、WebChat 与 SSE 清理及上游空闲超时、飞书进度、Qwen3-ASR HTTP、会话批量删除、文件按日分区和 64 位 ID 精度保护
+
+完整内容见 [v2.1.0 更新记录](https://claw.mate.vip/docs/zh/releases/2.1.0)。
+
+**v2.0.0（2026-07-31 发布）** —— 从“一个能干活的人”到“一支能协作的队伍”：**Agent 团队**成为常设编制，围绕共享任务板工作：
 
 - **Agent 团队与共享任务板** — 团队 / 角色（lead · member · reviewer）、八状态看板、`blockedBy` 依赖编排、成员级并行派发、前置结果自动传递、结果通报唤醒 Lead；Teams 页事件驱动实时看板 + 活动横幅 + 任务时间线 + 交付物下载 + 手动投任务
 - **为长任务加固的执行链** — 执行租约 + 运行期心跳防双重执行、取消即真实中断、`in_review` 审批卡点、失败/过期可重试
@@ -270,12 +364,7 @@ mateclaw/
 
 ## 参与贡献
 
-```bash
-git clone https://github.com/mateaix/mateclaw.git
-cd mateclaw
-cd mateclaw-server && mvn clean compile
-cd ../mateclaw-ui && pnpm install && pnpm dev
-```
+Fork 或克隆仓库后，按[快速开始](#快速开始)启动前后端；代码约定与检查方式见[贡献指南](mateclaw-server/src/main/resources/docs/zh/contributing.md)。
 
 ---
 

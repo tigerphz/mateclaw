@@ -143,8 +143,8 @@ Output: "2026-04-11T14:30:22"
 Web search via a **provider chain** — DuckDuckGo and SearXNG as keyless fallbacks, Serper and Tavily when you have keys. Configured in `Settings → System → Search Service` and takes effect without restart.
 
 ```
-Input:  {"query": "Spring AI Alibaba latest version", "freshness": "month", "count": 5}
-Output: "Spring AI Alibaba 1.1 was released..."
+Input:  {"query": "AgentScope Java latest version", "freshness": "month", "count": 5}
+Output: "AgentScope Java 2.0 was released..."
 ```
 
 Features:
@@ -384,6 +384,18 @@ Don't want to write Java? Bundle behavior into a skill package with a `SKILL.md`
 ### Option 3: an MCP server
 
 Capability already exists as an MCP server? Just add the server configuration. See [MCP](./mcp).
+
+---
+
+## 2.1.0: progressive tool bridge and action completion
+
+With a large tool catalog, MateClaw exposes a lightweight directory first and expands concrete schemas only when the task needs them. The progressive bridge reduces context pressure; normalized, enabled tool names are cached so long loops do not repeatedly scan the MCP hot path.
+
+Action requests now carry a completion policy: when the user explicitly asks to send, create, delete, query an external system, or operate a browser, the runtime retries once if its ledger has no successful substantive tool call. A second text-only attempt ends as `action_unverified`; a substantive attempt that failed ends as `action_failed`, rather than claiming completion. This proves that a substantive call succeeded, not semantic equivalence between its result and the user's goal. Read-only explanations and answers that need no tool are unaffected.
+
+`browser_use` hardens ref lifetime, navigation safety, session gates, wait conditions, and snapshots. Page changes explicitly invalidate old refs, and navigation/wait outcomes are diagnosable instead of silently clicking a stale element or crossing browser sessions.
+
+The proactive `list_channel_sessions` / `send_channel_message` tools push only to verified conversations in the current workspace; see [Channels](./channels).
 
 ---
 

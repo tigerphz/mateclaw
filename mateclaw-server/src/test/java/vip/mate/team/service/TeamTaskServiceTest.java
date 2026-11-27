@@ -1,6 +1,7 @@
 package vip.mate.team.service;
 
 import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
+import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.core.metadata.TableInfoHelper;
 import org.apache.ibatis.builder.MapperBuilderAssistant;
 import org.apache.ibatis.session.Configuration;
@@ -8,8 +9,14 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
+import org.mockito.InOrder;
 import org.mockito.ArgumentCaptor;
 import vip.mate.team.model.AgentTeamEntity;
+import vip.mate.decision.api.*;
+import vip.mate.team.model.TeamRunEntity;
+import vip.mate.team.model.TeamRunStatus;
 import vip.mate.team.model.TeamTaskCommentEntity;
 import vip.mate.team.model.TeamTaskCreateCommand;
 import vip.mate.team.model.TeamTaskEntity;
@@ -20,6 +27,7 @@ import vip.mate.team.repository.TeamTaskEventMapper;
 import vip.mate.team.repository.TeamTaskMapper;
 
 import java.util.List;
+import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.any;
@@ -36,12 +44,65 @@ class TeamTaskServiceTest {
     private static final Long TEAM_ID = 10L;
     private static final Long LEAD_ID = 1L;
     private static final Long MEMBER_ID = 2L;
+    private static final Long RUN_ID = 20L;
+    private static final Long WORKSPACE_ID = 30L;
 
     private TeamTaskMapper taskMapper;
     private TeamTaskCommentMapper commentMapper;
     private TeamTaskEventMapper eventMapper;
     private TeamService teamService;
+    private TeamRunProjectionScheduler projectionScheduler;
+    private TeamRunService runService;
     private TeamTaskService service;
+
+    @ParameterizedTest
+    @ValueSource(strings = {"pending", "in_progress"})
+    void explicitCompletionRejectsOversizedSummaryBeforeAnyTaskMutation(String status) {
+        when(taskMapper.selectById(5L)).thenReturn(task(5L, status));
+        when(taskMapper.update(isNull(), any())).thenReturn(1);
+        var error = assertThrows(IllegalArgumentException.class,
+                () -> service.completeTask(5L, MEMBER_ID, "x".repeat(8001)));
+
+        assertTrue(error.getMessage().contains("8000"));
+        assertTrue(error.getMessage().contains("final reply"));
+        verifyNoInteractions(taskMapper, commentMapper, eventMapper, projectionScheduler);
+    }
+
+    @Test
+    void staleActiveCompletionCannotMutateOrProduceSuccessfulOutcome() {
+        var adapter = mock(WorkerDecisionAdapter.class);
+        service.setDecisionAdapter(adapter); when(adapter.enabled()).thenReturn(true);
+        var original = WorkerDecisionAdapterTest.task();
+        var snapshot = WorkerDecisionAdapter.Snapshot.capture(original);
+        var replacement = WorkerDecisionAdapterTest.task(); replacement.setDispatchCount(2);
+        when(taskMapper.selectOne(any())).thenReturn(replacement);
+        var ticket = new DecisionTicket("worker", DecisionMode.ACTIVE, new DecisionValue.BooleanValue(true));
+        assertFalse(service.completeTask(1L, null, "result", ticket, snapshot).applied());
+        verify(taskMapper, never()).update(any(), any());
+        verify(adapter).outcome(ticket, false, "STALE_ATTEMPT");
+    }
+
+    @Test
+    void failedActiveCompletionUpdateRecordsNoAppliedMutation() {
+        var adapter = mock(WorkerDecisionAdapter.class); service.setDecisionAdapter(adapter);
+        var task = WorkerDecisionAdapterTest.task();
+        when(taskMapper.selectOne(any())).thenReturn(task);
+        var ticket = new DecisionTicket("worker", DecisionMode.ACTIVE, new DecisionValue.BooleanValue(true));
+        assertFalse(service.completeTask(1L, null, "done", ticket, WorkerDecisionAdapter.Snapshot.capture(task)).applied());
+        verify(adapter).outcome(ticket, false, "TRANSITION_REJECTED");
+        verifyNoInteractions(eventMapper);
+    }
+
+    @Test
+    void explicitCompletionObservesActualApprovalStatusAfterMutation() {
+        var adapter = mock(WorkerDecisionAdapter.class);
+        service.setDecisionAdapter(adapter); when(adapter.enabled()).thenReturn(true);
+        var task = WorkerDecisionAdapterTest.task(); task.setRequireApproval(true);
+        when(taskMapper.selectById(1L)).thenReturn(task);
+        when(taskMapper.update(isNull(), any())).thenReturn(1);
+        service.completeTask(1L, null, "result");
+        verify(adapter).observeCompletion(task, TeamTaskStatus.IN_REVIEW);
+    }
 
     @BeforeAll
     static void initTableInfo() {
@@ -60,12 +121,16 @@ class TeamTaskServiceTest {
         commentMapper = mock(TeamTaskCommentMapper.class);
         eventMapper = mock(TeamTaskEventMapper.class);
         teamService = mock(TeamService.class);
-        service = new TeamTaskService(taskMapper, commentMapper, eventMapper, teamService);
+        projectionScheduler = mock(TeamRunProjectionScheduler.class);
+        runService = mock(TeamRunService.class);
+        service = new TeamTaskService(taskMapper, commentMapper, eventMapper, teamService,
+                projectionScheduler, runService);
 
         AgentTeamEntity team = new AgentTeamEntity();
         team.setId(TEAM_ID);
         team.setLeadAgentId(LEAD_ID);
         team.setStatus(TeamService.STATUS_ACTIVE);
+        team.setWorkspaceId(WORKSPACE_ID);
         when(teamService.getTeam(TEAM_ID)).thenReturn(team);
         when(teamService.isMember(TEAM_ID, MEMBER_ID)).thenReturn(true);
         when(teamService.nextTaskNumber(TEAM_ID)).thenReturn(1);
@@ -85,6 +150,87 @@ class TeamTaskServiceTest {
         t.setTaskNumber(7);
         t.setStatus(status);
         return t;
+    }
+
+    private TeamTaskEntity runTask(Long id, String status) {
+        TeamTaskEntity task = task(id, status);
+        task.setRunId(RUN_ID);
+        return task;
+    }
+
+    private TeamRunEntity planningRun(Long teamId) {
+        TeamRunEntity run = new TeamRunEntity();
+        run.setId(RUN_ID);
+        run.setTeamId(teamId);
+        run.setWorkspaceId(WORKSPACE_ID);
+        run.setStatus(TeamRunStatus.PLANNING);
+        return run;
+    }
+
+    @Test
+    void creationCapturesServerBriefingAndPreservesMetadata() {
+        var run = planningRun(TEAM_ID);
+        run.setObjective("Original objective");
+        when(runService.requireRun(RUN_ID, WORKSPACE_ID)).thenReturn(run);
+        var created = service.createTask(baseCreate().runId(RUN_ID).description("Original instructions")
+                .metadata("{\"trace\":\"keep\",\"briefing\":{\"objective\":\"forged\"}}")
+                .build());
+        var metadata = cn.hutool.json.JSONUtil.parseObj(created.getMetadata());
+        assertEquals("keep", metadata.getStr("trace"));
+        var briefing = metadata.getJSONObject("briefing");
+        assertEquals(1, briefing.getInt("schemaVersion"));
+        assertEquals("Original objective", briefing.getStr("objective"));
+        assertEquals("Original instructions", briefing.getStr("description"));
+    }
+
+    @Test
+    void briefingIsBoundedAndOptionalInputsRoundTrip() {
+        var created = service.createTask(baseCreate().description("x".repeat(12001))
+                .acceptanceCriteria("Pass checks").constraints("c".repeat(4001)).metadata("junk").build());
+        var briefing = cn.hutool.json.JSONUtil.parseObj(created.getMetadata()).getJSONObject("briefing");
+        assertEquals(12000, briefing.getStr("description").getBytes(java.nio.charset.StandardCharsets.UTF_8).length);
+        assertTrue(briefing.getStr("description").endsWith("…"));
+        assertEquals(4000, briefing.getStr("constraints").getBytes(java.nio.charset.StandardCharsets.UTF_8).length);
+        assertEquals("Pass checks", briefing.getStr("acceptanceCriteria"));
+        assertNull(briefing.getStr("objective"));
+    }
+
+    @Test
+    void truncationDoesNotSplitUnicodeSurrogatePair() {
+        var created = service.createTask(baseCreate().description("x".repeat(11998) + "😀more").build());
+        var description = cn.hutool.json.JSONUtil.parseObj(created.getMetadata())
+                .getJSONObject("briefing").getStr("description");
+        assertEquals("x".repeat(11997) + "…", description);
+    }
+
+    @Test
+    void multibyteBriefingFitsMysqlTextAndPreservesOtherMetadata() {
+        var run = planningRun(TEAM_ID);
+        run.setObjective("目标😀".repeat(4000));
+        when(runService.requireRun(RUN_ID, WORKSPACE_ID)).thenReturn(run);
+        var created = service.createTask(baseCreate().runId(RUN_ID)
+                .description("说明😀".repeat(12000)).acceptanceCriteria("验收😀".repeat(4000))
+                .constraints("约束😀".repeat(4000)).metadata("{\"trace\":\"保留😀\"}").build());
+        var metadata = cn.hutool.json.JSONUtil.parseObj(created.getMetadata());
+        assertEquals("保留😀", metadata.getStr("trace"));
+        var briefing = metadata.getJSONObject("briefing");
+        for (var entry : java.util.Map.of("objective", 4000, "description", 12000,
+                "acceptanceCriteria", 4000, "constraints", 4000).entrySet()) {
+            String text = briefing.getStr(entry.getKey());
+            assertTrue(text.getBytes(java.nio.charset.StandardCharsets.UTF_8).length <= entry.getValue(), entry.getKey());
+            assertTrue(text.endsWith("…"));
+            assertFalse(Character.isHighSurrogate(text.charAt(text.length() - 2)));
+        }
+        assertTrue(created.getMetadata().getBytes(java.nio.charset.StandardCharsets.UTF_8).length < 25000);
+    }
+
+    @Test
+    void oversizedPreservedMetadataFailsClearlyBeforeInsert() {
+        var error = assertThrows(IllegalArgumentException.class,
+                () -> service.createTask(baseCreate().metadata("{\"trace\":\"" + "中".repeat(22000) + "\"}").build()));
+        assertTrue(error.getMessage().contains("65535"));
+        assertTrue(error.getMessage().contains("metadata"));
+        verify(taskMapper, never()).insert(any(TeamTaskEntity.class));
     }
 
     // ==================== creation guards ====================
@@ -135,6 +281,60 @@ class TeamTaskServiceTest {
         assertEquals(TeamTaskStatus.PENDING, created.getStatus());
         assertEquals(1, created.getTaskNumber());
         assertEquals(0, created.getDispatchCount());
+    }
+
+    @Test
+    @DisplayName("create copies an optional run id onto the persisted task")
+    void createCopiesRunId() {
+        when(runService.requireRun(RUN_ID, WORKSPACE_ID)).thenReturn(planningRun(TEAM_ID));
+        service.createTask(baseCreate().runId(RUN_ID).build());
+
+        ArgumentCaptor<TeamTaskEntity> captor = ArgumentCaptor.forClass(TeamTaskEntity.class);
+        verify(taskMapper).insert(captor.capture());
+        assertEquals(RUN_ID, captor.getValue().getRunId());
+        verify(projectionScheduler).scheduleRun(RUN_ID);
+    }
+
+    @Test
+    @DisplayName("run-aware task creation requires a planning run in the same team")
+    void createRequiresPlanningRunInSameTeam() {
+        when(runService.requireRun(RUN_ID, WORKSPACE_ID)).thenReturn(planningRun(999L));
+        IllegalArgumentException wrongTeam = assertThrows(IllegalArgumentException.class,
+                () -> service.createTask(baseCreate().runId(RUN_ID).build()));
+        assertTrue(wrongTeam.getMessage().contains("same team"));
+
+        TeamRunEntity running = planningRun(TEAM_ID);
+        running.setStatus(TeamRunStatus.RUNNING);
+        when(runService.requireRun(RUN_ID, WORKSPACE_ID)).thenReturn(running);
+        IllegalStateException wrongStatus = assertThrows(IllegalStateException.class,
+                () -> service.createTask(baseCreate().runId(RUN_ID).build()));
+        assertTrue(wrongStatus.getMessage().contains("planning"));
+        verify(taskMapper, never()).insert(any(TeamTaskEntity.class));
+    }
+
+    @Test
+    @DisplayName("blockedBy tasks must belong to the same run")
+    void createRequiresBlockersInSameRun() {
+        when(runService.requireRun(RUN_ID, WORKSPACE_ID)).thenReturn(planningRun(TEAM_ID));
+        when(taskMapper.selectById(99L)).thenReturn(task(99L, TeamTaskStatus.PENDING));
+
+        IllegalArgumentException runTaskWithLegacyBlocker = assertThrows(IllegalArgumentException.class,
+                () -> service.createTask(baseCreate().runId(RUN_ID).blockedBy(List.of(99L)).build()));
+        assertTrue(runTaskWithLegacyBlocker.getMessage().contains("same run"));
+
+        when(taskMapper.selectById(99L)).thenReturn(runTask(99L, TeamTaskStatus.PENDING));
+        IllegalArgumentException legacyTaskWithRunBlocker = assertThrows(IllegalArgumentException.class,
+                () -> service.createTask(baseCreate().blockedBy(List.of(99L)).build()));
+        assertTrue(legacyTaskWithRunBlocker.getMessage().contains("same run"));
+    }
+
+    @Test
+    @DisplayName("legacy task creation does not trigger run projection")
+    void createLegacyTaskDoesNotProject() {
+        service.createTask(baseCreate().build());
+
+        verify(projectionScheduler, never()).scheduleRun(any());
+        verify(projectionScheduler, never()).scheduleTask(any());
     }
 
     // ==================== completion ====================
@@ -207,6 +407,266 @@ class TeamTaskServiceTest {
         assertThrows(IllegalStateException.class, () -> service.completeTask(5L, MEMBER_ID, "late"));
     }
 
+    @Test
+    @DisplayName("successful completion triggers run projection")
+    void completeProjectsRun() {
+        TeamTaskEntity running = runTask(5L, TeamTaskStatus.IN_PROGRESS);
+        running.setOwnerAgentId(MEMBER_ID);
+        when(taskMapper.selectById(5L)).thenReturn(running);
+        when(taskMapper.update(isNull(), any())).thenReturn(1);
+        when(taskMapper.selectList(any())).thenReturn(List.of());
+
+        service.completeTask(5L, MEMBER_ID, "done");
+
+        verify(projectionScheduler).scheduleRun(RUN_ID);
+    }
+
+    @Test
+    @DisplayName("successful failure triggers run projection")
+    void failProjectsRun() {
+        when(taskMapper.selectById(5L)).thenReturn(runTask(5L, TeamTaskStatus.IN_PROGRESS));
+        when(taskMapper.update(isNull(), any())).thenReturn(1);
+        InOrder mutationOrder = inOrder(taskMapper);
+
+        assertTrue(service.failTask(5L, "error"));
+
+        mutationOrder.verify(taskMapper).selectById(5L);
+        mutationOrder.verify(taskMapper).update(isNull(), any());
+        mutationOrder.verifyNoMoreInteractions();
+        verify(projectionScheduler).scheduleTask(5L);
+    }
+
+    @Test
+    @DisplayName("successful cancellation triggers run projection")
+    void cancelProjectsRun() {
+        when(taskMapper.selectById(5L)).thenReturn(runTask(5L, TeamTaskStatus.IN_PROGRESS));
+        when(taskMapper.update(isNull(), any())).thenReturn(1);
+        when(taskMapper.selectList(any())).thenReturn(List.of());
+
+        service.cancelTask(5L, "stop");
+
+        verify(projectionScheduler).scheduleRun(RUN_ID);
+    }
+
+    @Test
+    @DisplayName("successful retry triggers run projection")
+    void retryProjectsRun() {
+        when(taskMapper.update(isNull(), any())).thenReturn(1);
+        TeamTaskEntity failed = runTask(5L, TeamTaskStatus.FAILED);
+        failed.setAssigneeAgentId(MEMBER_ID);
+        String originalMetadata = "{\"trace\":\"keep\",\"briefing\":{\"schemaVersion\":1,\"description\":\"Original instructions\"}}";
+        failed.setMetadata(originalMetadata);
+        when(taskMapper.selectOne(any())).thenReturn(failed);
+
+        assertTrue(service.retryTask(5L));
+        ArgumentCaptor<LambdaUpdateWrapper<TeamTaskEntity>> update = ArgumentCaptor.forClass(LambdaUpdateWrapper.class);
+        verify(taskMapper).update(isNull(), update.capture());
+        assertFalse(update.getValue().getSqlSet().contains("metadata"));
+        assertEquals(originalMetadata, failed.getMetadata());
+
+        verify(projectionScheduler).scheduleTask(5L);
+    }
+
+    @Test
+    @DisplayName("claim does not query the task after a successful mutation")
+    void claimDoesNotQueryTaskAfterMutation() {
+        when(taskMapper.update(isNull(), any())).thenReturn(1);
+
+        assertTrue(service.claimTask(5L, MEMBER_ID));
+        verify(taskMapper, never()).selectById(5L);
+        verify(projectionScheduler).scheduleTask(5L);
+    }
+
+    @Test
+    @DisplayName("assign does not query the task after a successful mutation")
+    void assignDoesNotQueryTaskAfterMutation() {
+        when(taskMapper.update(isNull(), any())).thenReturn(1);
+
+        assertTrue(service.assignTask(5L, MEMBER_ID));
+        verify(taskMapper, never()).selectById(5L);
+        verify(projectionScheduler).scheduleTask(5L);
+    }
+
+    @Test
+    @DisplayName("completion succeeds when projection scheduling fails")
+    void completeIgnoresProjectionSchedulingFailure() {
+        TeamTaskEntity running = runTask(5L, TeamTaskStatus.IN_PROGRESS);
+        running.setOwnerAgentId(MEMBER_ID);
+        when(taskMapper.selectById(5L)).thenReturn(running);
+        when(taskMapper.update(isNull(), any())).thenReturn(1);
+        when(taskMapper.selectList(any())).thenReturn(List.of());
+        doThrow(new IllegalStateException("scheduler unavailable"))
+                .when(projectionScheduler).scheduleRun(RUN_ID);
+
+        assertTrue(service.completeTask(5L, MEMBER_ID, "done").isEmpty());
+    }
+
+    @Test
+    @DisplayName("successful progress update triggers run projection")
+    void progressProjectsRun() {
+        when(taskMapper.selectById(5L)).thenReturn(runTask(5L, TeamTaskStatus.IN_PROGRESS));
+        when(taskMapper.update(isNull(), any())).thenReturn(1);
+        InOrder mutationOrder = inOrder(taskMapper);
+
+        assertTrue(service.updateProgress(5L, MEMBER_ID, 50, "halfway"));
+
+        mutationOrder.verify(taskMapper).selectById(5L);
+        mutationOrder.verify(taskMapper).update(isNull(), any());
+        mutationOrder.verifyNoMoreInteractions();
+        verify(projectionScheduler).scheduleTask(5L);
+    }
+
+    @Test
+    @DisplayName("tool approval parks an in-progress task without releasing dependents")
+    void toolApprovalParksTask() {
+        TeamTaskEntity running = runTask(5L, TeamTaskStatus.IN_PROGRESS);
+        running.setMetadata("{\"deliverableRequired\":true}");
+        when(taskMapper.selectById(5L)).thenReturn(running);
+        when(taskMapper.update(isNull(), any())).thenReturn(1);
+
+        assertTrue(service.parkForToolApproval(5L, "pending-42", "shell command requires approval"));
+
+        ArgumentCaptor<LambdaUpdateWrapper<TeamTaskEntity>> captor =
+                ArgumentCaptor.forClass(LambdaUpdateWrapper.class);
+        verify(taskMapper).update(isNull(), captor.capture());
+        var values = captor.getValue().getParamNameValuePairs().values();
+        assertTrue(values.contains("awaiting_approval"));
+        assertTrue(values.stream().anyMatch(value -> String.valueOf(value).contains("pending-42")));
+        assertTrue(values.stream().anyMatch(value -> String.valueOf(value).contains("deliverableRequired")),
+                "parking must merge approval context into existing metadata");
+        verify(taskMapper, never()).selectList(any());
+        verify(projectionScheduler).scheduleTask(5L);
+    }
+
+    @Test
+    @DisplayName("tool approval resume requires the exact pending id and records the replay lease")
+    void toolApprovalResumeUsesExactPendingId() {
+        TeamTaskEntity waiting = runTask(5L, TeamTaskStatus.AWAITING_APPROVAL);
+        waiting.setAssigneeAgentId(MEMBER_ID);
+        waiting.setMetadata("{\"deliverableRequired\":true,\"toolApproval\":{\"pendingId\":\"pending-42\"}}");
+        when(taskMapper.selectById(5L)).thenReturn(waiting);
+        when(taskMapper.update(isNull(), any())).thenReturn(1);
+
+        assertTrue(service.resumeAfterToolApproval(5L, "pending-42"));
+
+        ArgumentCaptor<LambdaUpdateWrapper<TeamTaskEntity>> captor =
+                ArgumentCaptor.forClass(LambdaUpdateWrapper.class);
+        verify(taskMapper).update(isNull(), captor.capture());
+        var values = captor.getValue().getParamNameValuePairs().values();
+        assertTrue(values.contains(TeamTaskStatus.IN_PROGRESS));
+        assertTrue(values.stream().anyMatch(value -> String.valueOf(value).contains("deliverableRequired")));
+        assertTrue(values.stream().anyMatch(value -> String.valueOf(value).contains("replayInProgress")));
+        verify(projectionScheduler).scheduleTask(5L);
+    }
+
+    @Test
+    @DisplayName("a stale pending id cannot resume a worker task")
+    void staleToolApprovalCannotResumeTask() {
+        TeamTaskEntity waiting = runTask(5L, TeamTaskStatus.AWAITING_APPROVAL);
+        waiting.setMetadata("{\"toolApproval\":{\"pendingId\":\"pending-new\"}}");
+        when(taskMapper.selectById(5L)).thenReturn(waiting);
+
+        IllegalStateException error = assertThrows(IllegalStateException.class,
+                () -> service.resumeAfterToolApproval(5L, "pending-old"));
+
+        assertTrue(error.getMessage().contains("no longer current"));
+        verify(taskMapper, never()).update(isNull(), any());
+    }
+
+    @Test
+    @DisplayName("a replay result is staged under the exact approval before it is consumed")
+    void stagesToolReplayResultForCrashSafeFinalization() {
+        TeamTaskEntity running = runTask(5L, TeamTaskStatus.IN_PROGRESS);
+        running.setMetadata("{\"deliverableRequired\":true,"
+                + "\"toolApproval\":{\"pendingId\":\"pending-42\"}}");
+        when(taskMapper.selectById(5L)).thenReturn(running);
+        when(taskMapper.update(isNull(), any())).thenReturn(1);
+
+        assertTrue(service.stageToolReplayResult(5L, "pending-42", "tool completed"));
+
+        ArgumentCaptor<LambdaUpdateWrapper<TeamTaskEntity>> captor =
+                ArgumentCaptor.forClass(LambdaUpdateWrapper.class);
+        verify(taskMapper).update(isNull(), captor.capture());
+        var values = captor.getValue().getParamNameValuePairs().values();
+        assertTrue(values.contains(TeamTaskStatus.AWAITING_APPROVAL));
+        assertTrue(values.stream().anyMatch(value -> String.valueOf(value).contains("pending-42")));
+        assertTrue(values.stream().anyMatch(value -> String.valueOf(value).contains("tool completed")));
+        assertTrue(values.stream().anyMatch(value -> String.valueOf(value).contains("deliverableRequired")));
+        verify(projectionScheduler).scheduleTask(5L);
+    }
+
+    @Test
+    @DisplayName("a claimed replay can be stopped after failure but not after a result is staged")
+    void abortClaimedReplayHasExplicitGuard() {
+        TeamTaskEntity waiting = runTask(5L, TeamTaskStatus.AWAITING_APPROVAL);
+        waiting.setMetadata("{\"toolApproval\":{\"pendingId\":\"pending-42\"}}");
+        when(taskMapper.selectById(5L)).thenReturn(waiting);
+        when(taskMapper.update(isNull(), any())).thenReturn(1);
+
+        assertTrue(service.abortClaimedToolReplay(5L, "pending-42", "alice"));
+
+        waiting.setMetadata("{\"toolApproval\":{\"pendingId\":\"pending-42\","
+                + "\"replayResult\":\"done\"}}");
+        assertThrows(IllegalStateException.class,
+                () -> service.abortClaimedToolReplay(5L, "pending-42", "alice"));
+    }
+
+    @Test
+    @DisplayName("an expired replay lease becomes uncertain instead of an ordinary retryable stale task")
+    void expiredReplayLeaseRequiresManualResolution() {
+        TeamTaskEntity replay = runTask(5L, TeamTaskStatus.IN_PROGRESS);
+        replay.setMetadata("{\"toolApproval\":{\"pendingId\":\"pending-42\","
+                + "\"replayInProgress\":true}}");
+        when(taskMapper.selectList(any())).thenReturn(List.of(replay));
+        when(taskMapper.update(isNull(), any())).thenReturn(1);
+
+        service.recoverStaleTasks();
+
+        ArgumentCaptor<LambdaUpdateWrapper<TeamTaskEntity>> captor =
+                ArgumentCaptor.forClass(LambdaUpdateWrapper.class);
+        verify(taskMapper).update(isNull(), captor.capture());
+        var values = captor.getValue().getParamNameValuePairs().values();
+        assertTrue(values.contains(TeamTaskStatus.AWAITING_APPROVAL));
+        assertTrue(values.stream().anyMatch(value -> String.valueOf(value)
+                .contains("replayOutcomeUncertain")));
+        assertFalse(values.contains(TeamTaskStatus.STALE));
+    }
+
+    @Test
+    @DisplayName("a replay exception is immediately parked as outcome-uncertain")
+    void replayExceptionCannotBeAutomaticallyRetried() {
+        TeamTaskEntity replay = runTask(5L, TeamTaskStatus.IN_PROGRESS);
+        replay.setMetadata("{\"toolApproval\":{\"pendingId\":\"pending-42\","
+                + "\"replayInProgress\":true}}");
+        when(taskMapper.selectById(5L)).thenReturn(replay);
+        when(taskMapper.update(isNull(), any())).thenReturn(1);
+
+        assertTrue(service.parkToolReplayUncertain(
+                5L, "pending-42", "provider failed; outcome uncertain"));
+
+        ArgumentCaptor<LambdaUpdateWrapper<TeamTaskEntity>> captor =
+                ArgumentCaptor.forClass(LambdaUpdateWrapper.class);
+        verify(taskMapper).update(isNull(), captor.capture());
+        var values = captor.getValue().getParamNameValuePairs().values();
+        assertTrue(values.contains(TeamTaskStatus.AWAITING_APPROVAL));
+        assertTrue(values.stream().anyMatch(value -> String.valueOf(value)
+                .contains("replayOutcomeUncertain")));
+    }
+
+    @Test
+    @DisplayName("feedback reopens a settled worker task but not an active or approval-blocked task")
+    void feedbackResumeHasExplicitStateGuard() {
+        TeamTaskEntity completed = runTask(5L, TeamTaskStatus.COMPLETED);
+        completed.setAssigneeAgentId(MEMBER_ID);
+        when(taskMapper.selectById(5L)).thenReturn(completed);
+        when(taskMapper.update(isNull(), any())).thenReturn(1);
+
+        assertTrue(service.resumeForWorkerFeedback(5L));
+
+        completed.setStatus(TeamTaskStatus.AWAITING_APPROVAL);
+        assertThrows(IllegalStateException.class, () -> service.resumeForWorkerFeedback(5L));
+    }
+
     // ==================== blocker comment ====================
 
     @Test
@@ -236,6 +696,38 @@ class TeamTaskServiceTest {
 
         assertFalse(escalate);
         verify(taskMapper, never()).update(isNull(), any());
+    }
+
+    @Test
+    @DisplayName("checkpoint evidence note is inserted only when its stable key is absent")
+    void addCommentOnceIsIdempotent() {
+        when(commentMapper.selectCount(any(LambdaQueryWrapper.class))).thenReturn(1L, 0L);
+        when(taskMapper.selectById(5L)).thenReturn(task(5L, TeamTaskStatus.COMPLETED));
+
+        assertFalse(service.addCommentOnce(5L, TeamTaskService.AUTHOR_SYSTEM, "bridge",
+                TeamTaskService.COMMENT_NOTE, "[checkpoint:R001] acknowledged"));
+        assertTrue(service.addCommentOnce(5L, TeamTaskService.AUTHOR_SYSTEM, "bridge",
+                TeamTaskService.COMMENT_NOTE, "[checkpoint:R002] acknowledged"));
+
+        verify(commentMapper, times(1)).insert(any(TeamTaskCommentEntity.class));
+    }
+
+    @Test
+    @DisplayName("checkpoint notes are deduplicated by their embedded stable key")
+    void checkpointCommentIsSemanticallyIdempotent() {
+        TeamTaskEntity tracker = task(5L, TeamTaskStatus.IN_PROGRESS);
+        tracker.setSubject("R001-R010 共享跟踪检查点");
+        when(taskMapper.selectById(5L)).thenReturn(tracker);
+        when(commentMapper.selectCount(any(LambdaQueryWrapper.class))).thenReturn(1L);
+
+        assertFalse(service.addComment(5L, TeamTaskService.AUTHOR_AGENT, "2",
+                TeamTaskService.COMMENT_NOTE,
+                "[运行台账] R001: [checkpoint:R001] acknowledged"));
+
+        verify(commentMapper, never()).insert(any(TeamTaskCommentEntity.class));
+        assertEquals("[checkpoint:R001] acknowledged",
+                TeamTaskService.checkpointEvidenceKey(
+                        "[运行台账] [CHECKPOINT:r001] acknowledged"));
     }
 
     // ==================== circuit breaker ====================
@@ -328,6 +820,22 @@ class TeamTaskServiceTest {
     }
 
     @Test
+    @DisplayName("addDeliverable is idempotent for the same generated URL")
+    void addDeliverableIgnoresDuplicateUrl() {
+        TeamTaskEntity running = task(5L, TeamTaskStatus.IN_PROGRESS);
+        running.setOwnerAgentId(MEMBER_ID);
+        running.setMetadata("{\"deliverables\":[{\"name\":\"report.docx\","
+                + "\"url\":\"/api/v1/files/generated/abc\"}]}");
+        when(taskMapper.selectById(5L)).thenReturn(running);
+
+        service.addDeliverable(5L, MEMBER_ID, "report-again.docx",
+                "/api/v1/files/generated/abc");
+
+        verify(taskMapper, never()).update(isNull(), any());
+        verify(eventMapper, never()).insert(any(TeamTaskEventEntity.class));
+    }
+
+    @Test
     @DisplayName("deliverable guards: external URL, non-owner, terminal task and overflow are rejected")
     void addDeliverableGuards() {
         TeamTaskEntity running = task(5L, TeamTaskStatus.IN_PROGRESS);
@@ -373,5 +881,48 @@ class TeamTaskServiceTest {
         junk.setMetadata("not-json");
         assertTrue(service.listDeliverables(junk).isEmpty());
         assertTrue(service.listDeliverables(null).isEmpty());
+    }
+
+    @Test
+    @DisplayName("dispatch candidates exclude planning runs but keep running and legacy tasks")
+    void findDispatchableExcludesPlanningRuns() {
+        TeamTaskEntity planning = runTask(1L, TeamTaskStatus.PENDING);
+        TeamTaskEntity running = task(2L, TeamTaskStatus.PENDING);
+        running.setRunId(21L);
+        TeamTaskEntity legacy = task(3L, TeamTaskStatus.PENDING);
+        when(taskMapper.selectList(any())).thenReturn(List.of(planning, running, legacy));
+        when(runService.findPlanningRunIds(Set.of(RUN_ID, 21L))).thenReturn(Set.of(RUN_ID));
+
+        assertEquals(List.of(running, legacy), service.findDispatchable(TEAM_ID));
+        verify(runService).findPlanningRunIds(Set.of(RUN_ID, 21L));
+    }
+
+    @Test
+    @DisplayName("run task lookup is scoped by run id")
+    void listTasksByRunScopesQuery() {
+        TeamTaskEntity first = runTask(1L, TeamTaskStatus.PENDING);
+        when(taskMapper.selectList(any())).thenReturn(List.of(first));
+
+        assertEquals(List.of(first), service.listTasksByRun(RUN_ID));
+
+        ArgumentCaptor<LambdaQueryWrapper<TeamTaskEntity>> query =
+                ArgumentCaptor.forClass(LambdaQueryWrapper.class);
+        verify(taskMapper).selectList(query.capture());
+        query.getValue().getSqlSegment();
+        assertTrue(query.getValue().getParamNameValuePairs().containsValue(RUN_ID));
+    }
+
+    @Test
+    @DisplayName("checkpoint range detection ignores the injected overall plan context")
+    void checkpointTerminalTagUsesOnlyLocalTaskText() {
+        TeamTaskEntity tracker = task(1L, TeamTaskStatus.IN_PROGRESS);
+        tracker.setSubject("R001-R300 唯一共享跟踪条目");
+        tracker.setDescription("每轮登记证据，R300 前保持进行中\n\n[Plan context]\nOverall request");
+        assertEquals("R300", service.checkpointTerminalTag(tracker));
+
+        TeamTaskEntity ordinary = task(2L, TeamTaskStatus.IN_PROGRESS);
+        ordinary.setSubject("设计稳定性指标");
+        ordinary.setDescription("产出指标清单\n\n[Plan context]\nOverall request: R001-R300 共享跟踪");
+        assertNull(service.checkpointTerminalTag(ordinary));
     }
 }

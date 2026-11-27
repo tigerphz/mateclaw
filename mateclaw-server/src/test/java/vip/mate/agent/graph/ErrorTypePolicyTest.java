@@ -21,9 +21,11 @@ class ErrorTypePolicyTest {
     private static final Object[][] POLICY_TABLE = {
             {ErrorType.NONE,                 0,  false, false, false},
             {ErrorType.RATE_LIMIT,           2,  true,  false, true },
+            {ErrorType.PROVIDER_BUSY,        0,  true,  false, false},
             {ErrorType.OVERLOADED,           5,  true,  false, false},
             {ErrorType.SERVER_ERROR,         10, true,  false, true },
             {ErrorType.PROMPT_TOO_LONG,      0,  false, false, false},
+            {ErrorType.PAYLOAD_TOO_LARGE,    0,  false, false, false},
             {ErrorType.AUTH_ERROR,           0,  true,  true,  true },
             {ErrorType.CLIENT_ERROR,         0,  false, false, false},
             {ErrorType.THINKING_BLOCK_ERROR, 1,  false, false, false},

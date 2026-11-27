@@ -1,17 +1,25 @@
 ---
 title: MateClaw Introduction — Self-hosted Multi-Agent AI Operating System
-description: MateClaw is an open-source multi-agent AI OS built on Spring AI Alibaba. ReAct + Plan-and-Execute engines, LLM Wiki knowledge base, 4-layer memory lifecycle, MCP tool protocol, 8-channel integration. One JAR, zero data egress.
+description: MateClaw is an open-source multi-agent AI OS built on Spring AI + AgentScope. ReAct + Plan-and-Execute engines, LLM Wiki knowledge base, 4-layer memory lifecycle, MCP tool protocol, 8-channel integration. One self-hosted JAR with operator-controlled data and outbound integrations.
 head:
   - - meta
     - name: keywords
-      content: MateClaw,multi-agent AI,self-hosted AI,AI operating system,Spring AI Alibaba,ReAct,Plan-and-Execute,MCP,LLM Wiki,memory lifecycle,Tool Guard,open source
+      content: MateClaw,multi-agent AI,self-hosted AI,AI operating system,Spring AI + AgentScope,ReAct,Plan-and-Execute,MCP,LLM Wiki,memory lifecycle,Tool Guard,open source
 ---
 
 # MateClaw — Self-hosted Multi-Agent AI Operating System
 
+MateClaw **3.1.0** brings skill lesson governance, precise memory editing, answer quoting and status indicators, plus model, tool, knowledge and channel reliability improvements developed after 3.0.0.
+
+Version: **3.1.0**; release date: **2026-11-19**. For currently published versions, see [GitHub Releases](https://github.com/mateaix/mateclaw/releases).
+
+[Upgrade guidance and changelog](./changelog)
+
+**Previous stable release [3.0.0](./releases/3.0.0) (2026-10-26)** introduced Java 21, Boot 4, Spring AI 2 and native AgentScope execution. 3.1.0 retains that architecture; see [this release](./releases/3.1.0) for new changes.
+
 **Your multi-agent AI. On your hardware. Under your rules.**
 
-MateClaw is a full AI operating system you deploy yourself. One JAR. One login. Your data never leaves the room.
+MateClaw is a full AI operating system you deploy yourself. One JAR. One login. You control persisted data and outbound integrations.
 
 **Three things it does that other AI products can't:**
 
@@ -55,23 +63,23 @@ MateClaw fights a different fight. It's **all of it, under one roof, on hardware
 
 Running MateClaw on your own hardware is not a compliance checkbox. It changes what the product **is**.
 
-**Your data stops paying rent.** Logs, conversations, documents, memory — none of it trains anyone else's model. None of it waits in a vendor's queue. None of it leaves your machines unless you point a channel at one.
+**You control the data and egress boundary.** Conversations, logs, documents, and memory persist in your deployment. Only task content needed by cloud models, IM channels, MCP servers, or other tool services is sent to integrations you explicitly configure. For fully local processing, combine local models and tools and leave external integrations disabled.
 
 **You own the roadmap.** Don't like how the memory consolidator works? Change it. Need a tool your vendor won't build? Add it. MateClaw is Apache 2.0 — not source-available, not "open core", not waiting on a quarterly product review.
 
 **You pick the economics.** Start on DashScope. Swap to Ollama when your local GPU arrives. Put one agent on OpenAI and keep the rest cheap. Agent config and tool graphs don't care what's under the model interface.
 
-**Your deployment surface is real.** One JAR. One Spring Boot process. No Python runtime chain. No Node dependency hell. The desktop app bundles everything. The Docker compose file is eighteen lines.
+**Your deployment surface is real.** One JAR. One Spring Boot process. Running the service requires no separate Python or Node installation. The desktop app bundles its JRE, and one Docker Compose command starts PostgreSQL, SearXNG, and the server.
 
 ---
 
 ## What's under the hood
 
-- **Backend** — Spring Boot 3.5 + Spring AI Alibaba 1.1. Agent runtime built on a StateGraph with nodes for reasoning, action, observation, plan generation, and step execution. MyBatis Plus for persistence. SSE for streaming — WebFlux is explicitly excluded.
+- **Backend** — Java 21, Spring Boot 4.2.0, Spring AI 2.1.0 and AgentScope Java 2.0.5. Native ReAct owns reasoning/action iteration; explicit application phases own Plan-and-Execute. MyBatis Plus persists product data. Streaming uses servlet MVC SSE.
 - **Frontend** — Vue 3 + TypeScript. Pinia for state, Element Plus + Tailwind for UI, full dark mode. Built into the backend JAR's `static/` so one process serves both.
 - **Desktop** — Electron with bundled JRE 21 and the packaged server JAR. Launches, initializes, and your users never know Java is underneath.
 - **Channels** — Each channel is a `ChannelAdapter` SPI implementation. Web streams over SSE. IM channels run on their platform's long-connection or webhook mode.
-- **Storage** — H2 file DB for development, MySQL 8 for production. Flyway manages schema migrations with dialect-specific scripts for each.
+- **Storage** — H2 file DB for development and desktop; PostgreSQL 16 in the public Docker stack; a supported MySQL 8 profile; and an opt-in KingbaseES driver. Flyway manages schema migrations per database dialect.
 
 ---
 

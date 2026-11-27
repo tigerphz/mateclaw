@@ -14,6 +14,8 @@
 <script setup lang="ts">
 import { computed, watchEffect } from 'vue'
 import { useI18n } from 'vue-i18n'
+import { chatDocumentTitle, formatChatDocumentTitle } from '@/composables/useChatDocumentTitle'
+import { useChatFavicon } from '@/composables/useChatFavicon'
 import en from 'element-plus/es/locale/lang/en'
 import zhCn from 'element-plus/es/locale/lang/zh-cn'
 import { currentLocale } from '@/i18n'
@@ -21,6 +23,7 @@ import { useThemeStore } from '@/stores/useThemeStore'
 import { useSystemSettingsStore } from '@/stores/useSystemSettingsStore'
 import { useGlobalWikilinkClick } from '@/composables/useGlobalWikilinkClick'
 import { useGlobalFileDownloadClick } from '@/composables/useGlobalFileDownloadClick'
+import { useGlobalGeneratedImageBlob } from '@/composables/useGlobalGeneratedImageBlob'
 import McConfirmHost from '@/components/common/McConfirmHost.vue'
 import FilePreviewDialog from '@/components/chat/preview/FilePreviewDialog.vue'
 
@@ -42,11 +45,20 @@ useGlobalWikilinkClick()
 // expired/missing file degrades to a toast instead of a full-page navigation
 // to the backend's 404 JSON, which would otherwise replace the whole SPA.
 useGlobalFileDownloadClick()
+useGlobalGeneratedImageBlob()
 
 const { t } = useI18n()
+useChatFavicon(chatDocumentTitle)
 
 watchEffect(() => {
-  document.title = t('app.title')
+  document.title = formatChatDocumentTitle(chatDocumentTitle.value, t('app.title'), t('chat.newChat'), {
+    running: t('app.chatTitleStatus.running'),
+    completed: t('app.chatTitleStatus.completed'),
+    incomplete: t('app.chatTitleStatus.incomplete'),
+    failed: t('app.chatTitleStatus.failed'),
+    stopped: t('app.chatTitleStatus.stopped'),
+    awaiting_approval: t('app.chatTitleStatus.awaitingApproval'),
+  })
 })
 
 const elementLocale = computed(() => (currentLocale.value === 'en-US' ? en : zhCn))

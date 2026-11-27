@@ -1,5 +1,6 @@
 package vip.mate.skill.runtime;
 
+import vip.mate.workspace.core.service.MemberFileIsolation;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
@@ -110,6 +111,7 @@ public class SkillScriptExecutionService {
      */
     public ScriptResult executeCode(String language, String code, Path workingDir,
                                     List<String> args, Map<String, String> envVars, Long timeoutSeconds) {
+        if (MemberFileIsolation.isEnabled()) return ScriptResult.error(-1, "Use the isolated code executor in member isolation mode");
         if (code == null || code.isBlank()) {
             return ScriptResult.error(-1, "No code supplied");
         }
@@ -162,12 +164,14 @@ public class SkillScriptExecutionService {
 
     private ScriptResult executeResolved(Path scriptPath, List<String> args, Map<String, String> envVars,
                                          long timeoutSeconds, boolean scrubSensitiveEnv) {
+        if (MemberFileIsolation.isEnabled()) return ScriptResult.error(-1, "Skill script execution is unavailable in member isolation mode");
         if (!Files.exists(scriptPath) || !Files.isRegularFile(scriptPath)) {
             return ScriptResult.error(-1, "Script not found: " + scriptPath);
         }
 
         Path stdoutFile = null;
         Path stderrFile = null;
+        Process process = null;
 
         try {
             // 构建命令（结构化参数，避免 shell 注入）
@@ -242,7 +246,7 @@ public class SkillScriptExecutionService {
             }
             injectPipMirrorEnv(pb);
 
-            Process process = pb.start();
+            process = pb.start();
 
             boolean finished = process.waitFor(timeoutSeconds, TimeUnit.SECONDS);
             if (!finished) {
@@ -259,6 +263,16 @@ public class SkillScriptExecutionService {
             String stderr = readFileTruncated(stderrFile, MAX_OUTPUT_BYTES);
             return new ScriptResult(exitCode, stdout, stderr);
 
+        } catch (InterruptedException e) {
+            // Stop must terminate the OS process as well as the Java wait.
+            // Without this, cancelling the outer chat stream leaves skill
+            // scripts running until their normal timeout.
+            if (process != null && process.isAlive()) {
+                killProcess(process);
+            }
+            Thread.currentThread().interrupt();
+            log.info("Skill script interrupted by conversation cancellation: {}", scriptPath);
+            return ScriptResult.error(-1, "Execution cancelled by user");
         } catch (Exception e) {
             log.error("Failed to execute script {}: {}", scriptPath, e.getMessage());
             return ScriptResult.error(-1, "Execution error: " + e.getMessage());

@@ -17,6 +17,7 @@ import vip.mate.dashboard.repository.CronJobRunMapper;
 import vip.mate.i18n.I18nService;
 import vip.mate.memory.event.ConversationCompletionPublisher;
 import vip.mate.workspace.conversation.ConversationService;
+import vip.mate.workspace.conversation.model.MessageEntity;
 
 import java.time.LocalDateTime;
 
@@ -45,6 +46,9 @@ import java.time.LocalDateTime;
 @RequiredArgsConstructor
 public class CronJobLifecycleService {
 
+    public record StartResult(CronJobRunEntity run, Long originMessageId) {
+    }
+
     private final CronJobRunMapper runMapper;
     private final ConversationService conversationService;
     private final ConversationCompletionPublisher completionPublisher;
@@ -60,14 +64,16 @@ public class CronJobLifecycleService {
      * @param triggerType {@code scheduled} (cron tick) or {@code manual} (runNow)
      */
     @Transactional(propagation = Propagation.REQUIRES_NEW)
-    public CronJobRunEntity startRun(CronJobEntity job, String userMessage, String triggerType,
-                                     String conversationId) {
+    public StartResult startRun(CronJobEntity job, String userMessage, String triggerType,
+                                String conversationId) {
         CronJobRunEntity run = new CronJobRunEntity();
         run.setCronJobId(job.getId());
         run.setConversationId(conversationId);
         run.setStatus("running");
         run.setTriggerType(triggerType != null ? triggerType : "scheduled");
-        run.setStartedAt(LocalDateTime.now());
+        LocalDateTime now = LocalDateTime.now();
+        run.setStartedAt(now);
+        run.setHeartbeatAt(now);
         run.setDeliveryStatus("NONE");
         runMapper.insert(run);
 
@@ -90,10 +96,13 @@ public class CronJobLifecycleService {
         // Persist the user message before the LLM call so history reads
         // see a coherent (user → assistant) ordering even if the agent
         // throws mid-run.
+        Long originMessageId = null;
         if (userMessage != null && !userMessage.isBlank()) {
-            conversationService.saveMessage(conversationId, "user", userMessage);
+            MessageEntity savedUser = conversationService.saveMessage(
+                    conversationId, "user", userMessage);
+            originMessageId = savedUser == null ? null : savedUser.getId();
         }
-        return run;
+        return new StartResult(run, originMessageId);
     }
 
     /**
@@ -123,9 +132,45 @@ public class CronJobLifecycleService {
         String message = error != null && error.getMessage() != null ? error.getMessage() : "unknown error";
         runMapper.update(null, new LambdaUpdateWrapper<CronJobRunEntity>()
                 .eq(CronJobRunEntity::getId, run.getId())
+                .eq(CronJobRunEntity::getStatus, "running")
                 .set(CronJobRunEntity::getStatus, "failed")
                 .set(CronJobRunEntity::getFinishedAt, LocalDateTime.now())
                 .set(CronJobRunEntity::getErrorMessage, StrUtil.maxLength(message, 1000)));
+    }
+
+    /**
+     * T-fail — terminal graph failure that arrived as structured stream metadata
+     * rather than a thrown exception. Persist the diagnostic assistant message
+     * for conversation coherence, but never publish success, memory, or delivery
+     * events for an {@code error_fallback} result.
+     */
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void finishRunFailed(CronJobRunEntity run, AssistantMessage result,
+                                String conversationId, AgentService.ChatResult chatResult) {
+        String convId = conversationId != null ? conversationId : run.getConversationId();
+        String text = result != null && result.getText() != null ? result.getText() : "";
+        int totalTokens = chatResult != null
+                ? chatResult.promptTokens() + chatResult.completionTokens() : 0;
+        int updated = runMapper.update(null, new LambdaUpdateWrapper<CronJobRunEntity>()
+                .eq(CronJobRunEntity::getId, run.getId())
+                .eq(CronJobRunEntity::getStatus, "running")
+                .set(CronJobRunEntity::getStatus, "failed")
+                .set(CronJobRunEntity::getFinishedAt, LocalDateTime.now())
+                .set(CronJobRunEntity::getErrorMessage, StrUtil.maxLength(text, 1000))
+                .set(totalTokens > 0, CronJobRunEntity::getTokenUsage, totalTokens));
+        if (updated == 0) {
+            log.warn("[CronLifecycle] Run {} lost its running fence before graph failure; dropping late result",
+                    run.getId());
+            return;
+        }
+
+        if (chatResult != null) {
+            conversationService.saveMessage(convId, "assistant", text, null, "error",
+                    chatResult.promptTokens(), chatResult.completionTokens(),
+                    chatResult.runtimeModel(), chatResult.runtimeProvider());
+        } else {
+            conversationService.saveMessage(convId, "assistant", text, null, "error");
+        }
     }
 
     /**
@@ -141,7 +186,9 @@ public class CronJobLifecycleService {
         run.setConversationId(null);
         run.setStatus("running");
         run.setTriggerType(triggerType != null ? triggerType : "scheduled");
-        run.setStartedAt(LocalDateTime.now());
+        LocalDateTime now = LocalDateTime.now();
+        run.setStartedAt(now);
+        run.setHeartbeatAt(now);
         run.setDeliveryStatus("NONE");
         runMapper.insert(run);
         return run;
@@ -155,12 +202,16 @@ public class CronJobLifecycleService {
      */
     @Transactional(propagation = Propagation.REQUIRES_NEW)
     public void markRunSucceeded(CronJobRunEntity run, String description) {
-        runMapper.update(null, new LambdaUpdateWrapper<CronJobRunEntity>()
+        int updated = runMapper.update(null, new LambdaUpdateWrapper<CronJobRunEntity>()
                 .eq(CronJobRunEntity::getId, run.getId())
+                .eq(CronJobRunEntity::getStatus, "running")
                 .set(CronJobRunEntity::getStatus, "succeeded")
                 .set(CronJobRunEntity::getFinishedAt, LocalDateTime.now())
                 .set(CronJobRunEntity::getErrorMessage,
                         description != null ? StrUtil.maxLength(description, 1000) : null));
+        if (updated == 0) {
+            log.warn("[CronLifecycle] Run {} lost its running fence before system completion", run.getId());
+        }
     }
 
     /**
@@ -198,11 +249,17 @@ public class CronJobLifecycleService {
 
         int totalTokens = chatResult != null
                 ? chatResult.promptTokens() + chatResult.completionTokens() : 0;
-        runMapper.update(null, new LambdaUpdateWrapper<CronJobRunEntity>()
+        int updated = runMapper.update(null, new LambdaUpdateWrapper<CronJobRunEntity>()
                 .eq(CronJobRunEntity::getId, run.getId())
+                .eq(CronJobRunEntity::getStatus, "running")
                 .set(CronJobRunEntity::getStatus, "succeeded")
                 .set(CronJobRunEntity::getFinishedAt, LocalDateTime.now())
                 .set(totalTokens > 0, CronJobRunEntity::getTokenUsage, totalTokens));
+        if (updated == 0) {
+            log.warn("[CronLifecycle] Run {} lost its running fence before completion; dropping late result",
+                    run.getId());
+            return;
+        }
 
         if (silent) {
             // No-op run: persist a short marker so the tasks_<wsId>

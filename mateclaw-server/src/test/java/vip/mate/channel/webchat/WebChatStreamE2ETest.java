@@ -1,18 +1,22 @@
 package vip.mate.channel.webchat;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
-import org.springframework.boot.test.mock.mockito.MockBean;
+import org.springframework.test.context.bean.override.mockito.MockitoBean;
 import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.context.TestPropertySource;
+import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 import reactor.core.publisher.Flux;
 import vip.mate.MateClawApplication;
 import vip.mate.agent.AgentService;
 import vip.mate.agent.model.AgentEntity;
+import vip.mate.channel.web.ChatStreamTracker;
+import vip.mate.channel.webchat.WebChatController.WebChatRequest;
 
 import java.io.BufferedReader;
 import java.io.IOException;
@@ -28,6 +32,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ExecutorService;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
@@ -44,7 +49,7 @@ import static org.mockito.ArgumentMatchers.isNull;
  * body is the actual SSE wire format produced by Spring MVC's SseEmitter — the
  * parser here is the one any third-party SDK would have to write.
  *
- * <p>{@link AgentService} is replaced with a Mockito {@code @MockBean} so the
+ * <p>{@link AgentService} is replaced with a Mockito {@code @MockitoBean} so the
  * agent / model layer is short-circuited: tests stub
  * {@link AgentService#chatStructuredStream} to return canned {@link AgentService.StreamDelta}s
  * and assert on the resulting SSE event sequence. This keeps the test fast,
@@ -74,12 +79,14 @@ import static org.mockito.ArgumentMatchers.isNull;
 @TestPropertySource(properties = {
         "spring.datasource.url=jdbc:h2:mem:webchat_stream_e2e_${random.uuid};MODE=MySQL;DATABASE_TO_LOWER=TRUE;CASE_INSENSITIVE_IDENTIFIERS=TRUE;DB_CLOSE_DELAY=-1",
         "spring.ai.dashscope.api-key=test-key",
-        "mateclaw.jwt.secret=webchat-it-secret-0123456789",
+        "mateclaw.jwt.secret=webchat-it-secret-0123456789abcdef",
+        "mateclaw.webchat.orphan-grace-sec=-1",
         "mateclaw.feature-flag.refresh-ms=999999"
 })
 class WebChatStreamE2ETest {
 
-    private static final String SECRET = "webchat-it-secret-0123456789";
+    private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
+    private static final String SECRET = "webchat-it-secret-0123456789abcdef";
     private static final String API_KEY = "testkey1e2etest01"; // key8 = "testkey1"
     private static final long CHANNEL_ID = 9_148_001L;
     private static final long AGENT_ID = 9_148_0011L;
@@ -87,9 +94,11 @@ class WebChatStreamE2ETest {
 
     @LocalServerPort private int port;
     @Autowired private JdbcTemplate jdbc;
+    @Autowired private WebChatController controller;
+    @Autowired private ChatStreamTracker streamTracker;
 
     /** Replaced with a Mockito mock; tests stub the two methods /stream calls. */
-    @MockBean private AgentService agentService;
+    @MockitoBean private AgentService agentService;
 
     private HttpClient http;
 
@@ -217,10 +226,23 @@ class WebChatStreamE2ETest {
         return rows.isEmpty() ? null : rows.get(0);
     }
 
+    private static String concatenatedContent(List<SseEvent> events) {
+        return events.stream()
+                .filter(e -> "content_delta".equals(e.name))
+                .map(e -> {
+                    try {
+                        return OBJECT_MAPPER.readTree(e.data).path("text").asText();
+                    } catch (IOException ex) {
+                        throw new AssertionError("Invalid content_delta JSON: " + e.data, ex);
+                    }
+                })
+                .reduce("", String::concat);
+    }
+
     // ==================== tests ====================
 
     @Test
-    @DisplayName("happy path: meta → content_delta* → done; assistant reply persisted")
+    @DisplayName("happy path: meta → batched content_delta* → done; assistant reply persisted")
     void happyPath() throws Exception {
         org.mockito.Mockito.when(agentService.chatStructuredStream(
                         eq(AGENT_ID), anyString(), anyString(), anyString(), isNull(), any()))
@@ -233,7 +255,8 @@ class WebChatStreamE2ETest {
                 streamPost(API_KEY, "{\"message\":\"hi\",\"visitorId\":\"" + visitorId + "\"}"));
 
         List<String> names = events.stream().map(e -> e.name).toList();
-        assertThat(names).containsSequence("meta", "content_delta", "content_delta", "done");
+        assertThat(names).containsSequence("meta", "content_delta", "done");
+        assertThat(concatenatedContent(events)).isEqualTo("Hello world!");
 
         SseEvent meta = events.stream().filter(e -> "meta".equals(e.name)).findFirst().orElseThrow();
         assertThat(meta.data)
@@ -246,6 +269,38 @@ class WebChatStreamE2ETest {
         assertThat(countUserMessages(cid)).isEqualTo(1);
         assertThat(countAssistantMessages(cid)).isEqualTo(1);
         assertThat(lastAssistantContent(cid)).isEqualTo("Hello world!");
+    }
+
+    @Test
+    @DisplayName("disconnect before chat worker registration arms orphan cleanup")
+    void disconnectBeforeChatWorkerRegistrationIsNotLost() throws Exception {
+        org.mockito.Mockito.when(agentService.chatStructuredStream(
+                        eq(AGENT_ID), anyString(), anyString(), anyString(), isNull(), any()))
+                .thenReturn(Flux.never());
+        String visitorId = "vE2E-pre-register-disconnect";
+        String sessionId = "pre-register";
+        String cid = WebChatController.deriveConversationId(API_KEY, visitorId, sessionId);
+        WebChatRequest request = new WebChatRequest();
+        request.setMessage("keep running");
+        request.setVisitorId(visitorId);
+        request.setSessionId(sessionId);
+
+        WebChatDisconnectTestSupport.QueuedExecutorService queued =
+                new WebChatDisconnectTestSupport.QueuedExecutorService();
+        ExecutorService original = WebChatDisconnectTestSupport.swapExecutor(controller, queued);
+        try {
+            SseEmitter emitter = controller.chatStream(API_KEY, request);
+            WebChatDisconnectTestSupport.fireCompletion(emitter);
+            queued.runNext();
+        } finally {
+            WebChatDisconnectTestSupport.swapExecutor(controller, original);
+        }
+
+        streamTracker.cleanupStaleRuns();
+
+        assertThat(streamTracker.streamExistsOnThisNode(cid))
+                .as("a disconnect observed before registration must arm exact-run orphan cleanup")
+                .isFalse();
     }
 
     @Test
@@ -271,8 +326,9 @@ class WebChatStreamE2ETest {
             byName.computeIfAbsent(e.name, k -> new ArrayList<>()).add(e);
         }
         assertThat(byName).containsKeys("meta", "thinking_delta", "content_delta", "done");
-        // 2 content_delta events, 1 thinking_delta, exactly one done.
-        assertThat(byName.get("content_delta")).hasSize(2);
+        // Adjacent upstream chunks may be coalesced on the SSE wire. The
+        // protocol guarantees complete ordered text, not one event per chunk.
+        assertThat(concatenatedContent(events)).isEqualTo("Final answer.");
         assertThat(byName.get("thinking_delta")).hasSize(1);
         assertThat(byName.get("done")).hasSize(1);
         assertThat(byName.get("meta")).hasSize(1);

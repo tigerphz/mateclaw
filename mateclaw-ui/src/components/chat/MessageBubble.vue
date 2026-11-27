@@ -3,6 +3,8 @@
     class="message-wrapper"
     :class="[role, { 'is-last': isLast }]"
     :data-role="role"
+    :data-message-id="message.id"
+    :data-conversation-id="message.conversationId"
     :data-status="status"
     @mouseenter="hovered = true"
     @mouseleave="hovered = false"
@@ -47,6 +49,18 @@
         <!-- ===== 分段式渲染模式（Claude Code 风格）===== -->
         <template v-if="useSegmentedView">
           <div class="segments-view">
+            <!-- The "full reasoning" preference is hiding earlier spans. Say so:
+                 silently removing them reads as reasoning that went missing. -->
+            <button
+              v-if="hiddenThinkingCount > 0 && showThinking"
+              class="superseded-toggle"
+              type="button"
+              @click="earlyThinkingExpanded = true"
+            >
+              <el-icon><InfoFilled /></el-icon>
+              <span>{{ $t('chat.earlierThinkingCollapsed', { count: hiddenThinkingCount }) }}</span>
+              <span class="superseded-toggle__action">{{ $t('chat.expand') }}</span>
+            </button>
             <template v-for="iter in groupedIterations" :key="iter.key">
               <!-- Iteration interrupted before any output landed — surface a chip
                    so the user knows the agent moved on instead of silently
@@ -61,31 +75,17 @@
               <template v-else>
                 <template v-for="seg in iter.items" :key="seg.id">
                 <ThinkingSegment v-if="seg.type === 'thinking' && showThinking" :segment="seg" />
-                <ToolCallSegment v-else-if="seg.type === 'tool_call'" :segment="seg" />
+                <ToolCallSegment v-else-if="seg.type === 'tool_call'" :segment="seg" :show-structured-result="false" />
                 <template v-else-if="seg.type === 'content'">
-                  <button
-                    v-if="seg.superseded"
-                    class="superseded-toggle"
-                    type="button"
-                    @click="toggleSupersededSegment(seg.id)"
-                  >
-                    <el-icon><InfoFilled /></el-icon>
-                    <span>{{ $t('chat.supersededPreviewCollapsed') }}</span>
-                    <span class="superseded-toggle__action">
-                      {{ isSupersededExpanded(seg.id) ? $t('chat.collapse') : $t('chat.expand') }}
-                    </span>
-                  </button>
-                  <div v-if="seg.repetitionWarning && (!seg.superseded || isSupersededExpanded(seg.id))" class="repetition-warning">
+                  <div v-if="seg.repetitionWarning" class="repetition-warning">
                     <el-icon><WarningFilled /></el-icon>
                     <span class="repetition-warning__text">{{ $t('chat.contentRepetitionWarning') }}</span>
                     <span v-if="seg.truncatedChars" class="repetition-warning__meta">({{ seg.truncatedChars }} chars)</span>
                   </div>
                   <ContentSegment
-                    v-if="!seg.superseded || isSupersededExpanded(seg.id)"
                     :segment="seg"
                     :show-cursor="showCursor && seg.status === 'running'"
                     :generated-file-names="generatedFileNames"
-                    :class="{ 'content-segment--superseded': seg.superseded }"
                   />
                 </template>
                 </template>
@@ -193,17 +193,11 @@
           -->
           <UserMessageContent v-if="role === 'user'" :content="displayContent" />
           <template v-else>
-            <div class="markdown-body" v-html="renderedContent"></div>
+            <div data-quote-answer class="markdown-body compact-markdown" v-html="renderedContent"></div>
             <TypingCursor v-if="showCursor" :typing="isGenerating" />
           </template>
         </div>
 
-
-        <!-- 停止指示器 -->
-        <div v-if="status === 'stopped' || status === 'interrupted'" class="stopped-indicator">
-          <el-icon><CloseBold /></el-icon>
-          <span>{{ status === 'interrupted' ? $t('chat.interrupted') : $t('chat.stopped') }}</span>
-        </div>
 
         <!-- parse_error content block -->
         <div v-if="parseErrorText" class="parse-error-card">
@@ -221,7 +215,7 @@
           <p class="error-card__action">{{ errorAction }}</p>
           <div class="error-card__footer">
             <span v-if="errorCode" class="error-card__code">{{ errorCode }}</span>
-            <button v-if="errorRetryable" class="error-card__retry" type="button" @click="$emit('regenerate')">
+            <button v-if="errorRetryable && !readonly" class="error-card__retry" type="button" @click="$emit('regenerate')">
               <el-icon><RefreshRight /></el-icon>
               {{ $t('chat.retry') }}
             </button>
@@ -229,6 +223,26 @@
         </div>
 
         </template><!-- /传统合并渲染模式 -->
+
+        <!-- Tool payloads remain in metadata; only their presentation moves.
+             Wait for this turn to finish, including stop/error, so results do
+             not interrupt reasoning and do not disappear on interrupted turns. -->
+        <div v-if="!isGenerating && answerToolResults.length" class="answer-tool-results">
+          <ToolResultView v-for="result in answerToolResults" :key="result.toolCallId || result.id"
+            :structured-content="result.structuredContent" />
+        </div>
+
+        <!-- Stopped/interrupted status lives outside the rendering fork so
+             segmented history turns with only thinking/tool output still make
+             the manual stop visible. -->
+        <div
+          v-if="status === 'stopped' || status === 'interrupted'"
+          class="stopped-indicator"
+          :class="status === 'interrupted' ? 'stopped-indicator--interrupted' : 'stopped-indicator--stopped'"
+        >
+          <el-icon><CloseBold /></el-icon>
+          <span>{{ status === 'interrupted' ? $t('chat.interrupted') : $t('chat.stopped') }}</span>
+        </div>
 
         <!--
           INCOMPLETE banner: graph emitted finishReason=incomplete after
@@ -244,11 +258,21 @@
           </div>
           <p class="incomplete-card__description">{{ $t('chat.incompleteDescription') }}</p>
           <div class="incomplete-card__footer">
-            <button class="incomplete-card__retry" type="button" @click="$emit('regenerate')">
+            <button v-if="!readonly" class="incomplete-card__retry" type="button" @click="$emit('regenerate')">
               <el-icon><RefreshRight /></el-icon>
               {{ $t('chat.incompleteRetry') }}
             </button>
           </div>
+        </div>
+
+        <!-- Use the persisted finish reason so a model's wrap-up cannot hide
+             an iteration-cap exit. Hide intermediate caps during goal continuation. -->
+        <div v-if="isIterationLimitReached" class="incomplete-card iteration-limit-card" role="status">
+          <div class="incomplete-card__header">
+            <el-icon class="incomplete-card__icon"><WarningFilled /></el-icon>
+            <span class="incomplete-card__title">{{ $t('chat.iterationLimitTitle') }}</span>
+          </div>
+          <p class="incomplete-card__description">{{ $t('chat.iterationLimitDescription') }}</p>
         </div>
 
         <!--
@@ -425,7 +449,7 @@
           </button>
           <!-- 重新生成（仅会话末尾的 assistant 回答；服务端只支持对末条回答重生成） -->
           <button
-            v-if="role === 'assistant' && !isGenerating && isLast"
+            v-if="role === 'assistant' && !isGenerating && isLast && !readonly"
             class="action-btn"
             type="button"
             :title="$t('chat.regenerate')"
@@ -436,7 +460,7 @@
           <!-- 回退到此处：删除本条及之后的所有消息。仅已持久化的消息可回退
                （客户端临时 id 带下划线，持久化雪花 id 是纯数字） -->
           <button
-            v-if="!isGenerating && canRewind"
+            v-if="!isGenerating && canRewind && !readonly"
             class="action-btn"
             type="button"
             :title="$t('chat.rewindHere')"
@@ -583,13 +607,15 @@ import { buildGeneratedFileNameMap, linkifyGeneratedFileUrls } from '@/utils/gen
 import { ensureModelViewer } from '@/utils/lazyModelViewer'
 import { useAuthenticatedAttachment } from '@/composables/useAuthenticatedAttachment'
 import { useToolLabel } from '@/composables/useToolLabel'
-import { http } from '@/api'
+import { http, fetchAuthenticatedBlob } from '@/api'
 import { copyToClipboard } from '@/utils/clipboard'
 import TypingCursor from './TypingCursor.vue'
 import { previewKindOf } from './preview/previewKind'
 import { openFilePreview } from './preview/previewBus'
 import BrowserTimeline from './BrowserTimeline.vue'
 import ToolCallSegment from './ToolCallSegment.vue'
+import ToolResultView from './tool-results/ToolResultView.vue'
+import { hasToolResultUi } from './tool-results/registry'
 import ThinkingSegment from './ThinkingSegment.vue'
 import ContentSegment from './ContentSegment.vue'
 import GoalAvatarRing from '@/components/goal/GoalAvatarRing.vue'
@@ -622,6 +648,7 @@ interface Props {
   assistantIcon?: string
   userIcon?: string
   showCursor?: boolean
+  readonly?: boolean
 }
 
 const props = withDefaults(defineProps<Props>(), {
@@ -629,6 +656,7 @@ const props = withDefaults(defineProps<Props>(), {
   assistantIcon: '🤖',
   userIcon: 'U',
   showCursor: false,
+  readonly: false,
 })
 
 const emit = defineEmits<{
@@ -728,7 +756,7 @@ const hasContent = computed(() => {
 // The segments auto-collapse when a thinking phase completes, so the final
 // answer stays the focal point even with reasoning visible. debugMode remains
 // a separate switch for tool-call internals and other diagnostics.
-const { showThinking } = storeToRefs(useSystemSettingsStore())
+const { showThinking, thinkingFull } = storeToRefs(useSystemSettingsStore())
 
 const showThinkingPanel = computed(() => showThinking.value && !!thinkingContent.value)
 
@@ -847,59 +875,59 @@ function copyMessage() {
 // --- TTS 朗读 ---
 const ttsState = ref<'idle' | 'loading' | 'playing'>('idle')
 let ttsAudio: HTMLAudioElement | null = null
+let ttsBlobUrl: string | null = null
+let ttsRequestVersion = 0
+
+function stopTts() {
+  ttsAudio?.pause()
+  if (ttsAudio) { ttsAudio.onended = null; ttsAudio.onerror = null }
+  ttsAudio = null
+  if (ttsBlobUrl) URL.revokeObjectURL(ttsBlobUrl)
+  ttsBlobUrl = null
+  ttsState.value = 'idle'
+}
 
 async function handleTts() {
   if (ttsState.value === 'playing') {
-    // 停止播放
-    ttsAudio?.pause()
-    ttsAudio = null
-    ttsState.value = 'idle'
+    stopTts()
     return
   }
-
+  if (ttsState.value === 'loading') return
   const text = displayContent.value || props.message.content || ''
-  if (!text) return
-
   const conversationId = props.message.conversationId
-  if (!conversationId) return
+  if (!text || !conversationId) return
 
+  const version = ++ttsRequestVersion
   ttsState.value = 'loading'
   try {
-    const res: any = await http.post('/tts/synthesize', {
-      conversationId,
-      text,
-    })
-    if (res.data?.success && res.data?.audioUrl) {
-      // 通过认证 fetch 获取音频 blob
-      const audioRes = await fetch(res.data.audioUrl, {
-        headers: { Authorization: `Bearer ${localStorage.getItem('token') || ''}` },
-      })
-      const blob = await audioRes.blob()
-      const blobUrl = URL.createObjectURL(blob)
-      ttsAudio = new Audio(blobUrl)
-      ttsAudio.onended = () => {
-        ttsState.value = 'idle'
-        URL.revokeObjectURL(blobUrl)
-        ttsAudio = null
-      }
-      ttsAudio.onerror = () => {
-        ttsState.value = 'idle'
-        URL.revokeObjectURL(blobUrl)
-        ttsAudio = null
-      }
-      ttsState.value = 'playing'
-      await ttsAudio.play()
-    } else {
-      ttsState.value = 'idle'
+    // The shared interceptor already unwraps the raw TTS response body.
+    const result: any = await http.post('/tts/synthesize', { conversationId, text }, { timeout: 240_000 })
+    if (version !== ttsRequestVersion) return
+    if (!result?.success || !result.audioUrl) {
+      throw new Error(result?.error || t('chat.ttsFailed'))
     }
-  } catch {
-    ttsState.value = 'idle'
+    const blob = await fetchAuthenticatedBlob(result.audioUrl)
+    if (version !== ttsRequestVersion) return
+    ttsBlobUrl = URL.createObjectURL(blob)
+    ttsAudio = new Audio(ttsBlobUrl)
+    ttsAudio.onended = stopTts
+    ttsAudio.onerror = () => {
+      stopTts()
+      mcToast.error(t('chat.ttsFailed'))
+    }
+    await ttsAudio.play()
+    if (version === ttsRequestVersion && ttsAudio) ttsState.value = 'playing'
+  } catch (error) {
+    if (version !== ttsRequestVersion) return
+    stopTts()
+    mcToast.error(error instanceof Error ? error.message : t('chat.ttsFailed'))
   }
 }
 
 onBeforeUnmount(() => {
   if (copyTimer) clearTimeout(copyTimer)
-  if (ttsAudio) { ttsAudio.pause(); ttsAudio = null }
+  ++ttsRequestVersion
+  stopTts()
   revokeAll()
 })
 
@@ -1063,18 +1091,6 @@ const formatFileSize = (size: number) => {
 
 // --- 执行过程面板 ---
 const executionExpanded = ref(false)
-const expandedSupersededSegments = ref(new Set<string>())
-
-function isSupersededExpanded(id: string) {
-  return expandedSupersededSegments.value.has(id)
-}
-
-function toggleSupersededSegment(id: string) {
-  const next = new Set(expandedSupersededSegments.value)
-  if (next.has(id)) next.delete(id)
-  else next.add(id)
-  expandedSupersededSegments.value = next
-}
 
 // --- 分段式渲染（Claude Code 风格） ---
 const parsedMetadata = computed(() => {
@@ -1091,6 +1107,40 @@ const parsedMetadata = computed(() => {
     } catch { return {} }
   }
   return raw
+})
+
+/** Per-message override of the "full reasoning" preference (the collapse banner). */
+const earlyThinkingExpanded = ref(false)
+
+/**
+ * Apply the "full reasoning" preference. When off, only the reasoning span
+ * that produced the answer survives — the last one in the timeline. Everything
+ * is still persisted and still exported by the trajectory endpoint; this is
+ * purely how much of it the bubble shows. A running span is never dropped, so
+ * a live turn still shows the model thinking as it goes.
+ *
+ * Whatever this hides is announced by the banner above the timeline and can be
+ * expanded in place. Dropping spans with no trace is indistinguishable from
+ * losing them — the reader sees reasoning that was there mid-turn simply gone,
+ * and a preference stuck in the off state has no symptom to follow back.
+ */
+function applyThinkingDetail(segs: MessageSegment[]): MessageSegment[] {
+  if (thinkingFull.value || earlyThinkingExpanded.value) return segs
+  const keepIdx = segs.map((s, i) => (s.type === 'thinking' ? i : -1))
+    .filter(i => i >= 0)
+    .pop()
+  if (keepIdx === undefined) return segs
+  return segs.filter((s, i) =>
+    s.type !== 'thinking' || i === keepIdx || s.status === 'running')
+}
+
+/** How many reasoning spans the preference is currently hiding on this message. */
+const hiddenThinkingCount = computed(() => {
+  if (thinkingFull.value || earlyThinkingExpanded.value) return 0
+  const all = (parsedMetadata.value?.segments as MessageSegment[] | undefined) || []
+  const total = all.filter(s => s.type === 'thinking').length
+  const shown = segments.value.filter(s => s.type === 'thinking').length
+  return Math.max(0, total - shown)
 })
 
 const segments = computed<MessageSegment[]>(() => {
@@ -1111,9 +1161,15 @@ const segments = computed<MessageSegment[]>(() => {
         // iteration's thinking bucket instead of the default-zero bucket
         // colliding with later iteration content. Without this, the fallback
         // thinking renders below the answer for any conversation that has
-        // multi-iteration RFC-22 segments tagged elsewhere.
+        // multi-iteration segments tagged elsewhere.
+        //
+        // seq=-1 keeps it ahead of every producer-numbered segment so the
+        // sort below still applies to the array it was injected into. This
+        // reconstruction has no real emission position — the thinking came
+        // from contentParts, not from the timeline — and leading the turn is
+        // the only defensible placement for it.
         const firstIter = segs.find(s => typeof s.iterationIndex === 'number')?.iterationIndex ?? 0
-        segs.unshift({ id: 'th-fb', type: 'thinking', status: 'completed', thinkingText: thinkingPart.text, iterationIndex: firstIter })
+        segs.unshift({ id: 'th-fb', type: 'thinking', status: 'completed', thinkingText: thinkingPart.text, iterationIndex: firstIter, seq: -1 })
       }
     }
 
@@ -1137,18 +1193,18 @@ const segments = computed<MessageSegment[]>(() => {
     segs.length = 0
     segs.push(...deduped)
 
-    // 修复历史消息顺序：如果 thinking 被落在 content 后面，提到首个 content 前
-    // 只处理单个 thinking 段的常见场景，避免破坏复杂交错时间线
-    const thinkingIndices = segs
-      .map((seg, index) => seg.type === 'thinking' ? index : -1)
-      .filter(index => index >= 0)
-    const firstNonThinkingIdx = segs.findIndex((seg: MessageSegment) => seg.type !== 'thinking')
-    if (thinkingIndices.length === 1 && firstNonThinkingIdx >= 0 && thinkingIndices[0] > firstNonThinkingIdx) {
-      const [thinkingSeg] = segs.splice(thinkingIndices[0], 1)
-      segs.splice(0, 0, thinkingSeg)
+    // 按发射序号排序。segments 携带生产端的单调 `seq`，排序对上面的去重
+    // 步骤是稳定的，且不会按类型搬运任何段落 —— 一段在工具观察之后产生的
+    // thinking 就留在观察之后，那才是模型真正产出它的位置。此前这里把"唯一
+    // 的 thinking 段"强行提到首个 content 之前，会把读完工具结果才得出的推理
+    // 显示在工具卡片上方，语义与实际发生顺序相反。
+    // 没有 `seq` 的走原数组顺序：live 段本就按事件顺序追加，历史消息也只有
+    // 数组顺序这一个信息源，无从重排。
+    if (segs.every(seg => typeof seg.seq === 'number')) {
+      segs.sort((a, b) => (a.seq as number) - (b.seq as number))
     }
 
-    return segs
+    return applyThinkingDetail(segs)
   }
 
   // Fallback：从 toolCalls + contentParts 做 best-effort 重建（旧消息兼容）
@@ -1161,9 +1217,12 @@ const segments = computed<MessageSegment[]>(() => {
   const toolCalls = meta?.toolCalls || []
   toolCalls.forEach((tc: ToolCallMeta, i: number) => {
     segs.push({
-      id: `tc-${i}`, type: 'tool_call', status: 'completed',
+      id: `tc-${i}`, type: 'tool_call',
+      status: tc.success === false ? 'error'
+        : (!tc.status || tc.status === 'completed' ? 'completed' : 'running'),
       toolName: tc.name, toolArgs: tc.arguments,
       toolResult: tc.result, toolSuccess: tc.success,
+      toolCallId: tc.toolCallId, structuredContent: tc.structuredContent,
     })
   })
   if (props.message.content) {
@@ -1172,9 +1231,24 @@ const segments = computed<MessageSegment[]>(() => {
   return segs
 })
 
+// Use the same deduplicated source for live and reloaded messages. Never
+// concatenate toolCalls with segments: they are two copies of the same calls.
+const answerToolResults = computed(() => {
+  const seen = new Set<string>()
+  return segments.value.filter(seg => {
+    if (seg.type !== 'tool_call' || seg.status !== 'completed'
+        || seg.toolSuccess === false || !hasToolResultUi(seg.structuredContent)) return false
+    const key = seg.toolCallId || seg.id
+    if (seen.has(key)) return false
+    seen.add(key)
+    return true
+  })
+})
+
 /**
  * Use segmented rendering when there are multiple segments, OR when the turn
- * contains a delegation segment. Delegations live in `segments` but not in
+ * contains structured output or a delegation segment. Structured output must
+ * remain visible even when it is the only segment. Delegations live in `segments` but not in
  * `metadata.toolCalls`, so the fallback path (which only reads toolCalls)
  * renders nothing for them — a single-step plan that delegates to a subagent
  * would otherwise show the subagent call as completely invisible. Forcing
@@ -1182,7 +1256,7 @@ const segments = computed<MessageSegment[]>(() => {
  */
 const useSegmentedView = computed(() =>
   segments.value.length > 1 ||
-  segments.value.some(s => s.type === 'tool_call' && (s.toolName || '').startsWith('→'))
+  segments.value.some(s => s.type === 'tool_call' && (s.structuredContent || (s.toolName || '').startsWith('→')))
 )
 
 /**
@@ -1251,8 +1325,8 @@ function fmtTokens(n: number): string {
  * Group segments by iterationIndex so each ReAct iteration renders as its own
  * thinking/tool-calls/content cluster. Falls back to a single ungrouped bucket
  * for legacy messages (no iterationIndex tagged) so historical conversations
- * keep rendering as before — including the existing "single-thinking reorder"
- * normalization done in the `segments` computed above.
+ * keep rendering as before. Ordering within a bucket is whatever the
+ * `segments` computed above settled on — emission order, by `seq`.
  */
 const groupedIterations = computed(() => {
   const segs = segments.value || []
@@ -1300,6 +1374,11 @@ const isIncomplete = computed<boolean>(() => {
   if (props.message.role !== 'assistant') return false
   return parsedMetadata.value?.finishReason === 'incomplete'
 })
+
+const isIterationLimitReached = computed<boolean>(() =>
+  props.message.role === 'assistant' && !isGenerating.value
+  && parsedMetadata.value?.finishReason === 'max_iterations_reached'
+)
 
 /**
  * True when the graph completed normally but {@code SourceEvidenceLedger}
@@ -1353,6 +1432,7 @@ const feedbackInfo = computed<FeedbackInfo | undefined>(() => {
 })
 
 function handleFeedbackAction(action: string) {
+  if (props.readonly && (action === 'retry' || action === 'regenerate')) return
   if (action === 'retry' || action === 'regenerate') {
     emit('regenerate')
     return
@@ -1658,10 +1738,6 @@ watch(isGenerating, (generating) => {
   color: var(--mc-primary, #2563eb);
 }
 
-.content-segment--superseded {
-  opacity: 0.72;
-}
-
 .message-wrapper {
   display: flex;
   gap: 12px;
@@ -1742,6 +1818,58 @@ watch(isGenerating, (generating) => {
   border-radius: 0;
   padding: 4px 0;
   color: var(--mc-assistant-bubble-color, #1e293b);
+}
+
+/* Keep long delegated results readable without letting one response become a
+   full-width wall of text. The message column remains responsive on narrow
+   screens, while desktop reading stays close to a comfortable line length. */
+.assistant-bubble .markdown-body {
+  max-width: 980px;
+  overflow-wrap: anywhere;
+}
+.assistant-bubble .markdown-body :deep(p) {
+  max-width: 920px;
+  margin: 0 0 6px !important;
+  line-height: 1.5;
+}
+.assistant-bubble .markdown-body :deep(p:empty) {
+  display: none;
+}
+.assistant-bubble .markdown-body :deep(p:has(br:only-child)) {
+  display: none;
+}
+.assistant-bubble .markdown-body :deep(> *) {
+  margin-block-start: 0;
+  margin-block-end: 6px;
+}
+.assistant-bubble .markdown-body :deep(> *:last-child) {
+  margin-block-end: 0;
+}
+.assistant-bubble .markdown-body :deep(h1),
+.assistant-bubble .markdown-body :deep(h2),
+.assistant-bubble .markdown-body :deep(h3) {
+  margin-top: 12px !important;
+  margin-bottom: 6px !important;
+  line-height: 1.35;
+}
+.assistant-bubble .markdown-body :deep(h2:first-child),
+.assistant-bubble .markdown-body :deep(h3:first-child) {
+  margin-top: 4px;
+}
+.assistant-bubble .markdown-body :deep(ul),
+.assistant-bubble .markdown-body :deep(ol) {
+  margin: 6px 0 !important;
+}
+.assistant-bubble .markdown-body :deep(li) {
+  margin: 2px 0;
+  line-height: 1.5;
+}
+.assistant-bubble .markdown-body :deep(li > p) {
+  margin: 0 !important;
+}
+.assistant-bubble .markdown-body :deep(hr) {
+  max-width: 920px;
+  margin: 12px 0;
 }
 
 .user-bubble {
@@ -2179,12 +2307,30 @@ watch(isGenerating, (generating) => {
 
 /* 状态指示器 */
 .stopped-indicator {
-  display: flex;
+  display: inline-flex;
   align-items: center;
   gap: 6px;
-  padding: 6px 0 2px;
+  margin-top: 8px;
+  padding: 6px 10px;
+  border: 1px solid var(--mc-border, #e2e8f0);
+  border-radius: 8px;
+  background: var(--mc-bg-sunken, #f8fafc);
   font-size: 12px;
-  color: var(--mc-text-tertiary, #94a3b8);
+  font-weight: 500;
+  line-height: 1.4;
+  color: var(--mc-text-secondary, #64748b);
+}
+
+.stopped-indicator--stopped {
+  border-color: color-mix(in srgb, var(--mc-danger, #dc2626) 24%, transparent);
+  background: color-mix(in srgb, var(--mc-danger, #dc2626) 8%, transparent);
+  color: var(--mc-danger, #dc2626);
+}
+
+.stopped-indicator--interrupted {
+  border-color: color-mix(in srgb, #d97706 26%, transparent);
+  background: color-mix(in srgb, #d97706 8%, transparent);
+  color: #b45309;
 }
 
 /* 错误卡片 */

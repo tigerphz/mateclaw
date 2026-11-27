@@ -8,6 +8,8 @@ import org.springframework.ai.chat.messages.AssistantMessage;
 import org.springframework.stereotype.Component;
 import vip.mate.agent.AgentService;
 import vip.mate.agent.context.ChatOrigin;
+import vip.mate.agent.context.ExecutionAttribution;
+import vip.mate.agent.graph.state.FinishReason;
 import vip.mate.cron.CronChatOriginFactory;
 import vip.mate.cron.model.CronJobEntity;
 import vip.mate.dashboard.model.CronJobRunEntity;
@@ -42,6 +44,7 @@ import vip.mate.wiki.service.WikiProcessingService;
 public class CronJobRunner {
 
     private final CronJobLifecycleService lifecycle;
+    private final CronRunHeartbeatService heartbeat;
     private final AgentService agentService;
     private final CronChatOriginFactory originFactory;
     private final vip.mate.cron.CronConversationResolver conversationResolver;
@@ -102,13 +105,14 @@ public class CronJobRunner {
         String conversationId = conversationResolver.resolve(job);
 
         // T1 — short tx
-        CronJobRunEntity run;
+        CronJobLifecycleService.StartResult started;
         try {
-            run = lifecycle.startRun(job, userMessage, triggerType, conversationId);
+            started = lifecycle.startRun(job, userMessage, triggerType, conversationId);
         } catch (Exception e) {
             log.error("[CronRunner] T1 startRun failed for job {}: {}", job.getId(), e.getMessage(), e);
             return;
         }
+        CronJobRunEntity run = started.run();
 
         // task_type='reminder' — pure notification, no LLM call. The user
         // (or the create_reminder tool on their behalf) supplied the exact
@@ -141,15 +145,20 @@ public class CronJobRunner {
         AgentService.ChatResult chatResult;
         AssistantMessage result;
         try {
-            ChatOrigin origin = originFactory.from(job, conversationId);
-            chatResult = runAgent(job, userMessage, origin, conversationId);
+            ChatOrigin origin = originFactory.from(
+                    job, conversationId, started.originMessageId());
+            origin = origin.withExecutionAttribution(new ExecutionAttribution(null, null, run.getId(), null,
+                    "cron:" + run.getId()));
+            try (CronRunHeartbeatService.Lease ignored = heartbeat.begin(run.getId())) {
+                chatResult = runAgent(job, userMessage, origin, conversationId);
+            }
             result = new AssistantMessage(chatResult.content());
         } catch (Exception e) {
             log.error("[CronRunner] runAgent failed for job {}: {}", job.getId(), e.getMessage(), e);
             try {
                 lifecycle.markRunFailed(run, e);
             } catch (Exception markErr) {
-                // CronRunStaleCleanup will sweep status='running' rows older than 30 min.
+                // CronRunStaleCleanup will recover a run after its heartbeat expires.
                 log.warn("[CronRunner] markRunFailed itself failed for run {}: {} (stale-cleanup will recover)",
                         run.getId(), markErr.getMessage());
             }
@@ -163,6 +172,10 @@ public class CronJobRunner {
 
         // T2 — short tx
         try {
+            if (FinishReason.ERROR_FALLBACK.getValue().equals(chatResult.finishReason())) {
+                lifecycle.finishRunFailed(run, result, conversationId, chatResult);
+                return;
+            }
             lifecycle.finishRunAndPublish(job, run, userMessage, result, conversationId, silent, chatResult);
         } catch (Exception e) {
             log.error("[CronRunner] T2 finishRunAndPublish failed for job {}: {}", job.getId(), e.getMessage(), e);

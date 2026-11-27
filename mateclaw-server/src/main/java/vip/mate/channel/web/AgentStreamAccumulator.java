@@ -30,7 +30,7 @@ import java.util.regex.Pattern;
  * Shared by the Web SSE path ({@code ChatController}) and the IM channel
  * router — live fan-out side effects go through the injected {@link Sink}
  * so each caller keeps its own broadcast semantics. Internal bookkeeping
- * events ({@code _usage_final}, {@code _routing_decision}) are consumed
+ * events ({@code _usage_update}, {@code _usage_final}, {@code _routing_decision}) are consumed
  * here and never reach the sink.
  */
 @Slf4j
@@ -121,7 +121,7 @@ public final class AgentStreamAccumulator {
         if (delta == null) return;
 
         if (delta.isEvent()) {
-            if ("_usage_final".equals(delta.eventType())) {
+            if (delta.isUsage()) {
                 Map<String, Object> data = delta.eventData();
                 promptTokens = ((Number) data.getOrDefault("promptTokens", 0)).intValue();
                 completionTokens = ((Number) data.getOrDefault("completionTokens", 0)).intValue();
@@ -212,13 +212,22 @@ public final class AgentStreamAccumulator {
 
         // thinking_delta
         if (delta.thinking() != null && !delta.thinking().isBlank()) {
+            var seg = findLastRunning("thinking");
+            // No running thinking segment means this delta opens a new reasoning
+            // span (a fresh iteration, after a tool call closed the previous one).
+            // The flat `thinking` field concatenates every span of the turn, so
+            // without a break the spans glue into one run-on paragraph — spans
+            // are separate thoughts and read as such only when kept apart.
+            boolean opensNewSpan = seg == null;
             if (!delta.segmentOnly()) {
+                if (opensNewSpan && thinking.length() > 0) {
+                    thinking.append("\n\n");
+                }
                 thinking.append(delta.thinking());
             }
             if (!delta.persistenceOnly()) {
                 sink.broadcast(conversationId, "thinking_delta", Map.of("delta", delta.thinking()));
             }
-            var seg = findLastRunning("thinking");
             if (seg != null) {
                 seg.put("thinkingText", seg.getOrDefault("thinkingText", "") + delta.thinking());
             } else {
@@ -335,6 +344,9 @@ public final class AgentStreamAccumulator {
                             && toolName.equals(tc.get("name")));
                 if (matches) {
                     tc.put("result", data.getOrDefault("result", ""));
+                    if (data.get("structuredContent") instanceof Map<?, ?> structured) {
+                        tc.put("structuredContent", structured);
+                    }
                     tc.put("success", data.getOrDefault("success", true));
                     tc.put("status", "completed");
                     break;
@@ -353,6 +365,9 @@ public final class AgentStreamAccumulator {
                     seg.put("status", "completed");
                     seg.put("endTimestamp", System.currentTimeMillis());
                     seg.put("toolResult", data.getOrDefault("result", ""));
+                    if (data.get("structuredContent") instanceof Map<?, ?> structured) {
+                        seg.put("structuredContent", structured);
+                    }
                     seg.put("toolSuccess", data.getOrDefault("success", true));
                     break;
                 }
@@ -394,8 +409,15 @@ public final class AgentStreamAccumulator {
 
     private Map<String, Object> newSegment(String type) {
         Map<String, Object> seg = new LinkedHashMap<>();
-        seg.put("id", type.substring(0, 2) + "-" + segCounter++);
+        int seq = segCounter++;
+        seg.put("id", type.substring(0, 2) + "-" + seq);
         seg.put("type", type);
+        // Monotonic emission index. Renderers order the timeline by this
+        // rather than inferring a position from the segment's type: array
+        // order can be perturbed on the way to the UI (dedup, fallback
+        // injection, live/persisted merges), and type-based relocation
+        // moves a span away from the point it was actually produced at.
+        seg.put("seq", seq);
         seg.put("status", "running");
         // Wall-clock bounds let history replays show the real per-segment
         // duration (e.g. "thought for 12s") instead of estimating from length.
@@ -430,6 +452,10 @@ public final class AgentStreamAccumulator {
     public int getCacheReadTokens() { return cacheReadTokens; }
     public int getCacheWriteTokens() { return cacheWriteTokens; }
     public int getReasoningTokens() { return reasoningTokens; }
+    public boolean hasUsage() {
+        return promptTokens > 0 || completionTokens > 0 || cacheReadTokens > 0
+                || cacheWriteTokens > 0 || reasoningTokens > 0;
+    }
     public String getRuntimeModelName() { return runtimeModelName; }
     public String getRuntimeProviderId() { return runtimeProviderId; }
     public String getCurrentPhase() { return currentPhase; }
@@ -460,9 +486,16 @@ public final class AgentStreamAccumulator {
         return parts;
     }
 
-    private void finalizeToolCalls() {
+    private void interruptUnfinishedToolCalls() {
         for (Map<String, Object> tc : toolCalls) {
-            if ("running".equals(tc.get("status"))) tc.put("status", "completed");
+            if ("running".equals(tc.get("status"))) tc.put("status", "interrupted");
+        }
+        for (Map<String, Object> segment : segments) {
+            if ("tool_call".equals(segment.get("type"))
+                    && "running".equals(segment.get("status"))) {
+                segment.put("status", "interrupted");
+                segment.put("endTimestamp", System.currentTimeMillis());
+            }
         }
     }
 
@@ -471,8 +504,8 @@ public final class AgentStreamAccumulator {
      * toolCalls 保留兼容旧 UI，segments 是按事件顺序的完整时间线。
      */
     public synchronized String toMetadataJson() {
-        finalizeToolCalls();
-        finalizeRunningSegments("thinking", "content", "tool_call");
+        interruptUnfinishedToolCalls();
+        finalizeRunningSegments("thinking", "content");
         // Producer-tagged timelines use the kind-driven authority; untagged
         // ones (pre-tag producers, replayed legacy turns) keep the structural
         // scan as fallback.

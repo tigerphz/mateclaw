@@ -2,9 +2,7 @@ package vip.mate.llm.chatmodel;
 
 import io.micrometer.observation.ObservationRegistry;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.ai.anthropic.AnthropicChatModel;
 import org.springframework.ai.anthropic.AnthropicChatOptions;
-import org.springframework.ai.anthropic.api.AnthropicApi;
 import org.springframework.ai.chat.model.ChatModel;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.http.client.JdkClientHttpRequestFactory;
@@ -21,7 +19,8 @@ import vip.mate.llm.model.ModelProviderEntity;
 import vip.mate.llm.service.ModelProviderService;
 
 import java.net.http.HttpClient;
-import java.time.Duration;
+import java.util.Map;
+import org.springframework.http.client.reactive.JdkClientHttpConnector;
 
 /**
  * Strategy implementation for {@link ModelProtocol#ANTHROPIC_MESSAGES}.
@@ -60,47 +59,23 @@ public class AnthropicChatModelBuilder implements ChatModelBuilder {
 
     @Override
     public ChatModel build(ModelConfigEntity model, ModelProviderEntity provider, RetryTemplate retry) {
-        AnthropicApi api = buildAnthropicApi(provider, model.getRequestTimeoutSeconds());
-        AnthropicChatOptions options = buildAnthropicOptions(model);
-        return AnthropicChatModel.builder()
-                .anthropicApi(api)
-                .defaultOptions(options)
-                .retryTemplate(retry)
-                .observationRegistry(observationRegistryProvider.getIfAvailable(() -> ObservationRegistry.NOOP))
-                .build();
+        AnthropicChatOptions options = buildClientOptions(model, provider);
+        return AnthropicSdkChatModel.create(options,
+                observationRegistryProvider.getIfAvailable(() -> ObservationRegistry.NOOP), Map.of(), false, retry);
     }
 
-    AnthropicApi buildAnthropicApi(ModelProviderEntity provider) {
-        return buildAnthropicApi(provider, null);
-    }
-
-    /**
-     * Overload — accepts a per-model read-timeout override
-     * (seconds). Null falls back to the default 180s.
-     */
-    AnthropicApi buildAnthropicApi(ModelProviderEntity provider, Integer readTimeoutOverride) {
+    AnthropicChatOptions buildClientOptions(ModelConfigEntity model, ModelProviderEntity provider) {
         if (provider == null || !modelProviderService.isProviderConfigured(provider.getProviderId())) {
             throw new MateClawException("err.agent.anthropic_not_configured",
-                    "Anthropic Provider 未完成配置，请在模型设置中填写有效的 API Key 和 Base URL");
+                    "Anthropic provider needs a valid API key and base URL");
         }
-        String apiKey = provider.getApiKey();
-        if (!modelProviderService.hasUsableApiKey(apiKey)) {
-            throw new MateClawException("err.agent.anthropic_key_invalid",
-                    "Anthropic API Key 未配置或无效: " + provider.getProviderId());
+        if (!modelProviderService.hasUsableApiKey(provider.getApiKey())) {
+            throw new MateClawException("err.agent.anthropic_key_invalid", "Invalid Anthropic API key");
         }
-        String baseUrl = provider.getBaseUrl();
-        RestClient.Builder restClientBuilder = applyHttpTimeouts(
-                restClientBuilderProvider.getIfAvailable(RestClient::builder), readTimeoutOverride);
-        WebClient.Builder webClientBuilder = applyHttpTimeoutsToWebClient(
-                webClientBuilderProvider.getIfAvailable(WebClient::builder), readTimeoutOverride);
-
-        AnthropicApi.Builder builder = AnthropicApi.builder()
-                .apiKey(apiKey.trim())
-                .restClientBuilder(restClientBuilder)
-                .webClientBuilder(webClientBuilder);
-        if (StringUtils.hasText(baseUrl)) {
-            builder.baseUrl(baseUrl.trim());
-        }
+        AnthropicChatOptions.Builder builder = buildAnthropicOptions(model).mutate()
+                .apiKey(provider.getApiKey().trim())
+                .timeout(HttpTimeouts.resolveReadTimeout(model.getRequestTimeoutSeconds())).maxRetries(0);
+        if (StringUtils.hasText(provider.getBaseUrl())) builder.baseUrl(provider.getBaseUrl().trim());
         return builder.build();
     }
 
@@ -166,17 +141,13 @@ public class AnthropicChatModelBuilder implements ChatModelBuilder {
         if (StringUtils.hasText(modelName)) {
             builder.model(modelName);
         }
-        boolean strictSamplingContract = isClaude47OrLater(modelName);
 
         // Extended thinking — request-level depth from ThinkingLevelHolder
         String thinkingLevel = ThinkingLevelHolder.get();
         boolean thinkingEnabled = thinkingLevel != null && !"off".equalsIgnoreCase(thinkingLevel);
 
         if (thinkingEnabled) {
-            // Anthropic thinking-mode constraints (pre-4.7): temperature MUST be 1,
-            // top_p forbidden, max_tokens must accommodate budget_tokens + buffer.
-            // Claude 4.7+ forbids temperature/top_p/top_k entirely (any non-null value
-            // → HTTP 400) and adds an "xhigh" budget tier between high and max.
+            // The Anthropic 3.x API no longer accepts sampling overrides.
             int budgetTokens = switch (thinkingLevel.toLowerCase()) {
                 case "low" -> 4096;
                 case "medium" -> 8192;
@@ -185,29 +156,11 @@ public class AnthropicChatModelBuilder implements ChatModelBuilder {
                 case "max" -> 32768;
                 default -> 16384;
             };
-            builder.thinking(AnthropicApi.ThinkingType.ENABLED, budgetTokens);
+            builder.thinkingEnabled(budgetTokens);
             builder.maxTokens(Math.max(budgetTokens + 4096,
                     runtimeModel.getMaxTokens() != null ? runtimeModel.getMaxTokens() : 8192));
-            // Claude 4.7+: omit temperature entirely. Pre-4.7 thinking mode requires
-            // temperature=1 (Anthropic-mandated default for thinking).
-            if (!strictSamplingContract) {
-                builder.temperature(1.0);
-            }
         } else {
-            // Non-thinking path.
-            // - Pre-4.7: Anthropic accepts EITHER temperature OR top_p (not both).
-            // - 4.7+: rejects all of temperature/top_p/top_k unless null/default. We
-            //   omit them entirely so operators with legacy configs don't 400.
-            if (!strictSamplingContract) {
-                if (runtimeModel.getTemperature() != null) {
-                    builder.temperature(runtimeModel.getTemperature());
-                } else if (runtimeModel.getTopP() != null) {
-                    builder.topP(runtimeModel.getTopP());
-                }
-            } else if (runtimeModel.getTemperature() != null || runtimeModel.getTopP() != null) {
-                log.debug("Ignoring temperature/top_p for Claude 4.7+ model {} (API rejects sampling params)",
-                        modelName);
-            }
+            // Sampling is omitted for every model under the Spring AI 2.1 contract.
             // Anthropic rejects non-positive maxTokens — clamp here so a bad config
             // surfaces as a logged warning instead of an opaque API 400 mid-conversation.
             Integer configuredMax = runtimeModel.getMaxTokens();
@@ -224,7 +177,7 @@ public class AnthropicChatModelBuilder implements ChatModelBuilder {
         // Prompt cache (system / tools / conversation history) — Spring AI 1.1.4+ first-class.
         builder.cacheOptions(anthropicCacheOptionsFactory.build());
 
-        return builder.internalToolExecutionEnabled(false).build();
+        return builder.build();
     }
 
     /**
@@ -242,24 +195,31 @@ public class AnthropicChatModelBuilder implements ChatModelBuilder {
 
     /**
      * Overload — accepts a per-model read-timeout override
-     * (seconds). Null / zero / negative falls back to {@link vip.mate.llm.chatmodel.HttpTimeouts#DEFAULT_READ_TIMEOUT}
+     * (seconds). Null / zero / negative falls back to {@link HttpTimeouts#DEFAULT_READ_TIMEOUT}
      * so unset model configs keep the historical 180s.
      */
     static RestClient.Builder applyHttpTimeouts(RestClient.Builder builder, Integer readTimeoutOverride) {
         HttpClient httpClient = HttpClient.newBuilder()
-                .connectTimeout(vip.mate.llm.chatmodel.HttpTimeouts.CONNECT_TIMEOUT)
+                .connectTimeout(HttpTimeouts.CONNECT_TIMEOUT)
                 .build();
         JdkClientHttpRequestFactory rf = new JdkClientHttpRequestFactory(httpClient);
-        rf.setReadTimeout(vip.mate.llm.chatmodel.HttpTimeouts.resolveReadTimeout(readTimeoutOverride));
+        rf.setReadTimeout(HttpTimeouts.resolveReadTimeout(readTimeoutOverride));
         return builder.requestFactory(rf);
     }
 
     /**
      * Streaming counterpart of {@link #applyHttpTimeouts(RestClient.Builder)}.
-     * Without this, Spring AI's AnthropicApi would back its streaming chat
-     * call by a default WebClient with neither connect nor read timeout — a
-     * stalled provider could hang the agent thread indefinitely while the
-     * failover chain idles (no exception = no signal).
+     *
+     * <p><b>Scope caveat (issue #585):</b> {@code setReadTimeout} maps to the
+     * JDK HttpClient's request timeout, which only protects up to the
+     * <em>response headers</em>. Once the headers arrive the clock stops, so a
+     * provider that returns 200 + a first SSE frame and then goes silent is
+     * <b>not</b> caught here — the body Flux would hang indefinitely. The
+     * body-level gap is closed by a reactor inter-frame idle timeout applied
+     * at the streaming chokepoint ({@code NodeStreamingChatHelper}, driven by
+     * {@link HttpTimeouts#DEFAULT_STREAM_IDLE_TIMEOUT}).
+     * This WebClient timeout still catches the "provider never sends headers"
+     * case (connection accepted, no response), so both layers are kept.
      * <p>
      * Uses the same JDK HttpClient + JdkClientHttpConnector path, so the
      * dependency surface doesn't pull in reactor-netty (excluded by this
@@ -275,11 +235,11 @@ public class AnthropicChatModelBuilder implements ChatModelBuilder {
      */
     static WebClient.Builder applyHttpTimeoutsToWebClient(WebClient.Builder builder, Integer readTimeoutOverride) {
         HttpClient httpClient = HttpClient.newBuilder()
-                .connectTimeout(vip.mate.llm.chatmodel.HttpTimeouts.CONNECT_TIMEOUT)
+                .connectTimeout(HttpTimeouts.CONNECT_TIMEOUT)
                 .build();
-        org.springframework.http.client.reactive.JdkClientHttpConnector connector =
-                new org.springframework.http.client.reactive.JdkClientHttpConnector(httpClient);
-        connector.setReadTimeout(vip.mate.llm.chatmodel.HttpTimeouts.resolveReadTimeout(readTimeoutOverride));
+        JdkClientHttpConnector connector =
+                new JdkClientHttpConnector(httpClient);
+        connector.setReadTimeout(HttpTimeouts.resolveReadTimeout(readTimeoutOverride));
         return builder.clientConnector(connector);
     }
 }

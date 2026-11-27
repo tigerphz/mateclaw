@@ -37,6 +37,8 @@ export interface Agent {
   name: string
   description?: string
   agentType: 'react' | 'plan_execute'
+  runtimeType?: 'native' | 'dsh' | string
+  runtimeConfig?: string | null
   systemPrompt?: string
   modelName?: string
   maxIterations: number
@@ -88,6 +90,7 @@ export interface Conversation {
   status?: 'active' | 'closed'
   streamStatus?: 'idle' | 'running'
   source?: string
+  conversationKind?: 'primary' | 'team_worker' | 'scheduled'
   pinned?: number
   /** Provider id of the model this conversation is pinned to (per-conversation model). */
   modelProvider?: string
@@ -138,6 +141,8 @@ export interface ChatAttachment {
 }
 
 export interface ToolCallMeta {
+  toolCallId?: string
+  structuredContent?: Record<string, unknown>
   name: string
   arguments?: string
   status: 'running' | 'completed' | 'awaiting_approval'
@@ -208,12 +213,19 @@ export interface MessageSegment {
   id: string
   type: 'thinking' | 'tool_call' | 'content' | 'phase' | 'approval' | 'plan'
   status: 'running' | 'completed' | 'error'
+  /**
+   * Producer-assigned emission index, monotonic within a turn. Present on
+   * persisted segments; absent on live ones, which are already appended in
+   * event order. Renderers sort by it instead of relocating segments by type.
+   */
+  seq?: number
   /** type=thinking */
   thinkingText?: string
   /** type=tool_call */
   toolName?: string
   toolArgs?: string
   toolResult?: string
+  structuredContent?: Record<string, unknown>
   toolSuccess?: boolean
   /** LLM-provided tool call id, used to pair tool_call_started ↔ tool_call_completed */
   toolCallId?: string
@@ -295,10 +307,18 @@ export interface GeneratedFile {
 }
 
 export interface MessageMetadata {
+  /** Canonical graph outcome, preserved in live SSE and persisted history. */
+  finishReason?: string
   /** Internal note discriminator, e.g. 'compression_summary' | 'team_announce' | 'team_announce_reply' */
   type?: string
   /** type=team_announce: number of settled team tasks carried by this note */
   taskCount?: number
+  /** Team orchestration ids remain strings to preserve Snowflake precision. */
+  runId?: string
+  taskId?: string
+  originMessageId?: string
+  teamId?: string
+  leadConversationId?: string
   currentPhase?: string
   toolCalls?: ToolCallMeta[]
   plan?: PlanMeta
@@ -533,6 +553,8 @@ export interface InstallRequest {
 }
 
 export interface InstallTask {
+  /** Cancellation is no longer safe once filesystem/DB writes start. */
+  cancellable?: boolean
   taskId: string
   bundleUrl: string
   status: 'PENDING' | 'INSTALLING' | 'COMPLETED' | 'FAILED' | 'CANCELLED'
@@ -638,6 +660,8 @@ export const CHANNEL_FIELD_DEFS: Record<string, ChannelFieldDef[]> = {
     { key: 'enable_nickname_cache', label: '昵称获取', placeholder: '', type: 'switch', defaultValue: true, tooltip: '通过联系人 API 获取用户真实昵称（需要 contact:user.base:readonly 权限）' },
     { key: 'enable_quoted_context', label: '引用消息上下文', placeholder: '', type: 'switch', defaultValue: true, tooltip: '用户引用某条消息回复时，自动拉取被引用消息内容注入到 prompt，agent 才能理解"解释一下"这种缺主语的引用' },
     { key: 'media_download_enabled', label: '媒体下载', placeholder: '', type: 'switch', defaultValue: false, tooltip: '下载消息中的图片和文件到本地（保存至 ~/.mateclaw/media/feishu/）' },
+    { key: 'card_streaming_enabled', label: '流式卡片', placeholder: '', type: 'switch', defaultValue: true, tooltip: '使用 CardKit 实时更新回复；需要 cardkit:card:write 权限' },
+    { key: 'stream_progress', label: '执行轨迹', placeholder: '', type: 'switch', defaultValue: true, tooltip: '在流式卡片中展示思考状态、计划步骤、工具进度与阶段旁白；原始思考和工具名称仍受下方过滤开关控制' },
   ],
   telegram: [
     { key: 'bot_token', label: 'Bot Token', placeholder: '123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11', required: true, sensitive: true, type: 'password', tooltip: '从 @BotFather 获取的 Bot Token' },
@@ -656,6 +680,7 @@ export const CHANNEL_FIELD_DEFS: Record<string, ChannelFieldDef[]> = {
     { key: 'bot_id', label: '机器人 ID', placeholder: 'bot_xxxxxxxxxx', required: true, type: 'text', tooltip: '企业微信智能机器人的 Bot ID（在企业微信后台创建智能机器人后获取）' },
     { key: 'secret', label: 'Secret', placeholder: 'xxxxxxxxxxxxxxxx', required: true, sensitive: true, type: 'password', tooltip: '企业微信智能机器人的 Secret' },
     { key: 'welcome_text', label: '欢迎消息', placeholder: '你好！我是你的 AI 助手', type: 'text', tooltip: '用户首次进入对话时自动发送的欢迎消息（留空则不发送）' },
+    { key: 'stream_progress', label: '执行轨迹', placeholder: '', type: 'switch', defaultValue: true, tooltip: '展示处理期间的实时进度与阶段旁白；关闭后仅发送最终答复。原始思考和工具名称仍受下方过滤开关控制' },
     { key: 'media_download_enabled', label: '媒体下载', placeholder: '', type: 'switch', defaultValue: false, tooltip: '下载消息中的图片和文件到本地并解密（需要本地磁盘空间）' },
     { key: 'media_dir', label: '媒体目录', placeholder: 'data/media', type: 'text', tooltip: '媒体文件保存目录（默认 data/media）' },
     { key: 'max_reconnect_attempts', label: '最大重连次数', placeholder: '-1 表示无限重连', type: 'number', defaultValue: -1, tooltip: 'WebSocket 断线后最大重连次数，-1 为无限重连' },
@@ -663,6 +688,7 @@ export const CHANNEL_FIELD_DEFS: Record<string, ChannelFieldDef[]> = {
   weixin: [
     { key: 'bot_token', label: 'Bot Token', placeholder: '扫码登录后自动获取', required: true, sensitive: true, type: 'password', tooltip: '微信 iLink Bot Token，通过扫描二维码登录获取' },
     { key: 'base_url', label: 'API 地址', placeholder: 'https://ilinkai.weixin.qq.com', type: 'text', defaultValue: 'https://ilinkai.weixin.qq.com', tooltip: 'iLink Bot API 基础地址（通常无需修改）' },
+    { key: 'stream_progress', label: '执行轨迹', placeholder: '', type: 'switch', defaultValue: true, tooltip: '展示处理期间的实时进度与阶段旁白；关闭后仅发送最终答复。原始思考和工具名称仍受下方过滤开关控制' },
     { key: 'media_download_enabled', label: '媒体下载', placeholder: '', type: 'switch', defaultValue: false, tooltip: '下载消息中的图片、文件、视频到本地并解密' },
     { key: 'media_dir', label: '媒体目录', placeholder: 'data/media', type: 'text', tooltip: '媒体文件保存目录（默认 data/media）' },
   ],
@@ -829,6 +855,9 @@ export interface SystemSettings {
   debugMode: boolean
   // Whether chat renders the model's reasoning ("thinking") blocks; default true
   showThinking: boolean
+  // Whether chat renders every iteration's reasoning or only the span that
+  // produced the answer; default true. Only meaningful while showThinking is on.
+  thinkingFull: boolean
   // Default workspace storage root; '' = use the server-side default
   workspaceStorageRoot?: string
   // 搜索服务配置

@@ -56,6 +56,8 @@ import java.util.stream.Collectors;
 @Slf4j
 @Service
 public class AgentBindingService implements AgentBindingResolver {
+    @Autowired
+    private vip.mate.team.service.TeamCoordinatorPolicy coordinatorPolicy;
 
     private final AgentSkillBindingMapper skillBindingMapper;
     private final AgentToolBindingMapper toolBindingMapper;
@@ -98,12 +100,13 @@ public class AgentBindingService implements AgentBindingResolver {
      * ACP virtual skills aren't rows in {@code mate_skill}; the bridge
      * synthesizes them from {@code mate_acp_endpoint}. We need this to
      * answer "what workspace does this virtual id belong to?" when an
-     * agent tries to bind one. MCP virtual skills don't need a bridge
-     * reference — {@link McpSkillBridge#isVirtualMcpSkillId(Long)} is a
-     * static range check, and MCP servers carry no workspace today, so
-     * binding any MCP virtual id is allowed for any agent.
+     * agent tries to bind one. MCP virtual bindings use McpWorkspaceAccess
+     * to validate the backing server, including missing-server rejection and
+     * legacy global sharing.
      */
     private final AcpSkillBridge acpSkillBridge;
+    @Autowired
+    private vip.mate.tool.mcp.runtime.McpWorkspaceAccess mcpWorkspaceAccess;
 
     @Autowired
     public AgentBindingService(AgentSkillBindingMapper skillBindingMapper,
@@ -254,7 +257,11 @@ public class AgentBindingService implements AgentBindingResolver {
      * silently undoes a user's explicit skill picks.
      */
     public Set<Long> skillIdsBoundToEnabledAgents() {
-        Set<Long> enabledAgentIds = enabledAgentIds();
+        return skillIdsBoundToEnabledAgents(null);
+    }
+
+    public Set<Long> skillIdsBoundToEnabledAgents(Long workspaceId) {
+        Set<Long> enabledAgentIds = enabledAgentIds(workspaceId);
         if (enabledAgentIds.isEmpty()) {
             return Set.of();
         }
@@ -273,7 +280,11 @@ public class AgentBindingService implements AgentBindingResolver {
      * archival candidates regardless of bindings.
      */
     public List<BlockedByBindingRow> blockedByBindingCandidates(LocalDateTime now) {
-        Set<Long> enabledAgentIds = enabledAgentIds();
+        return blockedByBindingCandidates(now, null);
+    }
+
+    public List<BlockedByBindingRow> blockedByBindingCandidates(LocalDateTime now, Long workspaceId) {
+        Set<Long> enabledAgentIds = enabledAgentIds(workspaceId);
         if (enabledAgentIds.isEmpty()) {
             return List.of();
         }
@@ -290,6 +301,9 @@ public class AgentBindingService implements AgentBindingResolver {
         }
         List<BlockedByBindingRow> rows = new ArrayList<>();
         for (SkillEntity skill : skillMapper.selectBatchIds(bySkill.keySet())) {
+            if (workspaceId != null && !workspaceId.equals(skill.getWorkspaceId())) {
+                continue;
+            }
             if (Boolean.TRUE.equals(skill.getBuiltin()) || Boolean.TRUE.equals(skill.getPinned())) {
                 continue;
             }
@@ -334,9 +348,17 @@ public class AgentBindingService implements AgentBindingResolver {
 
     /** Ids of every currently-enabled agent. */
     private Set<Long> enabledAgentIds() {
-        return agentMapper.selectList(new LambdaQueryWrapper<AgentEntity>()
-                        .eq(AgentEntity::getEnabled, true)
-                        .select(AgentEntity::getId))
+        return enabledAgentIds(null);
+    }
+
+    private Set<Long> enabledAgentIds(Long workspaceId) {
+        LambdaQueryWrapper<AgentEntity> query = new LambdaQueryWrapper<AgentEntity>()
+                .eq(AgentEntity::getEnabled, true);
+        if (workspaceId != null) {
+            query.eq(AgentEntity::getWorkspaceId, workspaceId);
+        }
+        query.select(AgentEntity::getId);
+        return agentMapper.selectList(query)
                 .stream()
                 .map(AgentEntity::getId)
                 .collect(Collectors.toSet());
@@ -383,8 +405,12 @@ public class AgentBindingService implements AgentBindingResolver {
         if (agent == null) {
             throw new MateClawException("err.agent.not_found", 404, "Agent 不存在: " + agentId);
         }
-        // MCP virtual: no workspace on McpServerEntity — globally bindable.
+        // MCP virtuals inherit their backing server ownership; legacy null remains shared.
         if (McpSkillBridge.isVirtualMcpSkillId(skillId)) {
+            if (mcpWorkspaceAccess != null && !mcpWorkspaceAccess.canAccess(
+                    McpSkillBridge.extractMcpServerId(skillId), agent.getWorkspaceId())) {
+                throw new MateClawException("err.workspace.forbidden", 403, "MCP skill belongs to another workspace or is missing");
+            }
             return;
         }
         SkillEntity skill;
@@ -487,12 +513,16 @@ public class AgentBindingService implements AgentBindingResolver {
      * <p>Auto-included on every non-null result, in addition to the bound
      * tools and skill-expanded tools:
      * <ul>
-     *   <li>{@link #SYSTEM_LEVEL_TOOLS} — agent-wide primitives.</li>
+     *   <li>{@link #MINIMAL_SYSTEM_TOOLS} for explicit tools opt-out;
+     *       {@link #SCOPED_TOOL_INTERNAL_TOOLS} when skills are disabled and
+     *       explicit tool bindings exist (including all-disabled rows);
+     *       otherwise {@link #SYSTEM_LEVEL_TOOLS} for compatibility.</li>
      *   <li>Every currently-bindable MCP tool ({@code source="mcp"},
      *       {@code available=true} in the picker) — but only when the agent
-     *       has not ticked any MCP tool itself. MCP servers are
-     *       administrator-level capabilities, so an agent that bound merely
-     *       a skill or a built-in tool keeps full MCP access. Once the
+     *       has not ticked any MCP tool itself and is not in the explicit
+     *       skills-disabled tool scope described above. MCP servers are
+     *       administrator-level capabilities, so a skills-enabled agent that
+     *       bound merely a skill or a built-in tool keeps full MCP access. Once the
      *       operator ticks specific MCP rows, that is read as a deliberate
      *       per-agent scope: only the ticked MCP tools stay and the rest
      *       are not auto-joined, so a role can be limited to a fixed MCP
@@ -502,6 +532,8 @@ public class AgentBindingService implements AgentBindingResolver {
      * </ul>
      */
     public Set<String> getEffectiveToolNames(Long agentId) {
+        if (coordinatorPolicy != null && coordinatorPolicy.isCoordinator(agentId))
+            return vip.mate.team.service.TeamCoordinatorPolicy.TOOLS;
         AgentEntity agent = agentMapper.selectById(agentId);
         boolean skillsDisabled = agent != null && Boolean.TRUE.equals(agent.getSkillsDisabled());
         boolean toolsDisabled = agent != null && Boolean.TRUE.equals(agent.getToolsDisabled());
@@ -528,12 +560,24 @@ public class AgentBindingService implements AgentBindingResolver {
             return null;
         }
 
+        // With skills disabled, explicit tool rows are the complete business
+        // capability selection. Do not infer scope from the live MCP catalog:
+        // stale/offline selections and an explicit empty set must stay scoped.
+        // tools_disabled retains its separate minimal-only opt-out below.
+        if (skillsDisabled && !toolsDisabled && directTools != null) {
+            Set<String> scoped = new LinkedHashSet<>(directTools);
+            scoped.addAll(SCOPED_TOOL_INTERNAL_TOOLS);
+            return scoped;
+        }
+
         Set<String> merged = new LinkedHashSet<>();
 
         if (boundSkillIds != null && !boundSkillIds.isEmpty()) {
             for (Long skillId : boundSkillIds) {
                 ResolvedSkill resolved = findResolvedSkillById(skillId);
                 if (resolved == null) continue;
+                AgentEntity boundAgent = agentMapper.selectById(agentId);
+                if (!SkillRuntimeService.matchesWorkspace(resolved, boundAgent != null ? boundAgent.getWorkspaceId() : null)) continue;
                 if (!vip.mate.skill.runtime.SkillRuntimeService.passesActiveGate(resolved)) {
                     // A disabled / security-blocked / setup-needed skill must
                     // not contribute tools to the LLM advertisement even if
@@ -550,14 +594,15 @@ public class AgentBindingService implements AgentBindingResolver {
             merged.addAll(directTools);
         }
 
-        // System-level tools that don't belong to any single skill but
-        // are agent-wide capabilities — structured memory primitives,
-        // workspace memory CRUD, etc. Without this carve-out, binding any
-        // skill silently strips record_lesson / remember / *memory_file
-        // tools, breaking the self-evolution loop. These survive even
-        // toolsDisabled=true because they are agent-internal infrastructure,
-        // unrelated to the user-facing capability picker.
-        merged.addAll(SYSTEM_LEVEL_TOOLS);
+        // Binding a skill preserves the historical default capabilities, but an
+        // explicit tools opt-out must not regain file/exec/network/delegation
+        // tools through that compatibility list (issue #655).
+        merged.addAll(toolsDisabled ? MINIMAL_SYSTEM_TOOLS : SYSTEM_LEVEL_TOOLS);
+        if (toolsDisabled && !skillsDisabled) {
+            // Skill opt-out is independent. Explicitly enabled skills may still
+            // be discovered and contribute their declared tools above.
+            merged.addAll(SKILL_DISCOVERY_TOOLS);
+        }
 
         // MCP tools. An agent that bound only a skill or a built-in tool
         // and ticked no MCP row normally keeps full access to every enabled
@@ -571,7 +616,7 @@ public class AgentBindingService implements AgentBindingResolver {
         // To deny a single MCP tool when none are ticked and tools are
         // enabled, use the tool-guard deny path in AgentGraphBuilder.
         if (!toolsDisabled) {
-            Set<String> enabledMcpTools = getEnabledMcpToolNames();
+            Set<String> enabledMcpTools = getEnabledMcpToolNames(agentId);
             boolean agentScopedMcpExplicitly = directTools != null && !directTools.isEmpty()
                     && !Collections.disjoint(directTools, enabledMcpTools);
             if (!agentScopedMcpExplicitly) {
@@ -588,10 +633,12 @@ public class AgentBindingService implements AgentBindingResolver {
      * cache parse error) yield an empty set so the caller's allowlist is
      * strictly narrower, never wider, than the picker — never throws.
      */
-    private Set<String> getEnabledMcpToolNames() {
+    private Set<String> getEnabledMcpToolNames(Long agentId) {
+        AgentEntity agent = agentMapper.selectById(agentId);
         try {
             return availableToolService.listAvailable().stream()
                     .filter(t -> "mcp".equals(t.getSource()))
+                    .filter(t -> mcpWorkspaceAccess == null || agent != null && mcpWorkspaceAccess.canUse(t.getProviderId(), agent.getWorkspaceId()))
                     .filter(AvailableToolDTO::isAvailable)
                     .map(AvailableToolDTO::getName)
                     .filter(n -> n != null && !n.isBlank())
@@ -638,13 +685,35 @@ public class AgentBindingService implements AgentBindingResolver {
     }
 
     /**
-     * Tools that exist outside the skill scope and must survive any
-     * agent-level skill binding restriction.
+     * Minimal internal capabilities retained by the explicit tools opt-out.
+     * General file access, execution, network access and delegation are excluded.
      *
      * <p>Add new entries here only after verifying the tool is genuinely
-     * agent-wide, not skill-specific. Tools added here bypass the
-     * {@link #getEffectiveToolNames} allowlist completely.
+     * required for internal state rather than a user-selectable capability.
      */
+    private static final Set<String> MINIMAL_SYSTEM_TOOLS = Set.of(
+            "record_lesson", "remember", "remember_structured", "recall_structured", "forget_structured",
+            "list_workspace_memory_files", "read_workspace_memory_file", "write_workspace_memory_file",
+            "edit_workspace_memory_file", "search_workspace_memory",
+            "getCurrentDate", "getCurrentDateTime", "getCurrentTime",
+            "setGoal", "addGoalCriterion", "completeGoal", "getGoalStatus",
+            "getManagedGoalJsonSlots", "publishManagedGoalJson", "checkManagedGoalJson",
+            "waitForGoalInput", "resumeGoal", "progress_update", "get_progress",
+            // These bridges resolve targets against the same effective allowlist.
+            "enable_tool", "tool_search", "tool_describe", "tool_call"
+    );
+
+    /**
+     * Internal tools for an explicit selection with skills disabled. read_file
+     * preserves access to large MCP results spilled into the workspace; normal
+     * sandbox and global tool-guard restrictions still apply at runtime.
+     * This is deliberately separate from the tools-disabled minimal set.
+     */
+    private static final Set<String> SCOPED_TOOL_INTERNAL_TOOLS = java.util.stream.Stream.concat(
+            MINIMAL_SYSTEM_TOOLS.stream(), java.util.stream.Stream.of("read_file"))
+            .collect(Collectors.toUnmodifiableSet());
+
+    /** Compatibility defaults for skill-bound agents that have NOT disabled tools. */
     private static final Set<String> SYSTEM_LEVEL_TOOLS = Set.of(
             // Structured memory primitives — used by every agent regardless
             // of skill bindings, otherwise the self-evolution path collapses
@@ -672,6 +741,12 @@ public class AgentBindingService implements AgentBindingResolver {
             // extension-tier tool for the rest of the conversation. Must be
             // agent-wide so the model can always surface hidden tools.
             "enable_tool",
+            // Stable Hermes-style bridges. They must survive every explicit
+            // allowlist because they are the only way to discover, inspect
+            // and invoke schemas that were deferred by the hard budget.
+            "tool_search",
+            "tool_describe",
+            "tool_call",
             // Skill discovery / dispatch — skills are docs, not callables;
             // these helpers let the LLM read SKILL.md / run scripts.
             "load_skill",
@@ -705,12 +780,18 @@ public class AgentBindingService implements AgentBindingResolver {
             "addGoalCriterion",
             "completeGoal",
             "getGoalStatus",
+            // User-selected managed JSON protocol, authorized again inside each tool service.
+            "getManagedGoalJsonSlots",
+            "publishManagedGoalJson",
+            "checkManagedGoalJson",
+            "waitForGoalInput",
+            "resumeGoal",
             // Conversation-scoped progress ledger — same rationale as the
             // goal primitives above. Long multi-step research / drafting
             // tasks need it on every business agent, not just the planner,
             // since context-window trims can otherwise let an agent forget
             // what it has already produced and re-do work or stall.
-            "progress_update",
+            "progress_update", "get_progress",
             // Document / media generation — agent-wide capabilities, never
             // declared inside any skill manifest. Pre-Phase-2b these were
             // universally visible; the new gate silently strips them whenever
@@ -743,6 +824,7 @@ public class AgentBindingService implements AgentBindingResolver {
             "read_file",
             "send_file",
             "write_file",
+            "append_file",
             "edit_file",
             "execute_shell_command",
             // Inline code execution — an agent-wide capability alongside shell.
@@ -798,6 +880,7 @@ public class AgentBindingService implements AgentBindingResolver {
     }
 
     public AgentToolBinding bindTool(Long agentId, String toolName) {
+        requireMcpToolWorkspace(agentId, toolName);
         // Mirror of bindSkill: writing any tool row clears the opt-out flag
         // so the binding state cannot contradict the agent-level toggle.
         clearToolsDisabledFlag(agentId);
@@ -845,6 +928,7 @@ public class AgentBindingService implements AgentBindingResolver {
      * </ul>
      */
     public void setToolBindings(Long agentId, List<String> toolNames) {
+        if (toolNames != null) toolNames.forEach(name -> requireMcpToolWorkspace(agentId, name));
         validateNewToolBindings(agentId, toolNames);
 
         // Side effect parallel to setSkillBindings: a non-empty save is an
@@ -874,6 +958,16 @@ public class AgentBindingService implements AgentBindingResolver {
      * "remove this stale tool") still succeed even if upstream state has
      * drifted.
      */
+    private void requireMcpToolWorkspace(Long agentId, String name) {
+        var ref = vip.mate.tool.mcp.runtime.McpToolNameResolver.parse(name);
+        if (ref == null || mcpWorkspaceAccess == null) return;
+        var agent = agentMapper.selectById(agentId);
+        if (agent == null || !mcpWorkspaceAccess.canAccess(ref.serverId(), agent.getWorkspaceId())) {
+            throw new MateClawException("err.workspace.forbidden", 403,
+                    "MCP tool belongs to another workspace or is missing");
+        }
+    }
+
     private void validateNewToolBindings(Long agentId, List<String> incoming) {
         if (incoming == null || incoming.isEmpty()) {
             return;

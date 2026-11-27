@@ -33,6 +33,7 @@ public class SystemSettingService {
     private static final String STREAM_ENABLED_KEY = "streamEnabled";
     private static final String DEBUG_MODE_KEY = "debugMode";
     private static final String SHOW_THINKING_KEY = "showThinking";
+    private static final String THINKING_FULL_KEY = "thinkingFull";
     private static final String STATEGRAPH_ENABLED_KEY = "stateGraphEnabled";
 
     // 搜索服务配置 keys
@@ -98,6 +99,9 @@ public class SystemSettingService {
      */
     private static final String WORKSPACE_STORAGE_ROOT_KEY = "workspace.storage_root";
 
+    /** Managed DeepSeek Harness runtime configuration. */
+    public static final String DSH_API_KEY_KEY = "dsh.api_key";
+
     private static final String ZHIPU_API_KEY_KEY = "zhipuApiKey";
     private static final String ZHIPU_BASE_URL_KEY = "zhipuBaseUrl";
     private static final String FAL_API_KEY_KEY = "falApiKey";
@@ -115,7 +119,7 @@ public class SystemSettingService {
     private static final Set<String> SENSITIVE_KEYS = Set.of(
             SERPER_API_KEY_KEY, TAVILY_API_KEY_KEY, WEIXINOA_APP_SECRET_KEY,
             ZHIPU_API_KEY_KEY, FAL_API_KEY_KEY, KLING_ACCESS_KEY_KEY, KLING_SECRET_KEY_KEY,
-            RUNWAY_API_KEY_KEY, MINIMAX_API_KEY_KEY);
+            RUNWAY_API_KEY_KEY, MINIMAX_API_KEY_KEY, DSH_API_KEY_KEY);
 
     private final SystemSettingMapper systemSettingMapper;
     private final SearchProviderRegistry searchProviderRegistry;
@@ -166,6 +170,7 @@ public class SystemSettingService {
         dto.setStreamEnabled(Boolean.parseBoolean(getValue(STREAM_ENABLED_KEY, "true")));
         dto.setDebugMode(Boolean.parseBoolean(getValue(DEBUG_MODE_KEY, "false")));
         dto.setShowThinking(Boolean.parseBoolean(getValue(SHOW_THINKING_KEY, "true")));
+        dto.setThinkingFull(Boolean.parseBoolean(getValue(THINKING_FULL_KEY, "true")));
         dto.setStateGraphEnabled(Boolean.parseBoolean(getValue(STATEGRAPH_ENABLED_KEY, "false")));
 
         // 搜索服务配置
@@ -333,6 +338,10 @@ public class SystemSettingService {
         }
         if (dto.getShowThinking() != null) {
             saveValue(SHOW_THINKING_KEY, String.valueOf(dto.getShowThinking()), "聊天界面是否展示模型思考过程");
+        }
+        if (dto.getThinkingFull() != null) {
+            saveValue(THINKING_FULL_KEY, String.valueOf(dto.getThinkingFull()),
+                    "聊天界面是否展示每一轮的思考，而非只展示得出答案的那一轮");
         }
         if (dto.getStateGraphEnabled() != null) {
             saveValue(STATEGRAPH_ENABLED_KEY, String.valueOf(dto.getStateGraphEnabled()), "启用 StateGraph 架构的 ReAct Agent");
@@ -648,6 +657,11 @@ public class SystemSettingService {
     /** Persist a raw string setting. */
     public void saveString(String key, String value, String description) {
         saveValue(key, value, description);
+    }
+
+    /** Return a masked representation suitable for an admin status response. */
+    public String maskSecret(String value) {
+        return maskApiKey(value);
     }
 
     private String getValue(String key, String defaultValue) {

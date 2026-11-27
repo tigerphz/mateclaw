@@ -80,7 +80,7 @@ mateclaw:
 ```
 
 ::: warning
-**生产环境必须改默认 JWT secret。** 至少 32 字符。用环境变量（`JWT_SECRET=...`）设置，**不要 commit**。
+**所有环境启动时都必须配置 `JWT_SECRET`。** 使用唯一的随机值，至少 32 个 UTF-8 字节；可用 `openssl rand -base64 48` 生成。不要 commit。更换密钥会使现有 token 失效。
 :::
 
 ### 错误码
@@ -403,7 +403,7 @@ mateclaw:
 
 ### 工作空间隔离**不**覆盖的
 
-- **共享的全局配置**——JWT secret、模型 provider key、MCP 服务定义都是全局的
+- **共享的全局配置**——JWT secret、模型 provider key 是全局的；MCP 支持本空间或全局共享归属，历史配置保留共享，全局 MCP 仅系统管理员可管理
 - **审计日志的跨工作空间访问**——带权限的安全管理员可以跨所有工作空间查询审计事件
 
 ---
@@ -494,7 +494,7 @@ curl "http://localhost:18088/api/v1/audit/events?from=2026-04-01&to=2026-04-11&a
 | **关掉 H2 console** | 生产环境 `spring.h2.console.enabled=false` |
 | **防火墙** | 只开放对外端口 |
 | **限流** | 在反向代理层配置 |
-| **MySQL，不是 H2** | 生产用独立的 MySQL 8 实例 |
+| **生产数据库，不用 H2** | 推荐按公开 Docker 栈使用 PostgreSQL 16；也支持独立 MySQL 8 或 KingbaseES |
 
 ### Nginx 反向代理示例
 
@@ -564,7 +564,7 @@ mateclaw:
 ## 安全最佳实践
 
 1. **改默认密码。** 现在就改。每一个部署都改。
-2. **设一个真正的 JWT secret。** 至少 32 字符，通过环境变量，永远不要 commit。
+2. **设置唯一的随机 JWT secret。** 至少 32 个 UTF-8 字节，用 `openssl rand -base64 48` 生成，永远不要 commit。更换密钥会使现有 token 失效。
 3. **最小权限。** 只启用 Agent 真的需要的工具。
 4. **默认 `require_approval`。** 把 Tool Guard 的 `default-policy` 翻成 `require_approval`，然后为安全场景加 `allow` 规则。**新加的工具默认安全**。
 5. **配好 File Guard。** 在任何 Agent 真的碰文件系统之前把 allowed/denied 路径锁死。
@@ -582,7 +582,7 @@ application.yml 里有**三块**安全相关配置——JWT、文件沙箱，以
 ```yaml
 mateclaw:
   jwt:
-    secret: ${JWT_SECRET:your-secret-key-at-least-32-chars}
+    secret: ${JWT_SECRET:}
     expiration: 86400000          # token 有效期（毫秒）
     renewal-threshold: 7200000    # 剩余有效期低于此值时滑动续期（毫秒）
 

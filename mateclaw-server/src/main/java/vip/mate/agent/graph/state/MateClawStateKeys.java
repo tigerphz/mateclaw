@@ -64,6 +64,8 @@ public final class MateClawStateKeys {
 
     /** 最终回答草稿（由 summarizing 或 limitExceeded 节点生成） */
     public static final String FINAL_ANSWER_DRAFT = "final_answer_draft";
+    /** Accumulated visible body for an explicit long-form generation request. */
+    public static final String LONG_FORM_DRAFT = "long_form_draft";
 
     /** 是否需要进入 summarizing 阶段 */
     public static final String SHOULD_SUMMARIZE = "should_summarize";
@@ -184,6 +186,22 @@ public final class MateClawStateKeys {
     /** Source references observed from successful tool results during this run. */
     public static final String SOURCE_EVIDENCE_LEDGER = "source_evidence_ledger";
 
+    /** Authoritative terminal tool receipts accumulated during the current graph run. */
+    public static final String ACTION_EXECUTION_LEDGER = "action_execution_ledger";
+
+    /** True when structured runtime context says this turn must perform an executable action. */
+    public static final String ACTION_COMPLETION_REQUIRED = "action_completion_required";
+
+    /** Number of prose-only final-answer corrections consumed in this run. */
+    public static final String FINALIZATION_ATTEMPTS = "finalization_attempts";
+    /** Independent executable continuation progress; all calls still spend the original run budget. */
+    public static final String FINALIZATION_PROGRESS_COUNT = "finalization_progress_count";
+    public static final String FINALIZATION_IDLE_CONTINUATIONS = "finalization_idle_continuations";
+    public static final String ACTION_COMPLETION_RETRY_COUNT = "action_completion_retry_count";
+
+    /** One-shot edge signal routing a rejected final candidate back to ReasoningNode. */
+    public static final String CONTINUE_REASONING = "continue_reasoning";
+
     // ===== Persistent goal — cross-turn objective lock-in =====
 
     /**
@@ -274,6 +292,12 @@ public final class MateClawStateKeys {
      * workspace context.
      */
     public static final String CHAT_ORIGIN = "chat_origin";
+
+    /** Thinking preference captured before asynchronous runtime callbacks. */
+    public static final String REQUESTED_THINKING_LEVEL = "requested_thinking_level";
+
+    /** Immutable delegation identity carried across runtime worker hops. */
+    public static final String SUBAGENT_RUN_CONTEXT = "subagent_run_context";
 
     // ===== Skill progressive disclosure (REPLACE strategy) =====
 

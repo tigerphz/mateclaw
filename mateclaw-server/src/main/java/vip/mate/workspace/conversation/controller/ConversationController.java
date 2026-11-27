@@ -3,14 +3,18 @@ package vip.mate.workspace.conversation.controller;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import lombok.RequiredArgsConstructor;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
 import org.springframework.security.core.Authentication;
 import org.springframework.web.bind.annotation.*;
 import vip.mate.common.result.R;
 import vip.mate.channel.web.ChatStreamTracker;
+import vip.mate.team.service.TeamWorkerConversationGovernanceService;
 import vip.mate.workspace.conversation.ConversationService;
 import vip.mate.workspace.conversation.vo.ConversationVO;
 import vip.mate.workspace.conversation.vo.MessageVO;
 
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 
@@ -25,8 +29,11 @@ import java.util.Map;
 @RequiredArgsConstructor
 public class ConversationController {
 
+    private static final int MAX_BATCH_DELETE_SIZE = 200;
+
     private final ConversationService conversationService;
     private final ChatStreamTracker streamTracker;
+    private final TeamWorkerConversationGovernanceService teamWorkerGovernanceService;
 
     /**
      * 获取当前用户的会话列表
@@ -60,6 +67,24 @@ public class ConversationController {
     }
 
     /**
+     * 导出会话轨迹 —— 调试/验收用的线性纯文本转录。
+     * <p>
+     * 与聊天界面读同一份 {@code metadata.segments} 时间线，但按发射顺序原样打印：
+     * 每轮推理、工具调用、工具返回、答案各自成块，包括界面会折叠掉的
+     * superseded 预写内容。可直接 diff 两次运行，或贴进 issue。
+     */
+    @Operation(summary = "导出会话轨迹（纯文本）")
+    @GetMapping(value = "/{conversationId}/trajectory", produces = "text/plain;charset=UTF-8")
+    public ResponseEntity<String> exportTrajectory(@PathVariable String conversationId,
+                                                   Authentication auth) {
+        String username = auth != null ? auth.getName() : "anonymous";
+        if (!conversationService.isConversationOwner(conversationId, username)) {
+            return ResponseEntity.status(HttpStatus.FORBIDDEN).body("无权访问该会话\n");
+        }
+        return ResponseEntity.ok(conversationService.renderTrajectory(conversationId));
+    }
+
+    /**
      * 获取指定会话的消息历史（支持分页）。
      * <p>
      * 不传 limit 时返回全部消息（向后兼容）。
@@ -71,9 +96,12 @@ public class ConversationController {
     public R<?> listMessages(@PathVariable String conversationId,
                              @RequestParam(required = false) Long beforeId,
                              @RequestParam(required = false) Integer limit,
+                             @RequestParam(required = false) Long runId,
+                             @RequestParam(required = false) Long taskId,
                              Authentication auth) {
         String username = auth != null ? auth.getName() : "anonymous";
-        if (!conversationService.isConversationOwner(conversationId, username)) {
+        if (!conversationService.isConversationOwner(conversationId, username)
+                && !teamWorkerGovernanceService.canReadTranscript(conversationId, runId, taskId, username)) {
             return R.fail(403, "无权访问该会话");
         }
 
@@ -199,13 +227,22 @@ public class ConversationController {
         String username = auth != null ? auth.getName() : "anonymous";
         List<String> ids = body.get("conversationIds");
         if (ids == null || ids.isEmpty()) {
-            return R.fail("未指定要删除的会话");
+            return R.fail(400, "未指定要删除的会话");
+        }
+        LinkedHashSet<String> uniqueIds = new LinkedHashSet<>();
+        for (String id : ids) {
+            if (id != null && !id.isBlank()) {
+                uniqueIds.add(id.trim());
+            }
+        }
+        if (uniqueIds.isEmpty()) {
+            return R.fail(400, "未指定要删除的会话");
+        }
+        if (uniqueIds.size() > MAX_BATCH_DELETE_SIZE) {
+            return R.fail(400, "单次最多删除 " + MAX_BATCH_DELETE_SIZE + " 个会话");
         }
         int deleted = 0;
-        for (String conversationId : ids) {
-            if (conversationId == null || conversationId.isBlank()) {
-                continue;
-            }
+        for (String conversationId : uniqueIds) {
             if (!conversationService.isConversationOwner(conversationId, username)) {
                 continue;
             }

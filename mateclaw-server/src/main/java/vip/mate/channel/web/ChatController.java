@@ -1,5 +1,6 @@
 package vip.mate.channel.web;
 
+import vip.mate.workspace.core.service.MemberFileIsolation;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -19,12 +20,14 @@ import vip.mate.common.result.R;
 import vip.mate.workspace.core.service.ChatUploadLocationResolver;
 import vip.mate.agent.AgentService;
 import vip.mate.agent.model.AgentEntity;
+import vip.mate.agent.runtime.ConversationTurnGate;
 import vip.mate.approval.ApprovalWorkflowService;
 import vip.mate.approval.MetadataDecision;
 import vip.mate.approval.PendingApproval;
 import vip.mate.approval.ResolveOutcome;
 import vip.mate.memory.event.ConversationCompletionPublisher;
 import vip.mate.workspace.conversation.ConversationService;
+import vip.mate.workspace.conversation.MessageMetadataJson;
 import vip.mate.workspace.conversation.model.MessageContentPart;
 import vip.mate.workspace.conversation.model.MessageEntity;
 
@@ -42,6 +45,8 @@ import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.time.LocalDateTime;
+import java.util.UUID;
 
 /**
  * Web 渠道聊天接口
@@ -65,6 +70,16 @@ public class ChatController {
     private final vip.mate.memory.identity.MemoryOwnerResolver memoryOwnerResolver;
     private final vip.mate.workspace.core.service.ChatUploadLocationResolver uploadLocationResolver;
     private final vip.mate.tool.document.preview.OfficePreviewService officePreviewService;
+    private final ConversationInputQueueStore inputQueue;
+
+    @org.springframework.beans.factory.annotation.Autowired
+    private ConversationTurnGate turnGate = new ConversationTurnGate();
+
+    @org.springframework.beans.factory.annotation.Autowired
+    private vip.mate.goal.service.GoalJsonAcceptanceService jsonAcceptance;
+
+    @org.springframework.beans.factory.annotation.Autowired
+    private vip.mate.goal.service.GoalApprovalRunService goalApprovalRuns;
 
     // Virtual thread per SSE task: matches the app-wide virtual-thread model
     // (spring.threads.virtual.enabled=true) and, unlike a cached platform-thread
@@ -191,13 +206,37 @@ public class ChatController {
             }
         }
 
+        // Worker conversations are immutable evidence from the web UI. Keep this
+        // guard at the user entry point so internal dispatch can still persist its
+        // user/assistant execution transcript through ConversationService.
+        if (!conversationService.isUserMessageAllowed(conversationId)) {
+            sendErrorDoneAndComplete(emitter, "执行任务会话为只读，不能发送新消息");
+            return emitter;
+        }
+
+        if (conversationService.conversationExists(conversationId)
+                && !conversationService.isConversationOwner(conversationId, username)) {
+            sendErrorDoneAndComplete(emitter, "无权操作该会话");
+            return emitter;
+        }
+
+        // Reserve before approval consumption, regeneration or stream mutation.
+        // Once registered, RunState protects the setup-to-subscription gap:
+        // autonomous admission checks isRunning while holding this same gate.
+        try (var setupPermit = turnGate.tryAcquire(conversationId)) {
+        if (setupPermit == null || streamTracker.isRunning(conversationId)) {
+            sendErrorDoneAndComplete(emitter, "正在生成回复，请先停止或排队后续消息");
+            return emitter;
+        }
+
         // ---- 审批命令拦截：/approve、/deny 走 SSE 流式 replay ----
         String normalizedMsg = requestMessage.trim().toLowerCase();
         boolean isApprovalCommand = "/approve".equals(normalizedMsg) || "approve".equals(normalizedMsg);
         boolean isDenyCommand = "/deny".equals(normalizedMsg) || "deny".equals(normalizedMsg);
 
         if (isApprovalCommand || isDenyCommand) {
-            PendingApproval pending = approvalService.findPendingByConversation(conversationId);
+            PendingApproval pending = findRequestedPendingApproval(
+                    conversationId, request.getPendingApprovalId());
             if (pending == null) {
                 try {
                     sendEvent(emitter, "error", Map.of("message", "当前没有待审批的工具调用"));
@@ -209,7 +248,13 @@ public class ChatController {
 
             // deny: workflow.resolve handles DB + metadata + memory atomically.
             if (isDenyCommand) {
-                ResolveOutcome denyOutcome = approvalService.resolve(pending.getPendingId(), username, "denied");
+                ResolveOutcome denyOutcome;
+                try {
+                    denyOutcome = resolveWithCurrentApprover(pending, auth, username, false);
+                } catch (vip.mate.exception.MateClawException revoked) {
+                    sendErrorDoneAndComplete(emitter, revoked.getMessage());
+                    return emitter;
+                }
                 conversationService.removeApprovalPlaceholders(conversationId);
                 log.info("[Approval-Stream] User {} denied pending {} for conversation {} (dbSynced={}, msgRewritten={})",
                         username, pending.getPendingId(), conversationId,
@@ -219,7 +264,13 @@ public class ChatController {
             // approve: atomic resolveAndConsume; workflow handles DB + metadata + memory.
             PendingApproval consumed = null;
             if (isApprovalCommand) {
-                ResolveOutcome consumeOutcome = approvalService.resolveAndConsume(pending.getPendingId(), username);
+                ResolveOutcome consumeOutcome;
+                try {
+                    consumeOutcome = resolveWithCurrentApprover(pending, auth, username, true);
+                } catch (vip.mate.exception.MateClawException revoked) {
+                    sendErrorDoneAndComplete(emitter, revoked.getMessage());
+                    return emitter;
+                }
                 if (consumeOutcome.isAlreadyResolved()) {
                     try {
                         sendEvent(emitter, "error", Map.of("message", "审批记录已过期或已被处理"));
@@ -240,6 +291,7 @@ public class ChatController {
             final String decision = isApprovalCommand ? "approved" : "denied";
 
             streamTracker.register(conversationId);
+            setupPermit.close();
             Long approvalAgentId = parseLongOrNull(pending.getAgentId());
             streamTracker.bindRunMeta(conversationId, approvalAgentId, username);
             registerEmitterCallbacks(emitter, conversationId);
@@ -270,8 +322,8 @@ public class ChatController {
                                 conversationService.getMessageCount(conversationId)));
                         // deny 是正常 turn 终结，用户可能在 awaiting_approval 阶段排了消息
                         ChatStreamTracker.CompletionResult denyCr = streamTracker.completeAndConsumeIfLast(conversationId);
-                        if (denyCr.allDone() && denyCr.queuedInput() != null) {
-                            startQueuedMessage(conversationId, emitter, approvalEmitterDone, denyCr.queuedInput(), username, requestBaseUrl);
+                        if (denyCr.allDone() && shouldDrainQueuedInput(conversationId, "completed")) {
+                            startQueuedMessage(conversationId, emitter, approvalEmitterDone, username, requestBaseUrl);
                         } else {
                             completeEmitterQuietly(emitter, approvalEmitterDone);
                         }
@@ -284,8 +336,8 @@ public class ChatController {
                         broadcastEvent(conversationId, "done", Map.of("status", "completed"));
                         // 审批记录被另一个请求消费，但用户可能在等待期间排了消息
                         ChatStreamTracker.CompletionResult consumedNullCr = streamTracker.completeAndConsumeIfLast(conversationId);
-                        if (consumedNullCr.allDone() && consumedNullCr.queuedInput() != null) {
-                            startQueuedMessage(conversationId, emitter, approvalEmitterDone, consumedNullCr.queuedInput(), username, requestBaseUrl);
+                        if (consumedNullCr.allDone() && shouldDrainQueuedInput(conversationId, "completed")) {
+                            startQueuedMessage(conversationId, emitter, approvalEmitterDone, username, requestBaseUrl);
                         } else {
                             completeEmitterQuietly(emitter, approvalEmitterDone);
                         }
@@ -313,7 +365,7 @@ public class ChatController {
                     }
                     // Carry the request-thread base URL so any file a replayed
                     // tool generates gets an absolute download link.
-                    replayOrigin = replayOrigin.withBaseUrl(requestBaseUrl);
+                    replayOrigin = replayOrigin.withBaseUrl(requestBaseUrl).withApprovalId(finalConsumed.getPendingId());
                     Disposable disposable = agentService.chatWithReplayStream(
                             replayAgentId, replayPrompt, conversationId, finalConsumed.getToolCallPayload(), username, replayOrigin)
                             .doOnNext(delta -> {
@@ -369,8 +421,9 @@ public class ChatController {
                                                 accumulator.toMetadataJson());  // includes toolCalls metadata
                                     } else if (replayWasStopped) {
                                         boolean replayIsFollowup = replayInterrupt == ChatStreamTracker.InterruptType.USER_INTERRUPT_WITH_FOLLOWUP;
-                                        savedAssistant = conversationService.saveMessage(conversationId, "assistant",
-                                                replayIsFollowup ? "[已中断]" : "[已停止生成]", null, persistStatus);
+                                        savedAssistant = saveAssistantWithUsage(conversationId,
+                                                replayIsFollowup ? "[已中断]" : "[已停止生成]", null,
+                                                persistStatus, accumulator);
                                     } else {
                                         savedAssistant = saveEmptyAssistantPlaceholder(
                                                 conversationId, persistStatus, accumulator, "SSE replay doOnComplete");
@@ -389,8 +442,8 @@ public class ChatController {
                                 } finally {
                                     ChatStreamTracker.CompletionResult cr = streamTracker.completeAndConsumeIfLast(conversationId);
                                     if (cr.allDone()) {
-                                        if (cr.queuedInput() != null) {
-                                            startQueuedMessage(conversationId, emitter, approvalEmitterDone, cr.queuedInput(), username, requestBaseUrl);
+                                        if (shouldDrainQueuedInput(conversationId, persistStatus)) {
+                                            startQueuedMessage(conversationId, emitter, approvalEmitterDone, username, requestBaseUrl);
                                         } else {
                                             conversationService.updateStreamStatus(conversationId, "idle");
                                             completeEmitterQuietly(emitter, approvalEmitterDone);
@@ -450,12 +503,13 @@ public class ChatController {
                                                 accumulator.getRuntimeProviderId(),
                                                 accumulator.toMetadataJson());
                                     } else if (isUserStop) {
-                                        savedAssistant = conversationService.saveMessage(conversationId, "assistant",
-                                                replayIsFollowup ? "[已中断]" : "[已停止生成]", null, errStatus);
+                                        savedAssistant = saveAssistantWithUsage(conversationId,
+                                                replayIsFollowup ? "[已中断]" : "[已停止生成]", null,
+                                                errStatus, accumulator);
                                     } else {
-                                        savedAssistant = conversationService.saveMessage(conversationId, "assistant",
+                                        savedAssistant = saveAssistantWithUsage(conversationId,
                                                 "[错误] " + (e.getMessage() != null ? e.getMessage() : "replay error"),
-                                                null, "failed");
+                                                null, "failed", accumulator);
                                     }
 
                                     if (replayIsFollowup) {
@@ -490,8 +544,8 @@ public class ChatController {
                                 streamTracker.clearInterruptState(conversationId);
                                 ChatStreamTracker.CompletionResult cr = streamTracker.completeAndConsumeIfLast(conversationId);
                                 if (cr.allDone()) {
-                                    if (cr.queuedInput() != null) {
-                                        startQueuedMessage(conversationId, emitter, approvalEmitterDone, cr.queuedInput(), username, requestBaseUrl);
+                                    if (shouldDrainQueuedInput(conversationId, errStatus)) {
+                                        startQueuedMessage(conversationId, emitter, approvalEmitterDone, username, requestBaseUrl);
                                     } else {
                                         conversationService.updateStreamStatus(conversationId, "idle");
                                         completeEmitterQuietly(emitter, approvalEmitterDone);
@@ -544,8 +598,22 @@ public class ChatController {
                 ? (regenerateSeed.content() != null ? regenerateSeed.content() : "")
                 : requestMessage;
 
+        // Snapshot selection on the request thread before the executor can be
+        // delayed behind other work. A Goal abandoned during model inference
+        // must still be recognizable when that turn asks for approval.
+        final vip.mate.agent.context.ChatOrigin selectedTurnOrigin;
+        try {
+            selectedTurnOrigin = captureWebGoal(memoryOrigin(conversationId, username,
+                    requesterUserIdOf(auth), workspaceId, request.getEndUserId())
+                    .withBaseUrl(requestBaseUrl), agentId);
+        } catch (vip.mate.exception.MateClawException invalidSelection) {
+            sendErrorDoneAndComplete(emitter, invalidSelection.getMessage());
+            return emitter;
+        }
+
         // ---- 正常请求：注册流状态并附着首个订阅者 ----
         streamTracker.register(conversationId);
+        setupPermit.close();
         streamTracker.bindRunMeta(conversationId, agentId, username);
         registerEmitterCallbacks(emitter, conversationId);
         streamTracker.attach(conversationId, emitter);
@@ -579,11 +647,19 @@ public class ChatController {
                 List<MessageContentPart> requestParts = regenerateSeed != null
                         ? regenerateSeed.parts()
                         : normalizeRequestParts(request);
+                if (regenerateSeed == null) {
+                    validateUploadedParts(conversationId, selectedTurnOrigin, requestParts);
+                }
                 String promptText = buildPromptText(message, requestParts);
+                Long originMessageId;
                 if (regenerateSeed == null) {
                     // Regenerate reuses the already-persisted seed user row —
                     // inserting again would duplicate it (issue #547).
-                    conversationService.saveMessage(conversationId, "user", message, requestParts);
+                    MessageEntity savedUser = conversationService
+                            .saveMessage(conversationId, "user", message, requestParts);
+                    originMessageId = savedUser == null ? null : savedUser.getId();
+                } else {
+                    originMessageId = regenerateSeed.seedMessageId();
                 }
                 conversationService.updateStreamStatus(conversationId, "running");
 
@@ -599,9 +675,7 @@ public class ChatController {
                 // RFC-063r §2.5: web entry — null channelId / no ChannelTarget;
                 // tools that need a workspace path read it from the agent (origin
                 // is enriched with workspaceBasePath in StateGraph buildInitialState).
-                vip.mate.agent.context.ChatOrigin webOrigin =
-                        memoryOrigin(conversationId, username, requesterUserIdOf(auth), workspaceId, request.getEndUserId())
-                                .withBaseUrl(requestBaseUrl);
+                vip.mate.agent.context.ChatOrigin webOrigin = selectedTurnOrigin.withOriginMessageId(originMessageId);
                 Disposable disposable = agentService.chatStructuredStream(agentId, promptText, conversationId, username, request.getThinkingLevel(), webOrigin)
                         .doOnNext(delta -> {
                             if (emitterDone.get()) return;
@@ -680,8 +754,9 @@ public class ChatController {
                                             accumulator.getRuntimeProviderId(),
                                             accumulator.toMetadataJson());
                                 } else if (wasStopped) {
-                                    savedAssistant = conversationService.saveMessage(conversationId, "assistant",
-                                            isInterruptFollowup ? "[已中断]" : "[已停止生成]", null, persistStatus);
+                                    savedAssistant = saveAssistantWithUsage(conversationId,
+                                            isInterruptFollowup ? "[已中断]" : "[已停止生成]", null,
+                                            persistStatus, accumulator);
                                 } else {
                                     savedAssistant = saveEmptyAssistantPlaceholder(
                                             conversationId, persistStatus, accumulator, "SSE doOnComplete");
@@ -728,7 +803,7 @@ public class ChatController {
                                 ChatStreamTracker.CompletionResult cr = streamTracker.completeAndConsumeIfLast(conversationId);
                                 if (cr.allDone()) {
                                     // RFC follow-up (2026-04-27): the previous guard
-                                    //   cr.queuedInput() != null && (isInterruptFollowup || !wasStopped)
+                                    //   hasQueuedInput(conversationId) && (isInterruptFollowup || !wasStopped)
                                     // dropped legitimate queued messages when the user stopped
                                     // the running turn and then sent a new message via the
                                     // enqueue path (not the interrupt-with-followup path) —
@@ -739,8 +814,8 @@ public class ChatController {
                                     // run it" condition; align with them. If the user
                                     // genuinely doesn't want continuation, no message would
                                     // have been in messageQueue to begin with.
-                                    if (cr.queuedInput() != null) {
-                                        startQueuedMessage(conversationId, emitter, emitterDone, cr.queuedInput(), username, requestBaseUrl);
+                                    if (shouldDrainQueuedInput(conversationId, persistStatus)) {
+                                        startQueuedMessage(conversationId, emitter, emitterDone, username, requestBaseUrl);
                                     } else {
                                         conversationService.updateStreamStatus(conversationId, "idle");
                                         // 延迟关闭 emitter，确保最后的事件都已发送
@@ -801,8 +876,9 @@ public class ChatController {
                                             accumulator.getRuntimeProviderId(),
                                             accumulator.toMetadataJson());
                                 } else {
-                                    savedAssistant = conversationService.saveMessage(conversationId, "assistant",
-                                            isInterruptFollowup ? "[已中断]" : "[已停止生成]", null, status);
+                                    savedAssistant = saveAssistantWithUsage(conversationId,
+                                            isInterruptFollowup ? "[已中断]" : "[已停止生成]", null,
+                                            status, accumulator);
                                 }
 
                                 if (isInterruptFollowup) {
@@ -823,7 +899,8 @@ public class ChatController {
                                     ));
                                     int stoppedMsgCount = conversationService.getMessageCount(conversationId);
                                     broadcastEvent(conversationId, "done", buildDonePayload(
-                                            conversationId, "stopped", savedAssistant, 0, 0,
+                                            conversationId, "stopped", savedAssistant,
+                                            accumulator.getPromptTokens(), accumulator.getCompletionTokens(),
                                             isAssistantPersisted(savedAssistant), stoppedMsgCount));
                                 }
                             } catch (Exception e) {
@@ -832,9 +909,9 @@ public class ChatController {
                                 streamTracker.clearInterruptState(conversationId);
                                 ChatStreamTracker.CompletionResult cr = streamTracker.completeAndConsumeIfLast(conversationId);
                                 if (cr.allDone()) {
-                                    if (cr.queuedInput() != null) {
+                                    if (shouldDrainQueuedInput(conversationId, status)) {
                                         // 无论中断类型，都消费排队消息（修复 Disposable 不可用时队列被丢弃的 bug）
-                                        startQueuedMessage(conversationId, emitter, emitterDone, cr.queuedInput(), username, requestBaseUrl);
+                                        startQueuedMessage(conversationId, emitter, emitterDone, username, requestBaseUrl);
                                     } else {
                                         conversationService.updateStreamStatus(conversationId, "idle");
                                         completeEmitterQuietly(emitter, emitterDone);
@@ -906,10 +983,12 @@ public class ChatController {
                                             accumulator.getRuntimeProviderId(),
                                             accumulator.toMetadataJson());
                                 } else if (isUserStop) {
-                                    savedAssistant = conversationService.saveMessage(conversationId, "assistant",
-                                            isInterruptFollowup ? "[已中断]" : "[已停止生成]", null, status);
+                                    savedAssistant = saveAssistantWithUsage(conversationId,
+                                            isInterruptFollowup ? "[已中断]" : "[已停止生成]", null,
+                                            status, accumulator);
                                 } else {
-                                    savedAssistant = conversationService.saveMessage(conversationId, "assistant", "[错误] " + errorMsg, null, "failed");
+                                    savedAssistant = saveAssistantWithUsage(conversationId,
+                                            "[错误] " + errorMsg, null, "failed", accumulator);
                                 }
 
                                 if (isInterruptFollowup) {
@@ -942,7 +1021,7 @@ public class ChatController {
                             streamTracker.clearInterruptState(conversationId);
                             ChatStreamTracker.CompletionResult cr = streamTracker.completeAndConsumeIfLast(conversationId);
                             log.info("SSE doOnError cleanup: conversationId={}, allDone={}, isInterruptFollowup={}, hasQueued={}",
-                                    conversationId, cr.allDone(), isInterruptFollowup, cr.queuedInput() != null);
+                                    conversationId, cr.allDone(), isInterruptFollowup, hasQueuedInput(conversationId));
                             if (cr.allDone()) {
                                 // RFC follow-up (2026-04-27): the previous guard
                                 //   cr.queuedInput()!=null && !(isUserStop && !isInterruptFollowup)
@@ -956,8 +1035,8 @@ public class ChatController {
                                 // follow-up. Whoever puts a message in messageQueue means it
                                 // — just run it. Aligns with doOnComplete and the 4 other
                                 // queue-launch sites in this controller.
-                                if (cr.queuedInput() != null) {
-                                    startQueuedMessage(conversationId, emitter, emitterDone, cr.queuedInput(), username, requestBaseUrl);
+                                if (shouldDrainQueuedInput(conversationId, status)) {
+                                    startQueuedMessage(conversationId, emitter, emitterDone, username, requestBaseUrl);
                                 } else {
                                     conversationService.updateStreamStatus(conversationId, "idle");
                                     completeEmitterQuietly(emitter, emitterDone);
@@ -990,6 +1069,7 @@ public class ChatController {
         });
 
         return emitter;
+        }
     }
 
     /**
@@ -1012,6 +1092,10 @@ public class ChatController {
             return R.fail(403, "无权操作该会话");
         }
         boolean stopped = streamTracker.requestStop(conversationId);
+        // Acknowledge only after the cancellation path had a chance to drain
+        // and persist its partial assistant message. Bound the wait so a
+        // genuinely non-cooperative third-party tool cannot pin the HTTP call.
+        boolean terminationConfirmed = !stopped || streamTracker.awaitTermination(conversationId, 2000L);
 
         // Sweep ghost approvals — workflow.denyAllByConversation owns DB + metadata + memory
         // atomically; we only need to broadcast SSE events on the resulting outcomes.
@@ -1030,6 +1114,7 @@ public class ChatController {
                 conversationId, username, stopped, denied.size(), messagesRewritten);
         return R.ok(Map.of(
                 "stopped", stopped,
+                "terminationConfirmed", terminationConfirmed,
                 "ghostPendingsCleared", denied.size(),
                 "messagesRewritten", messagesRewritten
         ));
@@ -1066,17 +1151,33 @@ public class ChatController {
         // 判断当前阶段（仅用于 reason 字段，行为对所有阶段一致：仅入队）
         boolean isAwaitingApproval = approvalService.findPendingByConversation(conversationId) != null;
 
-        // 仅入队、不 dispose。延迟持久化到 startQueuedMessage（让 Asst-N 先在 doOnComplete 落库，
-        // 否则 listMessages ORDER BY create_time ASC 会把 Q(N+1) 排到 Asst-N 前面）
-        boolean queued = streamTracker.enqueueMessage(conversationId, message, agentId, false, contentParts);
+        // Commit the payload before publishing acceptance. The stream tracker is
+        // only a wake signal; the database row remains authoritative on restart.
+        var enqueueConversation = conversationService.findByConversationId(conversationId);
+        Long queueAgentId = agentId == null && enqueueConversation != null
+                ? enqueueConversation.getAgentId() : agentId;
+        if (enqueueConversation == null || queueAgentId == null
+                || !java.util.Objects.equals(queueAgentId, enqueueConversation.getAgentId())) {
+            return R.fail(409, "会话助手已变化，请刷新后重试");
+        }
+        var queuedSelection = captureWebGoal(vip.mate.agent.context.ChatOrigin.web(conversationId,
+                username, enqueueConversation.getWorkspaceId(), null, null, requesterUserIdOf(auth)), queueAgentId);
+        var stored = inputQueue.enqueue(conversationId, queueAgentId, username, message, contentParts,
+                requesterUserIdOf(auth), queuedSelection.selectedGoalId(), LocalDateTime.now());
+        boolean queued = streamTracker.notifyQueuedInput(conversationId);
+        if (!queued) {
+            inputQueue.cancel(stored.id(), "stream_finished_before_queue_registration",
+                    LocalDateTime.now());
+        }
         log.info("Enqueued follow-up message during running turn: conversationId={}, user={}, queueSize={}, awaitingApproval={}",
-                conversationId, username, streamTracker.getQueueSize(conversationId), isAwaitingApproval);
+                conversationId, username, inputQueue.countQueued(conversationId), isAwaitingApproval);
 
         return R.ok(Map.of(
                 "interrupted", false,
                 "queued", queued,
-                "queueSize", streamTracker.getQueueSize(conversationId),
-                "reason", isAwaitingApproval ? "awaiting_approval" : "queued"
+                "queueItemId", stored.id().toString(),
+                "queueSize", inputQueue.countQueued(conversationId),
+                "reason", queued ? (isAwaitingApproval ? "awaiting_approval" : "queued") : "no_active_stream"
         ));
     }
 
@@ -1103,15 +1204,26 @@ public class ChatController {
         if (username == null) {
             return R.fail(401, "未登录，请先登录");
         }
+        try (var permit = turnGate.tryAcquire(request.getConversationId())) {
+        if (permit == null || streamTracker.isRunning(request.getConversationId())) {
+            return R.fail(409, "正在生成回复，请先停止或排队后续消息");
+        }
         conversationService.getOrCreateConversation(request.getConversationId(), agentId, username, workspaceId);
-        conversationService.saveMessage(request.getConversationId(), "user", request.getMessage(), request.getContentParts());
+        validateUploadedParts(request.getConversationId(),
+                vip.mate.agent.context.ChatOrigin.web(request.getConversationId(), username, workspaceId,
+                        null, null, requesterUserIdOf(auth)), request.getContentParts());
+        MessageEntity savedUser = conversationService.saveMessage(
+                request.getConversationId(), "user", request.getMessage(), request.getContentParts());
 
         String promptText = buildPromptText(request.getMessage(), request.getContentParts());
         // Carry the web origin so per-owner memory recall (read) and the
         // post-conversation memory write below agree on the same owner key.
-        vip.mate.agent.context.ChatOrigin webOrigin =
-                memoryOrigin(request.getConversationId(), username, requesterUserIdOf(auth), workspaceId, request.getEndUserId());
-        AgentService.ChatResult result = agentService.chatWithUsage(agentId, promptText, request.getConversationId(), webOrigin);
+        vip.mate.agent.context.ChatOrigin webOrigin = captureWebGoal(
+                memoryOrigin(request.getConversationId(), username, requesterUserIdOf(auth), workspaceId,
+                        request.getEndUserId()), agentId).withOriginMessageId(
+                                savedUser == null ? null : savedUser.getId());
+        AgentService.ChatResult result = turnGate.withPermit(permit, () ->
+                agentService.chatWithUsage(agentId, promptText, request.getConversationId(), webOrigin));
         String response = result.content();
         conversationService.saveMessage(request.getConversationId(), "assistant", response, null, "completed",
                 result.promptTokens(), result.completionTokens(),
@@ -1119,14 +1231,25 @@ public class ChatController {
         completionPublisher.publish(agentId, request.getConversationId(), request.getMessage(), response, "web",
                 memoryOwnerResolver.resolve(webOrigin));
         return R.ok(response);
+        }
     }
 
     @Operation(summary = "上传聊天附件")
     @PostMapping(value = "/upload", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
-    public R<ChatUploadResponse> upload(
+    public R<ChatUploadResponse> uploadInWorkspace(
             @RequestParam String conversationId,
             @RequestPart("file") MultipartFile file,
+            @RequestHeader(value = "X-Workspace-Id", required = false) Long workspaceId,
             Authentication auth) throws IOException {
+        return uploadForWorkspace(conversationId, file, workspaceId, auth);
+    }
+
+    public R<ChatUploadResponse> upload(String conversationId, MultipartFile file, Authentication auth) throws IOException {
+        return uploadForWorkspace(conversationId, file, null, auth);
+    }
+
+    private R<ChatUploadResponse> uploadForWorkspace(String conversationId, MultipartFile file,
+            Long workspaceId, Authentication auth) throws IOException {
 
         String username = auth != null ? auth.getName() : "anonymous";
         // 校验会话归属（会话可能尚未创建，此时允许上传——后续 stream/chat 会创建并绑定用户）。
@@ -1143,14 +1266,23 @@ public class ChatController {
         String originalFilename = file.getOriginalFilename() != null ? file.getOriginalFilename() : "file";
         String safeFilename = Path.of(originalFilename).getFileName().toString().replaceAll("[^a-zA-Z0-9._-]", "_");
         String storedName = System.currentTimeMillis() + "_" + safeFilename;
-        Path uploadRoot = uploadLocationResolver.resolveUploadRoot(conversationId);
+        var uploadOrigin = vip.mate.agent.context.ChatOrigin.web(conversationId, username,
+                workspaceId != null ? workspaceId : (conversationService.conversationExists(conversationId) ? null : 1L),
+                null, null, requesterUserIdOf(auth));
+        Path uploadRoot = MemberFileIsolation.isEnabled() ? uploadLocationResolver.resolveUploadRoot(uploadOrigin)
+                : uploadLocationResolver.resolveUploadRoot(conversationId);
         // resolveWriteDir sanitizes the id (IM-channel ids like "wecom:XXXX"
         // carry a ':' illegal on Windows) and appends the per-day sub-directory
         // when date folders are enabled. Reads probe both layouts.
-        Path writeDir = uploadLocationResolver.resolveWriteDir(conversationId);
-        Files.createDirectories(writeDir);
+        Path writeDir = MemberFileIsolation.isEnabled() ? uploadLocationResolver.resolveWriteDir(uploadOrigin)
+                : uploadLocationResolver.resolveWriteDir(conversationId);
         Path target = writeDir.resolve(storedName);
-        file.transferTo(target);
+        if (MemberFileIsolation.isEnabled()) {
+            vip.mate.workspace.core.service.MemberFileAccess.write(uploadRoot.getParent(), target, file.getBytes(), false);
+        } else {
+            Files.createDirectories(writeDir);
+            file.transferTo(target);
+        }
 
         log.info("Chat attachment uploaded: conversationId={}, user={}, file={}", conversationId, username, target);
 
@@ -1179,12 +1311,25 @@ public class ChatController {
             return ResponseEntity.status(403).build();
         }
 
-        Path filePath = resolveUploadedFile(conversationId, storedName);
+        if (MemberFileIsolation.isEnabled()) {
+            try {
+                MemberFileIsolation.scope(vip.mate.agent.context.ChatOrigin.web(conversationId, username,
+                        null, null, null, requesterUserIdOf(auth)));
+            } catch (SecurityException e) { return ResponseEntity.status(403).build(); }
+        }
+        Path filePath = MemberFileIsolation.isEnabled()
+                ? uploadLocationResolver.resolveExistingFile(vip.mate.agent.context.ChatOrigin.web(conversationId, username,
+                        null, null, null, requesterUserIdOf(auth)), storedName)
+                : resolveUploadedFile(conversationId, storedName);
         if (filePath == null) {
             return ResponseEntity.notFound().build();
         }
 
-        Resource resource = new FileSystemResource(filePath);
+        Resource resource = MemberFileIsolation.isEnabled()
+                ? new org.springframework.core.io.ByteArrayResource(vip.mate.workspace.core.service.MemberFileAccess.read(
+                        Path.of(MemberFileIsolation.scope(vip.mate.agent.context.ChatOrigin.web(conversationId, username,
+                                null, null, null, requesterUserIdOf(auth))).workspaceBasePath()), filePath, 32 * 1024 * 1024))
+                : new FileSystemResource(filePath);
         String contentType = Files.probeContentType(filePath);
         // probeContentType 在部分平台不识别视频格式，通过扩展名 fallback
         if (contentType == null) {
@@ -1219,6 +1364,8 @@ public class ChatController {
             return ResponseEntity.status(403).build();
         }
 
+        // Office converters execute outside the isolated runtime; do not launch them in strict mode.
+        if (MemberFileIsolation.isEnabled()) return ResponseEntity.status(HttpStatus.NOT_IMPLEMENTED).build();
         // 415: the client asked to preview a format this endpoint won't convert.
         if (!officePreviewService.isConvertible(storedName)) {
             return ResponseEntity.status(HttpStatus.UNSUPPORTED_MEDIA_TYPE).build();
@@ -1228,7 +1375,16 @@ public class ChatController {
             return ResponseEntity.status(HttpStatus.NOT_IMPLEMENTED).build();
         }
 
-        Path filePath = resolveUploadedFile(conversationId, storedName);
+        if (MemberFileIsolation.isEnabled()) {
+            try {
+                MemberFileIsolation.scope(vip.mate.agent.context.ChatOrigin.web(conversationId, username,
+                        null, null, null, requesterUserIdOf(auth)));
+            } catch (SecurityException e) { return ResponseEntity.status(403).build(); }
+        }
+        Path filePath = MemberFileIsolation.isEnabled()
+                ? uploadLocationResolver.resolveExistingFile(vip.mate.agent.context.ChatOrigin.web(conversationId, username,
+                        null, null, null, requesterUserIdOf(auth)), storedName)
+                : resolveUploadedFile(conversationId, storedName);
         if (filePath == null) {
             return ResponseEntity.notFound().build();
         }
@@ -1282,11 +1438,46 @@ public class ChatController {
         return vip.mate.agent.context.ChatOrigin.web(conversationId, username, workspaceId, null, baseUrl, requesterUserId);
     }
 
-    /**
-     * Extract the authenticated user's immutable numeric id from the
-     * {@link Authentication} details (stamped by {@code JwtAuthFilter} for both
-     * the JWT and PAT paths). Null when not authenticated or details absent.
-     */
+    private vip.mate.agent.context.ChatOrigin captureWebGoal(
+            vip.mate.agent.context.ChatOrigin origin, Long agentId) {
+        var withAgent = origin.withAgent(agentId);
+        return goalApprovalRuns == null ? withAgent : goalApprovalRuns.captureSelectedGoal(withAgent);
+    }
+
+    /** Hold the selected Goal's approver identity through the approval write. */
+    private ResolveOutcome resolveWithCurrentApprover(PendingApproval pending, Authentication auth,
+                                                       String username, boolean approve) {
+        if (goalApprovalRuns != null && jsonAcceptance != null) {
+            var origin = approvalService.restoreChatOrigin(pending.getChatOrigin());
+            if (approve && (origin == null || origin.conversationId() == null
+                    || origin.requesterUserId() == null && (origin.executionAttribution() == null
+                            || origin.executionAttribution().goalId() == null))
+                    && goalApprovalRuns.hasManagedGoalHistory(pending.getConversationId(), pending.getAgentId())) {
+                throw new vip.mate.exception.MateClawException(409,
+                        "Managed Goal approval origin is unavailable; start a new request");
+            }
+            if (origin != null) origin = origin.withApprovalId(pending.getPendingId());
+            if (origin != null && goalApprovalRuns.requiresCurrentApprover(origin)) {
+                var capturedOrigin = origin;
+                Long currentUserId = requesterUserIdOf(auth);
+                return jsonAcceptance.withAuthenticatedUser(currentUserId, username, current -> {
+                    var attribution = capturedOrigin.executionAttribution();
+                    if (attribution == null || attribution.goalAttemptId() == null) {
+                        if (!java.util.Objects.equals(currentUserId, capturedOrigin.requesterUserId())) {
+                            throw new vip.mate.exception.MateClawException(403, "Approval belongs to another account");
+                        }
+                    }
+                    goalApprovalRuns.validateCapturedForApproval(capturedOrigin, current, approve);
+                    return approve ? approvalService.resolveAndConsume(pending.getPendingId(), current)
+                            : approvalService.resolve(pending.getPendingId(), current, "denied");
+                });
+            }
+        }
+        return approve ? approvalService.resolveAndConsume(pending.getPendingId(), username)
+                : approvalService.resolve(pending.getPendingId(), username, "denied");
+    }
+
+    /** Extract the immutable account id stamped in Authentication details. */
     private Long requesterUserIdOf(org.springframework.security.core.Authentication auth) {
         if (auth == null) return null;
         Object details = auth.getDetails();
@@ -1339,6 +1530,8 @@ public class ChatController {
         private String message;
         private String conversationId = "default";
         private List<MessageContentPart> contentParts;
+        /** Exact approval selected by the UI; absent for legacy FIFO clients. */
+        private String pendingApprovalId;
         /** true 表示断线重连，不发送新消息，只附着到已有的流 */
         private Boolean reconnect;
         /**
@@ -1373,19 +1566,52 @@ public class ChatController {
         private Boolean regenerate;
     }
 
-    /**
-     * 自动启动排队消息（interrupt-with-followup 或自然完成后的续跑逻辑）。
-     * 接受由 {@link ChatStreamTracker#completeAndConsumeIfLast} 预先消费的 QueuedInput 快照。
-     * 快照已脱离 RunState 生命周期，不受后续 complete/register 影响。
-     * 支持链式续跑：queued stream 自身完成时也通过 completeAndConsumeIfLast 检查并递归调用。
-     */
+    /** Claims and starts the next durable input after the current stream finishes. */
     private void startQueuedMessage(String conversationId, SseEmitter emitter, AtomicBoolean emitterDone,
-                                    ChatStreamTracker.QueuedInput preConsumedInput, String requesterId,
-                                    String baseUrl) {
+                                    String requesterId, String baseUrl) {
+        String queueClaimId = UUID.randomUUID().toString();
+        ConversationInputQueueStore.QueuedInput preConsumedInput = inputQueue
+                .claimNext(conversationId, queueClaimId, LocalDateTime.now())
+                .orElse(null);
         if (preConsumedInput == null) {
             conversationService.updateStreamStatus(conversationId, "idle");
             completeEmitterQuietly(emitter, emitterDone);
             return;
+        }
+
+        Long agentId = preConsumedInput.agentId() != null ? preConsumedInput.agentId() : 1L;
+        var queuedConversation = conversationService.findByConversationId(conversationId);
+        if (queuedConversation == null || !agentId.equals(queuedConversation.getAgentId())) {
+            inputQueue.release(preConsumedInput.id(), queueClaimId, LocalDateTime.now());
+            broadcastEvent(conversationId, "warning", Map.of(
+                    "message", "排队消息对应的助手已变化，请确认后重试"));
+            conversationService.updateStreamStatus(conversationId, "idle");
+            completeEmitterQuietly(emitter, emitterDone);
+            return;
+        }
+
+        // A row queued by an older binary has no selection snapshot. If this
+        // conversation has managed Goal history, execution could turn an old
+        // selected request into an explicitly unselected approval after a Goal
+        // ended. Keep the user's text and require a fresh authenticated turn.
+        if (preConsumedInput.selectedGoalId() == null && goalApprovalRuns != null
+                && goalApprovalRuns.hasManagedGoalHistory(conversationId, String.valueOf(agentId))) {
+            skipQueuedInput(preConsumedInput, queueClaimId, conversationId, emitter, emitterDone,
+                    requesterId, baseUrl, "managed_goal_selection_unknown",
+                    "排队消息缺少Goal选择快照，内容已保存，请重新发送");
+            return;
+        }
+        if (preConsumedInput.selectedGoalId() != null) {
+            var selectedOrigin = vip.mate.agent.context.ChatOrigin.web(conversationId,
+                    preConsumedInput.createdBy(), queuedConversation.getWorkspaceId(), null,
+                    baseUrl, preConsumedInput.requesterUserId())
+                    .withAgent(agentId).withSelectedGoalId(preConsumedInput.selectedGoalId());
+            if (goalApprovalRuns == null || !goalApprovalRuns.queuedSelectionStillCurrent(selectedOrigin)) {
+                skipQueuedInput(preConsumedInput, queueClaimId, conversationId, emitter, emitterDone,
+                        requesterId, baseUrl, "managed_goal_selection_stale",
+                        "排队消息的Goal或账户已失效，内容已保存，请重新发送");
+                return;
+            }
         }
 
         // Rate Limit 防护：如果上一轮以 rate limit 错误结束，不立即续跑排队消息（必然再次 429）。
@@ -1395,11 +1621,14 @@ public class ChatController {
                 || lastMessage.contains("429") || lastMessage.contains("速率限制"))) {
             log.warn("Skipping queued message after rate limit error: conversationId={}, lastMessage={}",
                     conversationId, lastMessage.substring(0, Math.min(50, lastMessage.length())));
-            // 持久化用户消息不丢失
-            if (preConsumedInput.message() != null && !preConsumedInput.message().isBlank()
-                    && !preConsumedInput.persisted()) {
-                conversationService.saveMessage(conversationId, "user", preConsumedInput.message());
+            if (preConsumedInput.persistedMessageId() == null) {
+                MessageEntity saved = conversationService.saveMessage(conversationId, "user",
+                        preConsumedInput.message(), preConsumedInput.contentParts(), "queued");
+                if (saved != null) {
+                    inputQueue.bindMessage(preConsumedInput.id(), queueClaimId, saved.getId(), LocalDateTime.now());
+                }
             }
+            inputQueue.consume(preConsumedInput.id(), queueClaimId, LocalDateTime.now());
             broadcastEvent(conversationId, "warning", Map.of(
                     "message", "上一轮请求触发了频率限制，排队消息已保存，请稍后重新发送"));
             broadcastEvent(conversationId, "done", Map.of("status", "rate_limited"));
@@ -1409,16 +1638,26 @@ public class ChatController {
         }
 
         String queuedMessage = preConsumedInput.message();
-        Long agentId = preConsumedInput.agentId() != null ? preConsumedInput.agentId() : 1L;
         log.info("Starting queued message: conversationId={}, agentId={}, message={}",
-                conversationId, agentId, queuedMessage.substring(0, Math.min(30, queuedMessage.length())));
+                conversationId, agentId, queuedMessage == null ? "" : queuedMessage.substring(0, Math.min(30, queuedMessage.length())));
 
         // 持久化排队的用户消息（含 contentParts；幂等：如果 /interrupt 已提前持久化则跳过）。
         // 这里持久化是为了确保 user 消息在 assistant 消息（doOnError/doOnCancel 已写入）之后落库，
         // 让 listMessages ORDER BY create_time ASC 后顺序正确：Q1 → Asst1 → Q2 → Asst2。
-        if (queuedMessage != null && !queuedMessage.isBlank() && !preConsumedInput.persisted()) {
-            conversationService.saveMessage(conversationId, "user", queuedMessage,
+        Long queuedOriginMessageId = preConsumedInput.persistedMessageId();
+        if (queuedOriginMessageId == null) {
+            MessageEntity savedUser = conversationService.saveMessage(conversationId, "user", queuedMessage,
                     preConsumedInput.contentParts(), "queued");
+            queuedOriginMessageId = savedUser == null ? null : savedUser.getId();
+            if (queuedOriginMessageId == null
+                    || !inputQueue.bindMessage(preConsumedInput.id(), queueClaimId,
+                    queuedOriginMessageId, LocalDateTime.now())) {
+                inputQueue.release(preConsumedInput.id(), queueClaimId, LocalDateTime.now());
+                throw new IllegalStateException("Queued input could not be bound to its persisted message");
+            }
+        }
+        if (!inputQueue.consume(preConsumedInput.id(), queueClaimId, LocalDateTime.now())) {
+            throw new IllegalStateException("Queued input claim was lost before execution");
         }
 
         // 广播 queued_input_started 事件
@@ -1440,11 +1679,15 @@ public class ChatController {
         streamTracker.incrementFlux(conversationId);
         // RFC-063r §2.5: queued messages land in the same conversation; carry
         // a web-origin ChatOrigin so any cron job created during the queued
-        // turn keeps a consistent (null-channel) binding.
+        // turn keeps a consistent (null-channel) binding. The account id comes
+        // from the authenticated enqueue, never from the previous stream
+        // username. Managed operations revalidate this account and scope.
         vip.mate.agent.context.ChatOrigin queuedOrigin =
-                vip.mate.agent.context.ChatOrigin.web(conversationId, requesterId, null, null)
-                        .withBaseUrl(baseUrl);
-        Disposable disposable = agentService.chatStructuredStream(agentId, queuedMessage, conversationId, requesterId, null, queuedOrigin)
+                vip.mate.agent.context.ChatOrigin.web(conversationId, preConsumedInput.createdBy(),
+                                queuedConversation.getWorkspaceId(), null, baseUrl, preConsumedInput.requesterUserId())
+                        .withOriginMessageId(queuedOriginMessageId)
+                        .withSelectedGoalId(preConsumedInput.selectedGoalId());
+        Disposable disposable = agentService.chatStructuredStream(agentId, queuedMessage, conversationId, preConsumedInput.createdBy(), null, queuedOrigin)
                 .doOnNext(delta -> {
                     if (emitterDone.get()) return;
                     try {
@@ -1504,9 +1747,9 @@ public class ChatController {
                     } finally {
                         ChatStreamTracker.CompletionResult cr = streamTracker.completeAndConsumeIfLast(conversationId);
                         if (cr.allDone()) {
-                            if (cr.queuedInput() != null) {
+                            if (shouldDrainQueuedInput(conversationId, persistStatus)) {
                                 // 链式续跑：queued stream 期间又排了新消息
-                                startQueuedMessage(conversationId, emitter, emitterDone, cr.queuedInput(), requesterId, baseUrl);
+                                startQueuedMessage(conversationId, emitter, emitterDone, requesterId, baseUrl);
                             } else {
                                 conversationService.updateStreamStatus(conversationId, "idle");
                                 sseExecutor.execute(() -> {
@@ -1538,8 +1781,8 @@ public class ChatController {
                                     accumulator.toMetadataJson());
                         } else {
                             String errorMsg = e.getMessage() != null ? e.getMessage() : "queued stream error";
-                            savedAssistant = conversationService.saveMessage(conversationId, "assistant",
-                                    "[错误] " + errorMsg, null, "failed");
+                            savedAssistant = saveAssistantWithUsage(conversationId,
+                                    "[错误] " + errorMsg, null, "failed", accumulator);
                         }
                         broadcastEvent(conversationId, "error", buildErrorPayload(
                                 conversationId,
@@ -1550,8 +1793,8 @@ public class ChatController {
                     }
                     ChatStreamTracker.CompletionResult cr = streamTracker.completeAndConsumeIfLast(conversationId);
                     if (cr.allDone()) {
-                        if (cr.queuedInput() != null) {
-                            startQueuedMessage(conversationId, emitter, emitterDone, cr.queuedInput(), requesterId, baseUrl);
+                        if (shouldDrainQueuedInput(conversationId, "failed")) {
+                            startQueuedMessage(conversationId, emitter, emitterDone, requesterId, baseUrl);
                         } else {
                             conversationService.updateStreamStatus(conversationId, "idle");
                             completeEmitterQuietly(emitter, emitterDone);
@@ -1562,6 +1805,46 @@ public class ChatController {
         streamTracker.setDisposable(conversationId, disposable);
         streamTracker.setEmergencySaveCallback(conversationId,
                 () -> emergencySaveAccumulator(conversationId, accumulator));
+    }
+
+    private void skipQueuedInput(ConversationInputQueueStore.QueuedInput input, String claimId,
+                                 String conversationId, SseEmitter emitter, AtomicBoolean emitterDone,
+                                 String requesterId, String baseUrl, String reason, String warning) {
+        if (input.persistedMessageId() == null) {
+            MessageEntity saved = conversationService.saveMessage(conversationId, "user",
+                    input.message(), input.contentParts(), "queued");
+            if (saved == null || !inputQueue.bindMessage(input.id(), claimId,
+                    saved.getId(), LocalDateTime.now())) {
+                inputQueue.release(input.id(), claimId, LocalDateTime.now());
+                throw new IllegalStateException("Skipped queued input could not be preserved");
+            }
+        }
+        if (!inputQueue.consume(input.id(), claimId, LocalDateTime.now()))
+            throw new IllegalStateException("Skipped queued input claim was lost");
+        // The preceding turn may have removed its RunState already, so a
+        // tracker broadcast can silently disappear. The held emitter is the
+        // authoritative response for this queued input.
+        try {
+            sendEvent(emitter, "warning", Map.of("message", warning));
+            sendEvent(emitter, "queued_input_skipped", Map.of(
+                    "conversationId", conversationId,
+                    "message", input.message() == null ? "" : input.message(),
+                    "reason", reason));
+        } catch (IOException disconnected) {
+            log.debug("Queued-input skip notification could not be delivered for {}: {}",
+                    conversationId, disconnected.getMessage());
+        }
+        if (hasQueuedInput(conversationId)) {
+            sseExecutor.execute(() -> startQueuedMessage(conversationId, emitter, emitterDone,
+                    requesterId, baseUrl));
+        } else {
+            conversationService.updateStreamStatus(conversationId, "idle");
+            completeEmitterQuietly(emitter, emitterDone);
+        }
+    }
+
+    private boolean hasQueuedInput(String conversationId) {
+        return inputQueue.countQueued(conversationId) > 0;
     }
 
     /**
@@ -1634,6 +1917,31 @@ public class ChatController {
         return "[本次没有输出]";
     }
 
+    private boolean shouldDrainQueuedInput(String conversationId, String persistStatus) {
+        return shouldDrainQueuedInput(
+                persistStatus,
+                hasQueuedInput(conversationId),
+                approvalService.findPendingByConversation(conversationId) != null);
+    }
+
+    private PendingApproval findRequestedPendingApproval(String conversationId, String pendingApprovalId) {
+        if (pendingApprovalId == null || pendingApprovalId.isBlank()) {
+            return approvalService.findPendingByConversation(conversationId);
+        }
+        return approvalService.getPending(pendingApprovalId)
+                .filter(pending -> conversationId.equals(pending.getConversationId()))
+                .filter(pending -> "pending".equals(pending.getStatus()))
+                .orElse(null);
+    }
+
+    static boolean shouldDrainQueuedInput(String persistStatus,
+                                          boolean hasQueuedInput,
+                                          boolean hasPendingApproval) {
+        return hasQueuedInput
+                && !hasPendingApproval
+                && !"awaiting_approval".equals(persistStatus);
+    }
+
     static boolean isAssistantPersisted(MessageEntity savedAssistant) {
         return savedAssistant != null;
     }
@@ -1667,8 +1975,13 @@ public class ChatController {
         log.warn("{} with empty accumulator: conversationId={}, status={}, finishReason={}, phase={}, hasSegments={}",
                 source, conversationId, status, accumulator.getFinishReason(),
                 accumulator.getCurrentPhase(), !accumulator.segmentsEmpty());
-        return conversationService.saveMessage(conversationId, "assistant",
-                emptyAssistantPlaceholder(status), null, status,
+        return saveAssistantWithUsage(conversationId, emptyAssistantPlaceholder(status), null, status, accumulator);
+    }
+
+    private MessageEntity saveAssistantWithUsage(String conversationId, String text,
+                                                List<MessageContentPart> parts, String status,
+                                                AgentStreamAccumulator accumulator) {
+        return conversationService.saveMessage(conversationId, "assistant", text, parts, status,
                 accumulator.getPromptTokens(),
                 accumulator.getCompletionTokens(),
                 accumulator.getCacheReadTokens(),
@@ -1707,8 +2020,15 @@ public class ChatController {
             String rawMetadata = savedAssistant.getMetadata();
             if (rawMetadata != null && !rawMetadata.isBlank()) {
                 try {
-                    Map<String, Object> parsed = objectMapper.readValue(rawMetadata,
+                    // Without the unwrap this readValue throws on the H2 profile
+                    // and the catch below swallows it, so the superseded markers
+                    // never ride the done payload and every client waits for a
+                    // reload instead — a degradation with no symptom in the log.
+                    Map<String, Object> parsed = objectMapper.readValue(
+                            MessageMetadataJson.normalize(rawMetadata),
                             new com.fasterxml.jackson.core.type.TypeReference<Map<String, Object>>() {});
+                    Object finishReason = parsed.get("finishReason");
+                    if (finishReason instanceof String reason && !reason.isBlank()) payload.put("finishReason", reason);
                     Object segs = parsed.get("segments");
                     if (segs instanceof java.util.List<?> list && !list.isEmpty()) {
                         payload.put("segments", segs);
@@ -1773,7 +2093,7 @@ public class ChatController {
         try {
             String text = accumulator.getContent();
             List<MessageContentPart> parts = accumulator.toAssistantParts();
-            if (text.isBlank() && parts.isEmpty()) {
+            if (text.isBlank() && parts.isEmpty() && !accumulator.hasUsage()) {
                 log.warn("[ChatController] Emergency save skipped (empty accumulator): conversationId={}, finishReason={}, phase={}, hasSegments={}",
                         conversationId, accumulator.getFinishReason(), accumulator.getCurrentPhase(),
                         !accumulator.segmentsEmpty());
@@ -1814,6 +2134,28 @@ public class ChatController {
         textPart.setType("text");
         textPart.setText(request.getMessage());
         return List.of(textPart);
+    }
+
+    private void validateUploadedParts(String conversationId, vip.mate.agent.context.ChatOrigin origin,
+                                       List<MessageContentPart> parts) {
+        if (parts == null) return;
+        for (MessageContentPart part : parts) {
+            if (part == null || part.getStoredName() == null || part.getStoredName().isBlank()) continue;
+            Path file = uploadLocationResolver.resolveExistingFile(origin, part.getStoredName());
+            if (file == null) {
+                throw new IllegalArgumentException("聊天附件不存在或不属于当前会话");
+            }
+            // Do not let a client-supplied filesystem path become an agent prompt.
+            if (MemberFileIsolation.isEnabled()) {
+                part.setPath(toRelativeUploadPath(uploadLocationResolver.resolveUploadRoot(origin), file));
+            } else {
+                Path root = uploadLocationResolver.resolveCandidateUploadRoots(conversationId).stream()
+                        .filter(candidate -> file.startsWith(candidate))
+                        .findFirst()
+                        .orElseThrow(() -> new IllegalArgumentException("聊天附件目录无效"));
+                part.setPath(toRelativeUploadPath(root, file));
+            }
+        }
     }
 
     private String buildPromptText(String message, List<MessageContentPart> parts) {
@@ -1923,7 +2265,9 @@ public class ChatController {
         return new AgentStreamAccumulator(objectMapper, new AgentStreamAccumulator.Sink() {
             @Override
             public void broadcast(String conversationId, String eventName, Object payload) {
-                broadcastEvent(conversationId, eventName, payload);
+                if (!streamTracker.consumeLiveToolEvent(conversationId, eventName, payload)) {
+                    broadcastEvent(conversationId, eventName, payload);
+                }
             }
 
             @Override

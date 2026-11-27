@@ -30,7 +30,6 @@
               <option value="qq">{{ t('channels.types.qq') }}</option>
               <option value="slack">{{ t('channels.types.slack') }}</option>
               <option value="webchat">{{ t('channels.types.webchat') }}</option>
-              <option value="webhook">{{ t('channels.types.webhook') }}</option>
             </select>
           </div>
           <div class="form-group full-width">
@@ -472,6 +471,7 @@ import {
   extractChannelFields,
   extractRenderConfig,
   parseConfigJson,
+  supportsChannelMessageFilter,
   type AccessControlValue,
   type RenderConfigValue,
 } from '@/utils/channelConfigJson'
@@ -633,13 +633,8 @@ const needsWebhookUrl = computed(() => {
   return true
 })
 
-// Browser-rendered channels stream structured message parts over SSE and let
-// the client decide what to draw (thinking panel, tool cards). They never go
-// through the adapter's outbound text render path, which is the only place the
-// message-filter config is read — so the controls would be inert there.
-const BROWSER_RENDERED_TYPES = ['web', 'webchat']
 const supportsMessageFilter = computed(
-  () => !BROWSER_RENDERED_TYPES.includes(form.value.channelType || ''),
+  () => supportsChannelMessageFilter(form.value.channelType),
 )
 
 const isLocalhost = computed(() => {
@@ -668,6 +663,9 @@ const feishuRequiredPermissions = computed(() => {
     { scope: 'im:message', desc: t('channels.feishu.perm.message'), reason: t('channels.feishu.perm.messageReason') },
     { scope: 'im:message.receive_v1', desc: t('channels.feishu.perm.receive'), reason: t('channels.feishu.perm.receiveReason') },
   ]
+  if (channelConfig.value?.card_streaming_enabled !== false) {
+    perms.push({ scope: 'cardkit:card:write', desc: t('channels.feishu.perm.cardkit'), reason: t('channels.feishu.perm.cardkitReason') })
+  }
   if (channelConfig.value?.connection_mode === 'websocket') {
     perms.push({ scope: 'im:resource', desc: t('channels.feishu.perm.resource'), reason: t('channels.feishu.perm.resourceReason') })
   }

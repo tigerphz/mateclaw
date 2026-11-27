@@ -1,7 +1,8 @@
 package vip.mate.agent.graph.plan;
 
-import com.alibaba.cloud.ai.graph.CompiledGraph;
-import com.alibaba.cloud.ai.graph.RunnableConfig;
+import vip.mate.workspace.core.service.MemberFileIsolation;
+import vip.mate.agent.runtime.AgentRuntime;
+import vip.mate.tool.builtin.DelegationContext;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.chat.messages.Message;
@@ -9,6 +10,7 @@ import org.springframework.ai.chat.messages.UserMessage;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 import vip.mate.agent.AgentService;
+import vip.mate.agent.StreamUsageSnapshot;
 import vip.mate.agent.AgentState;
 import vip.mate.agent.BaseAgent;
 import vip.mate.agent.delegation.DelegatedUsageAccumulator;
@@ -25,24 +27,14 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
- * 基于 StateGraph 的 Plan-Execute Agent
- * <p>
- * 使用 spring-ai-alibaba-graph-core 的 StateGraph 引擎实现：
- * <ol>
- *   <li>简单问答快速退出（PlanGenerationNode 前置判断）</li>
- *   <li>多步任务：规划 → 逐步执行（带工具调用）→ 汇总</li>
- * </ol>
- * <p>
- * content_delta 和 thinking_delta 由节点内 NodeStreamingChatHelper 直推，
- * chatStructuredStream() 只处理 phase/tool/plan/step 等结构化事件。
- * 不再从 NodeOutput 二次整段下发已流式推送的内容。
- *
- * @author MateClaw Team
+ * Plan application entry point backed by explicit planning and execution phases.
+ * Individual step tool loops use the native agent runtime. Streaming callbacks deliver
+ * content and thinking; retained RunSteps project plan, step and tool events.
  */
 @Slf4j
 public class StateGraphPlanExecuteAgent extends BaseAgent implements StructuredStreamCapable {
 
-    private final CompiledGraph compiledGraph;
+    private final AgentRuntime compiledGraph;
     private final PlanningService planningService;
     private final org.springframework.ai.chat.model.ChatModel chatModel;
     private final ConversationWindowManager conversationWindowManager;
@@ -50,7 +42,7 @@ public class StateGraphPlanExecuteAgent extends BaseAgent implements StructuredS
     private final vip.mate.agent.AgentToolSet toolSet;
 
     public StateGraphPlanExecuteAgent(ChatClient chatClient, ConversationService conversationService,
-                                      CompiledGraph compiledGraph, PlanningService planningService,
+                                      AgentRuntime compiledGraph, PlanningService planningService,
                                       org.springframework.ai.chat.model.ChatModel chatModel,
                                       ConversationWindowManager conversationWindowManager) {
         this(chatClient, conversationService, compiledGraph, planningService,
@@ -58,7 +50,7 @@ public class StateGraphPlanExecuteAgent extends BaseAgent implements StructuredS
     }
 
     public StateGraphPlanExecuteAgent(ChatClient chatClient, ConversationService conversationService,
-                                      CompiledGraph compiledGraph, PlanningService planningService,
+                                      AgentRuntime compiledGraph, PlanningService planningService,
                                       org.springframework.ai.chat.model.ChatModel chatModel,
                                       ConversationWindowManager conversationWindowManager,
                                       vip.mate.agent.AgentToolSet toolSet) {
@@ -93,10 +85,17 @@ public class StateGraphPlanExecuteAgent extends BaseAgent implements StructuredS
     @Override
     public Flux<AgentService.StreamDelta> chatWithReplayStream(String userMessage, String conversationId,
                                                                 String toolCallPayload) {
+        return chatWithReplayStream(userMessage, conversationId, toolCallPayload, "");
+    }
+
+    @Override
+    public Flux<AgentService.StreamDelta> chatWithReplayStream(String userMessage, String conversationId,
+                                                                String toolCallPayload, String requesterId) {
         setState(AgentState.RUNNING);
         try {
             log.info("[{}] Plan-Execute replay stream: conversationId={}", agentName, conversationId);
             Map<String, Object> inputs = buildInitialState(userMessage, conversationId);
+            inputs.put(MateClawStateKeys.REQUESTER_ID, requesterId != null ? requesterId : "");
 
             // 从 DB 恢复 awaiting_approval 状态的计划上下文（按 conversationId 过滤，避免并发会话误取）
             PlanningService.PlanResumeContext ctx = planningService.findAwaitingApprovalContext(conversationId);
@@ -137,8 +136,8 @@ public class StateGraphPlanExecuteAgent extends BaseAgent implements StructuredS
 
     /** 公共流执行逻辑，由 chatStructuredStream 和 chatWithReplayStream 共用 */
     private Flux<AgentService.StreamDelta> executeStream(Map<String, Object> inputs) {
-        String threadId = UUID.randomUUID().toString();
-        RunnableConfig config = RunnableConfig.builder().threadId(threadId).build();
+
+
 
         AtomicInteger sentEventCount = new AtomicInteger(0);
         AtomicInteger finalPromptTokens = new AtomicInteger(0);
@@ -152,11 +151,19 @@ public class StateGraphPlanExecuteAgent extends BaseAgent implements StructuredS
         // token usage into the turn's _usage_final and to clear the accumulator
         // on terminal so an errored turn never leaks an entry.
         final String usageConversationId = (String) inputs.get(MateClawStateKeys.CONVERSATION_ID);
-        // 去重：记录上一次已持久化的 step 结果和 thinking，防止 PlanSummaryNode 重复 emit 上一步内容
-        AtomicReference<String> lastPersistedStepResult = new AtomicReference<>("");
+        // Step results are persisted by PlanningService and the plan_step_completed
+        // event (metadata.plan.stepResults). They must never be appended to the
+        // assistant message body: FINAL_SUMMARY is the sole canonical body. Keeping
+        // the two channels separate prevents one-step plans from rendering/persisting
+        // "answeranswer" and keeps live output identical to history replay.
         AtomicReference<String> lastPersistedStepThinking = new AtomicReference<>("");
+        // 最终汇总同样需要游标：FINAL_SUMMARY / FINAL_SUMMARY_THINKING 也是 REPLACE，
+        // 一旦写入就会出现在此后每个 RunStep 上。
+        AtomicReference<String> lastPersistedSummary = new AtomicReference<>("");
+        AtomicReference<String> lastPersistedSummaryThinking = new AtomicReference<>("");
+        AtomicReference<String> lastPersistedPlanThinking = new AtomicReference<>("");
 
-        return BaseAgent.routingStartupDelta(inputs).concatWith(compiledGraph.stream(inputs, config)
+        return BaseAgent.routingStartupDelta(inputs).concatWith(compiledGraph.stream(inputs)
                 .flatMapIterable(output -> {
                     List<AgentService.StreamDelta> deltas = new ArrayList<>();
                     // 1. 提取事件（只发送新增部分）
@@ -176,17 +183,22 @@ public class StateGraphPlanExecuteAgent extends BaseAgent implements StructuredS
                     boolean thinkingAlreadyStreamed = output.state()
                             .value(MateClawStateKeys.THINKING_STREAMED, false);
 
-                    // 2a. 各步骤执行结果（StepExecutionNode 已通过 NodeStreamingChatHelper 直推 SSE，
-                    //     这里仅作为 persistOnly 送入 Accumulator，确保写入 mate_message）
-                    //     利用内容本身去重，避免 PlanSummaryNode 输出时重复 emit 上一步残留在 state 的值
-                    output.state().<String>value(PlanStateKeys.CURRENT_STEP_RESULT)
+                    // 2·0 规划阶段的推理。它先于计划本身发出，且是整轮唯一必然发生的
+                    //     一段推理 —— 步骤被派发到别处执行时，step / summary 两段
+                    //     根本不会产生，此前这一轮就一段思考都不落库。
+                    output.state().<String>value(PlanStateKeys.PLAN_THINKING)
                             .filter(s -> !s.isEmpty())
-                            .filter(s -> !s.equals(lastPersistedStepResult.get()))
-                            .ifPresent(stepContent -> {
-                                deltas.add(AgentService.StreamDelta.persistOnly(stepContent, null));
-                                lastPersistedStepResult.set(stepContent);
+                            .filter(s -> !s.equals(lastPersistedPlanThinking.get()))
+                            .ifPresent(planThinking -> {
+                                lastPersistedPlanThinking.set(planThinking);
+                                deltas.add(AgentService.StreamDelta.persistOnly(null, planThinking));
                             });
 
+                    // 2a. Step reasoning may remain in the diagnostic timeline, but
+                    //     CURRENT_STEP_RESULT deliberately does not become a content
+                    //     delta. The result is already durable in the plan record and
+                    //     plan_step_completed metadata; only FINAL_SUMMARY belongs in
+                    //     mate_message.content.
                     output.state().<String>value(PlanStateKeys.CURRENT_STEP_THINKING)
                             .filter(s -> !s.isEmpty())
                             .filter(s -> !s.equals(lastPersistedStepThinking.get()))
@@ -195,18 +207,31 @@ public class StateGraphPlanExecuteAgent extends BaseAgent implements StructuredS
                                 lastPersistedStepThinking.set(stepThinking);
                             });
 
-                    // 2b. 最终汇总
-                    output.state().<String>value(PlanStateKeys.FINAL_SUMMARY)
-                            .filter(s -> !s.isEmpty())
-                            .ifPresent(summary -> deltas.add(contentAlreadyStreamed
-                                    ? AgentService.StreamDelta.persistOnly(summary, null)
-                                    : new AgentService.StreamDelta(summary, null)));
-
+                    // 2b. 最终汇总（同样 thinking 先于 content）
+                    //     两个 key 都是 REPLACE：值会滞留在后续每个 RunStep 里。
+                    //     没有游标时每批都会重发一次 —— 汇总正文被反复追加进
+                    //     mate_message.content，而 thinking 会在正文之后再落一段，
+                    //     于是气泡末尾挂出一个孤立的思考框。与 2a 的 step 级
+                    //     去重保持同一套写法。
                     output.state().<String>value(PlanStateKeys.FINAL_SUMMARY_THINKING)
                             .filter(s -> !s.isEmpty())
-                            .ifPresent(thinking -> deltas.add(thinkingAlreadyStreamed
-                                    ? AgentService.StreamDelta.persistOnly(null, thinking)
-                                    : new AgentService.StreamDelta(null, thinking)));
+                            .filter(s -> !s.equals(lastPersistedSummaryThinking.get()))
+                            .ifPresent(thinking -> {
+                                lastPersistedSummaryThinking.set(thinking);
+                                deltas.add(thinkingAlreadyStreamed
+                                        ? AgentService.StreamDelta.persistOnly(null, thinking)
+                                        : new AgentService.StreamDelta(null, thinking));
+                            });
+
+                    output.state().<String>value(PlanStateKeys.FINAL_SUMMARY)
+                            .filter(s -> !s.isEmpty())
+                            .filter(s -> !s.equals(lastPersistedSummary.get()))
+                            .ifPresent(summary -> {
+                                lastPersistedSummary.set(summary);
+                                deltas.add(contentAlreadyStreamed
+                                        ? AgentService.StreamDelta.persistOnly(summary, null)
+                                        : new AgentService.StreamDelta(summary, null));
+                            });
 
                     // 3. 更新最新累计 token usage
                     finalPromptTokens.set(output.state().value(MateClawStateKeys.PROMPT_TOKENS, 0));
@@ -216,6 +241,7 @@ public class StateGraphPlanExecuteAgent extends BaseAgent implements StructuredS
                     finalReasoningTokens.set(output.state().value(MateClawStateKeys.REASONING_TOKENS, 0));
                     finalModelName.set(output.state().value(MateClawStateKeys.RUNTIME_MODEL_NAME, ""));
                     finalProviderId.set(output.state().value(MateClawStateKeys.RUNTIME_PROVIDER_ID, ""));
+                    deltas.add(0, StreamUsageSnapshot.from(output.state()));
 
                     return deltas;
                 })
@@ -284,6 +310,9 @@ public class StateGraphPlanExecuteAgent extends BaseAgent implements StructuredS
     }
 
     private Map<String, Object> buildInitialState(String userMessage, String conversationId) {
+        var incoming = vip.mate.agent.context.ChatOriginHolder.get().withConversationId(conversationId);
+        var memberOrigin = MemberFileIsolation.scope(incoming.withWorkspace(incoming.workspaceId(), this.workspaceBasePath));
+        String workspaceBasePath = memberOrigin.workspaceBasePath();
         // 加载会话历史（复用 BaseAgent.buildConversationHistory，与 ReAct 对齐）
         List<Message> historyMessages = buildConversationHistory(conversationId, userMessage);
 
@@ -353,7 +382,12 @@ public class StateGraphPlanExecuteAgent extends BaseAgent implements StructuredS
         }
         origin = origin.withConversationId(conversationId)
                 .withWorkspace(origin.workspaceId(), workspaceBasePath);
+        origin = MemberFileIsolation.scope(origin);
+        inputs.put(MateClawStateKeys.WORKSPACE_BASE_PATH, origin.workspaceBasePath() != null ? origin.workspaceBasePath() : "");
         inputs.put(MateClawStateKeys.CHAT_ORIGIN, origin);
+        String thinkingLevel = vip.mate.llm.chatmodel.ThinkingLevelHolder.get();
+        if (thinkingLevel != null) inputs.put(MateClawStateKeys.REQUESTED_THINKING_LEVEL, thinkingLevel);
+        inputs.put(MateClawStateKeys.SUBAGENT_RUN_CONTEXT, DelegationContext.current());
 
         // RFC 48 — inject active goal snapshot for GoalEvaluationNode.
         // Mirrors StateGraphReActAgent.buildInitialState exactly.
@@ -361,8 +395,15 @@ public class StateGraphPlanExecuteAgent extends BaseAgent implements StructuredS
             try {
                 vip.mate.goal.model.GoalEntity active =
                         goalService.findActiveByConversation(conversationId);
+                var currentGoal = active != null ? active : goalService.findLatestByConversation(conversationId);
+                inputs.put(MateClawStateKeys.SYSTEM_PROMPT, inputs.get(MateClawStateKeys.SYSTEM_PROMPT)
+                        + vip.mate.goal.service.GoalLifecycleHints.render(currentGoal));
                 if (active != null) {
                     inputs.put(MateClawStateKeys.ACTIVE_GOAL, active);
+                    if (active.isJsonAcceptanceRequired()) {
+                        inputs.put(MateClawStateKeys.SYSTEM_PROMPT, inputs.get(MateClawStateKeys.SYSTEM_PROMPT) + "\n\n"
+                                + vip.mate.goal.service.GoalJsonProtocolHints.INSTRUCTIONS);
+                    }
                 }
             } catch (Exception e) {
                 log.warn("[{}] findActiveByConversation failed: {}", agentName, e.getMessage());

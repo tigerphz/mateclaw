@@ -1,7 +1,7 @@
 package vip.mate.agent.graph.node;
 
-import com.alibaba.cloud.ai.graph.OverAllState;
-import com.alibaba.cloud.ai.graph.action.NodeAction;
+import vip.mate.agent.runtime.state.RunState;
+import vip.mate.agent.runtime.state.NodeAction;
 import lombok.extern.slf4j.Slf4j;
 import vip.mate.agent.GraphEventPublisher;
 import vip.mate.agent.graph.state.DirectToolOutput;
@@ -62,7 +62,7 @@ public class FinalAnswerNode implements NodeAction {
     }
 
     @Override
-    public Map<String, Object> apply(OverAllState state) throws Exception {
+    public Map<String, Object> apply(RunState state) throws Exception {
         MateClawStateAccessor accessor = new MateClawStateAccessor(state);
 
         String finalAnswer;
@@ -139,7 +139,12 @@ public class FinalAnswerNode implements NodeAction {
         } else if (!existingAnswer.isEmpty()) {
             // 来自 reasoning 直接回答（或 stopped partial）
             finalAnswer = existingAnswer;
-            finalThinking = !currentThinking.isEmpty() ? currentThinking : existingThinking;
+            // FINAL_THINKING wins here: every writer of FINAL_ANSWER on this path
+            // sets it in the same node output, so it is the reasoning that produced
+            // this very answer. CURRENT_THINKING is REPLACE and was last written by
+            // a tool-calling iteration, so preferring it swapped in an earlier
+            // round's reasoning on any turn that used tools.
+            finalThinking = !existingThinking.isEmpty() ? existingThinking : currentThinking;
             // 尊重上游已设的 finishReason（如 STOPPED），只有未设时才默认 NORMAL
             finishReason = !existingReason.isEmpty() ? parseFinishReason(existingReason) : FinishReason.NORMAL;
             log.info("[FinalAnswerNode] Using existing finalAnswer ({} chars), reason={}",

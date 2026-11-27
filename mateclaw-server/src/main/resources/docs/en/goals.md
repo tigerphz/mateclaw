@@ -9,6 +9,92 @@ head:
 
 # Persistent Goals
 
+## 2.3.0: managed JSON acceptance
+
+Expand JSON acceptance in the chat Goal panel. An authorized user supplies a requirement key, artifact slot, and required fields (one per line). Active and paused Goals are configurable; terminal Goals are read-only. Requirements belong to the user: model tools cannot change them on the user's behalf.
+
+1. Select a slot such as `report` and top-level fields such as `summary` and `items`. Requirement keys and slots start with a lowercase letter and contain only lowercase letters, digits, underscores, or hyphens, up to 64 characters.
+2. The employee calls `getManagedGoalJsonSlots`, then `publishManagedGoalJson` to publish a strict JSON object to a selected slot. The content is stored as a managed version; a workspace file path cannot substitute for publication.
+3. Call `checkManagedGoalJson` with the current requirement revision, artifact ID, and slot generation. The server derives the result from stored bytes rather than accepting a model-declared PASS.
+4. Every current requirement needs a matching valid binding, alongside the Goal's existing completion conditions. Changing a requirement or publishing a new generation requires new checks; refresh after a version conflict.
+
+**Scope and limits:** the current recipe checks only that 1–16 distinct top-level fields exist and are not null; names are 1–128 characters. It is not full JSON Schema, field-type, or business-correctness validation. Each version is limited to 1 MiB UTF-8, each Goal to 32 versions, and versions expire after 24 hours. Expired versions cannot provide a valid completion binding. At the version limit, inspect and reuse a still-valid current version rather than repeatedly publishing.
+
+### Observation versus acceptance binding
+
+Execution evidence defaults to `mateclaw.execution-evidence.mode=observe`, recording attempts and artifacts. `off` disables recording; `enforce` is currently rejected. Ordinary artifact version checks and required-field diagnostics run on demand and return `acceptanceEligible=false`; they cannot replace managed JSON bindings. The ordinary checklist still requires every criterion to pass with nonblank evidence.
+
+Inputs accepted during approval or busy execution retain the selected Goal and requester identity. Recovery rechecks Goal state, account access, and runtime ownership. Queued input cannot automatically revive a terminal Goal.
+
+
+## Continuous execution (v1)
+
+New goals default to `persistentExecution=true`; omitted `turnBudget` and `llmCallBudget` become `0` (no cumulative limit). Explicit positive budgets still apply. Existing goals retain legacy mode and do not start automatically after an upgrade.
+
+A durable queue and background supervisor schedule persistent goals across bounded graph segments. A graph limit ends a segment, not the goal. Queued work, cooldowns, retries and expired leases survive server restarts. Completion requires all persisted criteria to pass with nonblank evidence. Stop, essential missing input, approval denial and budget exhaustion pause execution until an explicit resume.
+
+`GET /api/v1/goals/{id}/execution` exposes the latest scheduling state, reason and due time; the goal API remains authoritative for current goal status. Streams broadcast scheduling changes through `goal_continuation`. V1 supports a single backend instance and the native runtime. External tool effects are not guaranteed exactly once; recovery must check existing artifacts and async handles. Budgets are checked at segment boundaries, not as per-request spending caps.
+
+## The durable execution contract
+
+Persistent execution separates a long goal from any one HTTP request or graph run. The database holds the work that must survive process loss:
+
+| Durable state | Why it matters after a restart |
+|---|---|
+| Goal and criteria | The completion bar remains unchanged |
+| Continuation row | The supervisor knows whether work is queued, cooling down, retrying, paused, or blocked |
+| Attempt and lease | An interrupted segment can be classified before another segment is claimed |
+| Accepted-input queue | A message sent while the worker is busy is consumed later instead of being dropped |
+| Progress ledger and artifacts | The next segment can inspect completed work and continue from evidence |
+
+One segment claims the goal, consumes at most one queued input, executes a bounded graph run, saves its result, and then either reaches a terminal condition or schedules the next segment. A backend restart releases orphaned input claims and reconciles expired attempts before ordinary dispatch resumes.
+
+Recovery is deliberately conservative. A safe retry may run again; an already-saved assistant message is reconciled; completed tool evidence is inspected; and a tool that may have produced an uncertain external side effect blocks for review. This avoids silently converting “the process restarted” into “repeat a payment, publication, or deletion.”
+
+### Inputs accepted while work is running
+
+When an active persistent goal is already executing, new user input is stored in `mate_conversation_input_queue` before it is handed to a later attempt. Each item moves through queued, claimed, and consumed states. If the process stops after claiming but before consuming it, startup recovery releases the orphaned claim so the same input remains available.
+
+The queue preserves accepted input; it does not make contradictory instructions safe. A user can still pause or abandon the goal, and an instruction that changes the acceptance criteria should update the goal explicitly rather than relying on an ambiguous follow-up sentence.
+
+## Designing work that can run for hours
+
+The runtime can preserve scheduling state, but the task still needs recoverable checkpoints. For long-form writing, code generation, research collections, or data exports:
+
+1. Create concrete criteria before doing bulk work. Counts, file paths, required sections, tests, and final validation are stronger than “produce a good result.”
+2. Store a small plan and progress ledger in the workspace. Record the last completed unit, cumulative count, unresolved items, and the exact next action.
+3. Write in bounded units. For prose, a chapter or 2,000–4,000 Chinese characters per mutation is easier to retry and inspect than an entire volume in one tool call.
+4. Re-read the checkpoint and the target file tail after recovery. Continue from evidence rather than from the model's recollection of the interrupted turn.
+5. Prefer retry-safe mutations. `append_file` treats an exact block already present at the file tail as success with `alreadyApplied=true`; `expectedTail` can reject an append when another write changed the file since it was read.
+6. Pace provider traffic. Set a minimum continuation interval and a provider-wide backoff that match the model's quota. A retry storm is not progress.
+7. Verify before completion. Recount content, enumerate units, read the ending, rerun tests, and require nonblank evidence for every criterion before calling `completeGoal`.
+
+### Example: a 500,000-character novel soak test
+
+A useful soak test asks the General Assistant to create a persistent goal for a ten-volume, roughly 180-chapter novel, save a story bible, outline, and progress ledger, then append one chapter at a time until the body contains at least 500,000 Chinese characters. Each recovery pass must inspect existing headings and the file tail before writing the next chapter.
+
+In the 2026-08-30 single-instance validation, the backend was stopped during chapter generation. Twelve chapters and 15,342 Chinese characters were present at the recovery checkpoint. After restart, the supervisor reloaded the original goal and conversation context, read the outline, progress ledger, and volume tail, then continued at chapter 13. The observation window reached chapter 17 and 24,628 Chinese characters with zero duplicate chapter headings. Provider rate limits and a transient connection failure entered backoff and later continued. These figures describe that test run; they are not throughput guarantees.
+
+For a repeatable check, record values before restart and compare them after recovery:
+
+```bash
+FILE=data/workspace/novel-ash-sea/volumes/volume-01.md
+rg -c '^## 第.*章' "$FILE"
+python3 - <<'PY'
+import re
+from pathlib import Path
+text = Path("data/workspace/novel-ash-sea/volumes/volume-01.md").read_text(encoding="utf-8")
+print(len(re.findall(r"[\u4e00-\u9fff]", text)))
+PY
+rg '^## 第.*章' "$FILE" | sort | uniq -d
+```
+
+The last command must produce no output. Also check `GET /actuator/health`, `GET /api/v1/goals/{id}/execution`, the continuation logs, the progress ledger, and the newest artifact timestamp. Recovery has passed only when the worker writes a new unit after restart without losing queued input or duplicating the previous unit.
+
+::: warning Current boundary
+Persistent Goal v1 is designed and tested for one backend instance using the native runtime. Database-backed state survives a restart of that instance, but arbitrary external side effects are not exactly once. Use provider idempotency keys, read-before-write reconciliation, or human review for payments, sends, publishes, and destructive actions.
+:::
+
 > **You used to repeat the context every turn. Now you set a goal once, the worker follows.**
 
 You say "deploy this blog to fly.io" in one turn, the worker answers, and stops. Next turn you have to remember to ask "is DNS set? cert signed? tests run?" — you're keeping the goal in your head, not the worker.
@@ -109,6 +195,8 @@ After every turn, a backend evaluator node runs:
 
 ### Auto-followup
 
+Persistent mode schedules a fresh graph segment through the durable supervisor. The graph-local injection below applies only to legacy goals (`persistentExecution=false`).
+
 When `autoFollowupEnabled=true` and this turn's evaluator decision is "continue", the backend:
 
 1. Writes a `followup_injected` event to the timeline
@@ -169,6 +257,10 @@ Both modes use **structured output** — the evaluator returns a typed object (c
 
 **Completion is deterministic.** Only when **every criterion passes** is the goal done. 19 of 20 passed (a 0.95 score) is still "continue" — miss one and one is missing, no fuzzy threshold.
 
+::: warning Verify deliverable evidence for long tasks
+An async child task's `status=succeeded` and `progress=100` are lifecycle terminal signals, not evidence that a criterion passed. For files, long-form writing, test cases, and similar deliverables, make criteria reproducible: for example, “the target file exists and can be read back,” “body text contains at least N characters,” or “at least N independent scenarios can be enumerated.” If a write or execution tool failed, only an outline was produced, or work remains pending, keep that criterion unpassed.
+:::
+
 **Three ways to add a checklist:**
 
 - **At creation** — pass `criteria: ["DNS resolves", "SSL valid", "tests green"]` to the `setGoal` tool, or `criteria` to `POST /api/v1/goals`. Skips the bootstrap round.
@@ -198,9 +290,9 @@ The evaluation logic implements Spring AI's `Evaluator` interface: it does goal-
 
 ---
 
-## Four built-in tools (worker-callable)
+## Built-in goal tools (worker-callable)
 
-These four ship as agent-wide system tools — no binding setup needed:
+These tools ship as agent-wide system tools — no binding setup needed:
 
 | Tool | Purpose | Prompt example |
 |---|---|---|
@@ -208,6 +300,7 @@ These four ship as agent-wide system tools — no binding setup needed:
 | **addGoalCriterion** | Append a sub-criterion to the active goal | "Add: must support IPv6" |
 | **completeGoal** | Explicitly mark done | "All items done — call completeGoal" |
 | **getGoalStatus** | Inspect current state | "How are we doing?" |
+| **waitForGoalInput** | Pause a persistent goal for essential missing input | "Wait for the user to supply the deployment domain" |
 
 On completion (`completeGoal`, or the evaluator judging **every criterion passed**), the worker forwards a summary to its [long-term memory](./memory) so future conversations can recall it.
 
@@ -215,7 +308,7 @@ On completion (`completeGoal`, or the evaluator judging **every criterion passed
 
 ## Sub-agents cannot mutate the parent's goal
 
-In [multi-agent collaboration](./agents) a parent worker can delegate to a child worker. Children **don't see** the four goal tools — the goal is the parent conversation's state, the child is a stateless executor.
+In [multi-agent collaboration](./agents) a parent worker can delegate to a child worker. Children **don't see** the goal tools — the goal is the parent conversation's state, the child is a stateless executor.
 
 > This is intentional. Children do work for the parent, but the goal stays owned by the parent.
 
@@ -227,7 +320,7 @@ In [multi-agent collaboration](./agents) a parent worker can delegate to a child
 turnsUsed >= turnBudget  OR  (agentLlmCallsUsed + evalLlmCallsUsed) >= llmCallBudget
 ```
 
-Either one hit → goal status flips to **exhausted**, no more evaluations, no more follow-ups, ring turns red-orange. The last turn's assistant reply still goes through.
+Persistent mode checks positive budgets only; `0` means unlimited. Reaching a budget pauses the goal with scheduling state **budget_limited**; increase the budget and resume. Legacy goals still enter terminal **exhausted** and require a new goal to continue. The current segment's reply is still saved.
 
 Your options:
 
@@ -247,7 +340,8 @@ Your options:
 
  active ──all criteria passed / completeGoal──→ completed (terminal)
    ↓
- active ──turns_used / llm_calls exhausted ────→ exhausted (terminal)
+ active ──positive budget reached (persistent) → paused
+ active ──budget reached (legacy) ────────────→ exhausted (terminal)
    ↓
  active ──user abandon ────────────────────────→ abandoned (terminal)
 ```
@@ -300,9 +394,18 @@ mateclaw:
     default-auto-followup: true
     # Runtime master switch; when off, no goal injects a followup regardless of its per-goal flag.
     allow-auto-followup: true
-    # Default turn budget when the user doesn't override.
+    # Persistent goal segments that may execute concurrently in one backend instance.
+    max-concurrent-segments: 4
+    # Global minimum delay in seconds before an ordinary segment continues.
+    minimum-continuation-interval-seconds: 1
+    # Pause new claims after a retryable provider/evaluator failure (seconds; 0 disables it).
+    provider-failure-global-backoff-seconds: 30
+    # New goals run persistently; omitted budgets mean unlimited (0).
+    default-persistent-execution: true
+    supervisor-poll-ms: 5000
+    # Legacy default turn budget.
     default-turn-budget: 20
-    # Default combined (agent + evaluator) LLM call budget.
+    # Legacy combined (agent + evaluator) LLM call budget.
     default-llm-call-budget: 200
     # Minimum seconds between two consecutive auto-followups.
     auto-followup-cooldown-seconds: 0
@@ -319,6 +422,13 @@ mateclaw:
     evaluator-context-messages: 8
 ```
 
+The effective continuation delay is the larger of
+`minimum-continuation-interval-seconds` and the goal's `followupCooldownSeconds`.
+The provider-wide backoff is instance-local; restart recovery continues to use the durable
+continuation `next_run_at` and per-goal failure count. For soak tests or constrained model
+capacity, start with concurrency `1`, a `300` second minimum interval, and a `300` second
+provider backoff, then increase load only after reviewing logs.
+
 ---
 
 ## Database
@@ -330,7 +440,7 @@ Two tables, all `mate_`-prefixed:
 | `mate_agent_goal` | Goal itself; status / budgets / dual LLM counters / auto-followup config |
 | `mate_agent_goal_event` | Append-only event log; powers the timeline view |
 
-Flyway migration `V120__agent_goal.sql` (H2 / MySQL / KingbaseES dialects).
+`mate_goal_continuation` stores durable scheduling, due times and leases. Flyway migrations `V120__agent_goal.sql` and `V188__goal_continuation.sql` (H2 / MySQL / KingbaseES dialects).
 
 ---
 
@@ -339,3 +449,7 @@ Flyway migration `V120__agent_goal.sql` (H2 / MySQL / KingbaseES dialects).
 **A goal isn't a new feature on the worker. It's a state change.**
 
 Before, the worker forgot the moment it answered. Goals make a worker remember one thing across many turns — what it's working on, what's still missing, when it counts as done. You say it once. The ring next to the avatar tracks the rest.
+
+## 3.0.0: continuation decisions and side-effect recovery
+
+Continuation suggestions use bounded structured decisions and domain constraints, with SHADOW as default. Fenced checkpoints are saved before tool execution; uncertain outcomes after side effects require intervention rather than blind replay. See [decision layer](./decision-layer) and [changelog](./changelog).

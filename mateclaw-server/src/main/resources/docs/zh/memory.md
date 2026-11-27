@@ -9,6 +9,10 @@ head:
 
 # AI 记忆系统
 
+## 3.1.0：精确编辑与切换隔离
+
+手工编辑记忆章节时，服务端按完整章节标题匹配，保留相邻章节及原有换行；同名标题存在歧义时会返回冲突，避免覆盖错误章节。保存或删除期间即使切换员工、文件或会话，异步结果仍绑定到原操作对象，不会覆盖新选中的内容。
+
 **记忆是系统越用越懂你的机制。**
 
 MateClaw 里其他所有东西，在你配置完之后就静止了。Agent、工具、知识库——你改它们的时候才改。记忆是**唯一一个**会自己改变的部分，变化是实际使用过程的副产品。这就是整个设计的核心意图。
@@ -232,12 +236,12 @@ mate:
 - 消息数达到下限（默认 4 条）
 - 最后一条用户消息够长（默认至少 10 字符）
 
-全部通过，开始提取。
+“记住这个”一类显式记忆请求会绕过消息数、消息长度和冷却门控。分析失败或被规则跳过时不会启动冷却，后续符合条件的请求可以立即重试。
 
 ### 并发控制
 
-- **冷却**——同一个 Agent 在默认 5 分钟内不会重复提取
-- **按 Agent 加锁**——同一个 Agent 已经有一个提取任务在跑，新任务直接跳过
+- **冷却**——同一个 Agent/owner 记忆桶在默认 5 分钟内不会重复提取
+- **按 Agent/owner 加锁**——同一个记忆桶已有提取任务在跑时，新任务直接跳过
 
 ### LLM 实际在做什么
 
@@ -580,7 +584,7 @@ Mem0 集成是**可选的社区贡献项**，不在 MateClaw 的默认安装里�
 | `syncTurn(agentId, conversationId, userMessage, assistantReply, ownerKey)` | 当 `syncEnabled=true` 且 `ownerKey` 非空时，**异步**把这一轮的 user/assistant 消息以 `user_id = ownerKey` 推到 `POST {baseUrl}/memories/` —— 与召回查询用同一个标识。失败只记日志、不阻塞响应 |
 | `getToolBeans` | 空列表——v1 不暴露 Agent 可调用的工具 |
 
-**故障隔离**：recall 或 sync 任何一边抛异常，插件自己吞掉、写日志，平台继续走其他 provider。Mem0 挂了不会影响 MateClaw 的本地记忆。
+**故障隔离**：sync 异常由插件内部记录；recall 异常会上抛到平台的 provider 边界，由平台隔离并计入熔断器。每个 provider 有独立超时，整条召回链还有总时延预算；连续失败的 provider 会暂时跳过。因此 Mem0 挂了不会阻塞 MateClaw 的本地记忆。
 
 ### per-owner 隔离的映射
 
@@ -610,8 +614,11 @@ Mem0 用 `user_id` + `agent_id` 做隔离。MateClaw 的映射：
 | `syncEnabled` | boolean | 否 | `true` | 是否在 syncTurn 时把每轮对话推到 `/memories/` |
 | `maxResults` | integer | 否 | `5` | 每次召回返回的记忆条数上限 |
 | `timeoutMs` | integer | 否 | `3000` | HTTP 超时（毫秒），recall 和 sync 共用 |
+| `syncQueueCapacity` | integer | 否 | `256` | 异步同步队列最大待处理轮次；队列满时丢弃新写入并记录警告 |
 
 配置只在插件加载时读一次——改了要重载插件才会生效。
+
+平台层召回保护位于 `mate.memory`：`provider-prefetch-timeout-ms`（默认 `1500`）、`provider-prefetch-total-budget-ms`（默认 `2500`）、`provider-circuit-failure-threshold`（默认 `3`）、`provider-circuit-cooldown-seconds`（默认 `30`）。只有明确需要无限等待时，才把单项超时或总预算设为 `0`。
 
 ### 已知限制（v1）
 

@@ -1,6 +1,6 @@
 package vip.mate.agent.graph.node;
 
-import com.alibaba.cloud.ai.graph.OverAllState;
+import vip.mate.agent.runtime.state.RunState;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.ai.chat.messages.ToolResponseMessage;
@@ -31,7 +31,7 @@ class ObservationNodeRefundTest {
         return new ToolResponseMessage.ToolResponse("id-" + name, name, "ok");
     }
 
-    private OverAllState state(int iteration, int refundCount, List<ToolResponseMessage.ToolResponse> results) {
+    private RunState state(int iteration, int refundCount, List<ToolResponseMessage.ToolResponse> results) {
         Map<String, Object> m = new HashMap<>();
         m.put(CURRENT_ITERATION, iteration);
         m.put(MAX_ITERATIONS, 25);
@@ -39,7 +39,7 @@ class ObservationNodeRefundTest {
         m.put(OBSERVATION_HISTORY, new ArrayList<String>());
         m.put(TOOL_RESULTS, results);
         m.put(TOOL_CALL_COUNT, 0);
-        return new OverAllState(m);
+        return new RunState(m);
     }
 
     @Test
@@ -73,6 +73,20 @@ class ObservationNodeRefundTest {
                 state(3, 0, List.of(result("load_skill"), result("web_search"))));
         assertEquals(4, out.get(CURRENT_ITERATION));
         assertNull(out.get(ITERATION_REFUND_COUNT));
+    }
+
+    @Test
+    @DisplayName("退还迭代的轮次仍然递增观察计数（内容分类只能读观察计数，不能读迭代预算）")
+    void refundedRound_stillAdvancesObservationCount() throws Exception {
+        // The invariant StateGraphReActAgent.streamedContentDelta relies on: a
+        // refunded round did real observation work even though it was not
+        // charged an iteration. Classifying content by CURRENT_ITERATION here
+        // tagged the NEXT round's grounded narration as pre-tool rehearsal, and
+        // renderers collapsed it. TOOL_CALL_COUNT is never refunded or reset.
+        Map<String, Object> out = node().apply(state(0, 0, List.of(result("load_skill"))));
+
+        assertEquals(0, out.get(CURRENT_ITERATION), "iteration budget stays put — the round was refunded");
+        assertEquals(1, out.get(TOOL_CALL_COUNT), "the observation still happened and must be counted");
     }
 
     @Test

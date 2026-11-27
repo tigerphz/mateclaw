@@ -16,6 +16,7 @@ import vip.mate.team.repository.AgentTeamMapper;
 import vip.mate.team.repository.AgentTeamMemberMapper;
 
 import java.util.List;
+import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.*;
@@ -50,7 +51,7 @@ class TeamServiceTest {
         memberMapper = mock(AgentTeamMemberMapper.class);
         agentMapper = mock(AgentMapper.class);
         service = new TeamService(teamMapper, memberMapper, agentMapper,
-                mock(ApplicationEventPublisher.class));
+                mock(ApplicationEventPublisher.class), mock(TeamRosterLifecycleService.class));
     }
 
     private AgentEntity agent(Long id, String agentType) {
@@ -58,6 +59,7 @@ class TeamServiceTest {
         a.setId(id);
         a.setName("agent-" + id);
         a.setAgentType(agentType);
+        a.setWorkspaceId(1L);
         return a;
     }
 
@@ -69,7 +71,119 @@ class TeamServiceTest {
         when(memberMapper.selectCount(any())).thenReturn(0L);
 
         assertDoesNotThrow(() ->
-                service.createTeam("组", null, LEAD_ID, List.of(MEMBER_ID), "admin"));
-        verify(teamMapper).insert(any(AgentTeamEntity.class));
+                service.createTeam(1L, "组", null, LEAD_ID, List.of(MEMBER_ID), "admin"));
+        org.mockito.ArgumentCaptor<AgentTeamEntity> captor =
+                org.mockito.ArgumentCaptor.forClass(AgentTeamEntity.class);
+        verify(teamMapper).insert(captor.capture());
+        assertEquals(1L, captor.getValue().getWorkspaceId());
+    }
+
+    @Test
+    void rejectsMemberFromAnotherWorkspace() {
+        AgentEntity lead = agent(LEAD_ID, "react");
+        AgentEntity member = agent(MEMBER_ID, "react");
+        member.setWorkspaceId(2L);
+        when(agentMapper.selectById(LEAD_ID)).thenReturn(lead);
+        when(agentMapper.selectById(MEMBER_ID)).thenReturn(member);
+
+        IllegalArgumentException error = assertThrows(IllegalArgumentException.class,
+                () -> service.createTeam(1L, "组", null, LEAD_ID, List.of(MEMBER_ID), "admin"));
+
+        assertEquals("member agent does not belong to the current workspace: 2", error.getMessage());
+        verify(teamMapper, never()).insert(any(AgentTeamEntity.class));
+    }
+
+    @Test
+    void listTeamsAlwaysScopesByWorkspace() {
+        when(teamMapper.selectList(any())).thenReturn(List.of());
+
+        service.listTeams(7L);
+
+        @SuppressWarnings("rawtypes")
+        org.mockito.ArgumentCaptor<com.baomidou.mybatisplus.core.conditions.Wrapper> captor =
+                org.mockito.ArgumentCaptor.forClass(com.baomidou.mybatisplus.core.conditions.Wrapper.class);
+        verify(teamMapper).selectList(captor.capture());
+        com.baomidou.mybatisplus.core.conditions.Wrapper<?> wrapper = captor.getValue();
+        assertTrue(wrapper.getSqlSegment().toLowerCase().contains("workspace"), wrapper.getSqlSegment());
+        @SuppressWarnings("unchecked")
+        com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper<AgentTeamEntity> lambda =
+                (com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper<AgentTeamEntity>) wrapper;
+        assertTrue(lambda.getParamNameValuePairs().containsValue(7L));
+    }
+
+    @Test
+    void agentCannotResolveTeamOwnedByAnotherWorkspace() {
+        AgentEntity agent = agent(LEAD_ID, "react");
+        AgentTeamMemberEntity membership = new AgentTeamMemberEntity();
+        membership.setTeamId(10L);
+        AgentTeamEntity foreignTeam = new AgentTeamEntity();
+        foreignTeam.setId(10L);
+        foreignTeam.setWorkspaceId(2L);
+        foreignTeam.setStatus(TeamService.STATUS_ACTIVE);
+        when(agentMapper.selectById(LEAD_ID)).thenReturn(agent);
+        when(memberMapper.selectOne(any())).thenReturn(membership);
+        when(teamMapper.selectById(10L)).thenReturn(foreignTeam);
+
+        Optional<AgentTeamEntity> result = service.getTeamForAgent(LEAD_ID);
+
+        assertTrue(result.isEmpty());
+    }
+
+    @Test
+    void addMemberRejectsAgentFromAnotherWorkspace() {
+        AgentTeamEntity team = new AgentTeamEntity();
+        team.setId(10L);
+        team.setLeadAgentId(LEAD_ID);
+        team.setWorkspaceId(1L);
+        AgentEntity foreignMember = agent(MEMBER_ID, "react");
+        foreignMember.setWorkspaceId(2L);
+        when(teamMapper.selectOne(any(com.baomidou.mybatisplus.core.conditions.Wrapper.class)))
+                .thenReturn(team);
+        when(agentMapper.selectById(MEMBER_ID)).thenReturn(foreignMember);
+
+        IllegalArgumentException error = assertThrows(IllegalArgumentException.class,
+                () -> service.addMember(10L, 1L, MEMBER_ID, "member"));
+
+        assertEquals("member agent does not belong to the current workspace: 2", error.getMessage());
+        verify(memberMapper, never()).insert(any(AgentTeamMemberEntity.class));
+    }
+
+    @Test void coordinatorSettingsMergeValidateRuntimeAndPublishInvalidation() {
+        AgentTeamEntity team = new AgentTeamEntity(); team.setId(10L); team.setWorkspaceId(1L);
+        team.setLeadAgentId(LEAD_ID); team.setSettings("{\"notifications\":true}");
+        when(teamMapper.selectOne(any())).thenReturn(team);
+        when(agentMapper.selectById(LEAD_ID)).thenReturn(agent(LEAD_ID, "react"));
+        var member = new AgentTeamMemberEntity(); member.setAgentId(LEAD_ID);
+        when(memberMapper.selectList(any())).thenReturn(List.of(member));
+        service.updateTeam(10L, 1L, null, null, "{\"coordinatorMode\":true}");
+        assertEquals("{\"notifications\":true,\"coordinatorMode\":true}", team.getSettings());
+        verify(teamMapper).updateById(team);
+        var publisher = (ApplicationEventPublisher) org.springframework.test.util.ReflectionTestUtils.getField(service,"eventPublisher");
+        verify(publisher).publishEvent(new vip.mate.team.event.TeamChangedEvent(List.of(LEAD_ID)));
+        assertThrows(vip.mate.exception.MateClawException.class, () -> service.updateTeam(10L,1L,null,null,"{\"coordinatorMode\":null}"));
+        assertThrows(vip.mate.exception.MateClawException.class, () -> service.updateTeam(10L,1L,null,null,"{} {}"));
+        team.setSettings("legacy malformed");
+        assertThrows(vip.mate.exception.MateClawException.class, () -> service.updateTeam(10L,1L,null,null,"{}"));
+    }
+
+    @Test void activeLeadCannotToggleButMembersDoNotBlockAndDshLeadCannotEnable() {
+        AgentTeamEntity team = new AgentTeamEntity(); team.setId(10L); team.setWorkspaceId(1L); team.setLeadAgentId(LEAD_ID);
+        when(teamMapper.selectOne(any())).thenReturn(team);
+        var running = new vip.mate.agent.runtime.RunningConversationRegistry();
+        org.springframework.test.util.ReflectionTestUtils.setField(service,"runningConversationRegistry",running);
+        running.register("lead-turn",LEAD_ID);
+        assertThrows(vip.mate.exception.MateClawException.class, () -> service.updateTeam(10L,1L,null,null,"{\"coordinatorMode\":true}"));
+        running.unregister("lead-turn"); running.register("member-turn",MEMBER_ID);
+        AgentEntity lead = agent(LEAD_ID,"plan_execute"); lead.setRuntimeType("dsh");
+        when(agentMapper.selectById(LEAD_ID)).thenReturn(lead);
+        assertThrows(vip.mate.exception.MateClawException.class, () -> service.updateTeam(10L,1L,null,null,"{\"coordinatorMode\":true}"));
+        lead.setRuntimeType("native");
+        service.updateTeam(10L,1L,null,null,"{\"coordinatorMode\":true}");
+        running.register("lead-turn",LEAD_ID);
+        service.updateTeam(10L,1L,null,null,"{\"coordinatorMode\":true}"); // no effective toggle
+        assertThrows(vip.mate.exception.MateClawException.class, () -> service.updateTeam(10L,1L,null,null,"{\"coordinatorMode\":false}"));
+        running.unregister("lead-turn");
+        service.updateTeam(10L,1L,null,null,"{\"coordinatorMode\":false}");
+        assertFalse(TeamCoordinatorPolicy.enabled(team.getSettings()));
     }
 }

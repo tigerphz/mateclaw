@@ -14,8 +14,10 @@ Deep-dive topics have their own pages — Tool Guard rules in [Security & Approv
 |---------|----------|--------------|
 | `default` | H2 file at `./data/mateclaw` | No action needed |
 | `mysql` | MySQL 8.0+ | `spring.profiles.active=mysql` or `SPRING_PROFILES_ACTIVE=mysql` |
+| `postgres` | PostgreSQL 16+ | `SPRING_PROFILES_ACTIVE=postgres` |
+| `kingbase` | KingbaseES | `SPRING_PROFILES_ACTIVE=kingbase` (opt-in driver required) |
 
-Docker deployments activate `mysql` automatically. Desktop builds use `default`.
+The public Docker Compose stack activates `postgres`. Desktop builds use `default`; the `mysql` profile remains supported for existing or self-managed deployments.
 
 ---
 
@@ -44,7 +46,7 @@ spring:
       enabled: true              # Available at /h2-console (disable in production)
 ```
 
-### Database — MySQL (production)
+### Database — MySQL (supported self-managed deployment)
 
 ```yaml
 spring:
@@ -53,7 +55,7 @@ spring:
   datasource:
     url: jdbc:mysql://localhost:3306/mateclaw?useSSL=false&serverTimezone=UTC
     username: root
-    password: ${MYSQL_ROOT_PASSWORD}
+    password: ${DB_PASSWORD}
     driver-class-name: com.mysql.cj.jdbc.Driver
 ```
 
@@ -63,7 +65,7 @@ spring:
 **Model configuration is 100% UI-driven.** Don't put `spring.ai.*` blocks in `application.yml` — every provider, key, and model config lives in `Settings → Models`, backed by the `mate_model_provider` and `mate_model_config` tables.
 :::
 
-**LLM API keys are not read from environment variables** — `DASHSCOPE_API_KEY` / `OPENAI_API_KEY` / etc. have no effect. A fresh install starts with no providers configured; log in and add your first one under `Settings → Models → Add Provider`. Full reference in [Models](./models).
+**Provider, key, and model rows in the database are the primary configuration.** On a fresh install, log in and add the first provider under `Settings → Models → Add Provider`. `DASHSCOPE_API_KEY` remains a compatibility fallback for DashScope auto-configuration, but it does not replace the provider row; do not assume equivalent environment variables are read for other providers. Full reference in [Models](./models).
 
 ### Virtual threads (JDK 21)
 
@@ -173,12 +175,12 @@ Environment overrides: `MATECLAW_WORKSPACE_SANDBOX_ENABLED` / `MATECLAW_WORKSPAC
 ```yaml
 mateclaw:
   jwt:
-    secret: ${JWT_SECRET:your-secret-key-at-least-32-characters-long}
+    secret: ${JWT_SECRET:}
     expiration: 86400000
 ```
 
 ::: warning
-Change the default JWT secret in production. Must be at least 32 characters. Use an environment variable; never commit it.
+`JWT_SECRET` is required at startup in every environment. Set a unique random value of at least 32 UTF-8 bytes; generate one with `openssl rand -base64 48`. Never commit it. Rotating it invalidates existing tokens.
 :::
 
 ### Skill workspace
@@ -215,40 +217,43 @@ Details in [Multimodal](./multimodal).
 
 ## Environment variables
 
-::: warning LLM keys are not read from env
-DashScope / OpenAI / Anthropic / DeepSeek / Kimi and other provider API keys are **not configured via environment variables**. The container starts with zero LLM keys; after login, add your first provider under `Settings → Models → Add Provider`.
+::: warning Manage LLM keys in the console
+Provider, key, and model rows in `Settings → Models` are primary. `DASHSCOPE_API_KEY` remains only as a compatibility fallback for DashScope auto-configuration; do not assume equivalent environment variables are read for other providers.
 :::
 
 | Variable | Required | Purpose |
 |----------|----------|---------|
 | `SERPER_API_KEY` | — | Google Serper search key (search tools not yet UI-managed) |
 | `TAVILY_API_KEY` | — | Tavily search key (same as above) |
-| `JWT_SECRET` | — | JWT signing secret (recommended in production) |
+| `JWT_SECRET` | Yes | JWT signing secret |
 | `MATECLAW_CORS_ALLOWED_ORIGINS` | — | CORS allowlist (recommended in production) |
-| `DB_PASSWORD` / `DB_ROOT_PASSWORD` | Docker | MySQL app user / root password |
-| `SPRING_PROFILES_ACTIVE` | — | Set to `mysql` for production |
+| `DB_PASSWORD` / `DB_ADMIN_PASSWORD` | Docker | PostgreSQL application / bootstrap-admin passwords (must differ) |
+| `DB_USERNAME` / `DB_ADMIN_USERNAME` | — | PostgreSQL application / bootstrap-admin usernames |
+| `DB_HOST` / `DB_PORT` / `DB_NAME` | — | Database address, port, and name |
+| `SPRING_PROFILES_ACTIVE` | — | Docker Compose sets `postgres`; self-managed deployments may use `mysql` / `kingbase` |
 
 ### Setting them
 
 **Linux / macOS:**
 
 ```bash
-export JWT_SECRET=your-production-secret-at-least-32-chars
+export JWT_SECRET="$(openssl rand -base64 48)"
 export SERPER_API_KEY=your-serper-key   # optional
 ```
 
 **Windows (PowerShell):**
 
 ```powershell
-$env:JWT_SECRET = "your-production-secret-at-least-32-chars"
+$env:JWT_SECRET = openssl rand -base64 48
 ```
 
 **Docker (`.env` file):**
 
 ```properties
 DB_PASSWORD=secure-password-here
-DB_ROOT_PASSWORD=different-secure-password-here
-JWT_SECRET=your-production-secret-at-least-32-chars
+DB_ADMIN_PASSWORD=different-secure-password-here
+# Generate with: openssl rand -base64 48
+JWT_SECRET=replace-with-generated-value
 ```
 
 After startup, open `http://localhost:18080`, sign in as `admin / admin123`, and add your first LLM provider under `Settings → Models → Add Provider`.
@@ -263,7 +268,18 @@ MateClaw uses **Flyway** for schema migrations:
 2. `db/migration/mysql/V*__*.sql` — MySQL-dialect migration scripts
 3. After migrations, seed data is loaded from `db/data-*.sql` — idempotent
 
-Flyway auto-selects the correct dialect path based on the active Spring profile. Every startup runs a `repair` before `migrate`, self-healing checksum drift and partially-failed migrations (especially important for desktop users upgrading offline).
+Flyway selects the migration dialect from the active Spring profile. Startup runs `migrate` with checksum validation enabled by default in all bundled profiles. Applied migration files must not be edited: checksum drift or a failed migration stops startup rather than silently changing the schema history.
+
+**Desktop upgrade compatibility:** an existing desktop database whose applied scripts differ from the new release can now fail to start. A new database and an unchanged migration history need no repair. Keep a backup that can be opened with the previous application version; do not delete the database to clear a validation error.
+
+If validation fails:
+
+1. Stop the application and back up the database. Keep the exact previous and target release artifacts, and inspect the failing migration and schema history.
+2. Compare the old and new SQL with the actual schema/data. Prefer restoring the expected migration file or a maintainer-provided forward migration. `repair` changes migration metadata; it does **not** execute changed DDL, undo partial DDL/data changes, or prove the schema is correct. Resolve any partial migration effects before proceeding.
+3. Only after confirming that history repair is appropriate, set `mateclaw.flyway.auto-repair=true` (environment variable `MATECLAW_FLYWAY_AUTOREPAIR=true`) for one controlled startup. Repair uses the configured migration locations and is followed by normal migration. Keep validation enabled.
+4. Remove the opt-in immediately afterwards, restart normally, and verify validation and application behavior before allowing writes. If recovery fails, restore the backup with its matching application version.
+
+The opt-in defaults to `false`, including Desktop. It is not an unattended upgrade policy. `spring.flyway.validate-on-migrate` remains externally configurable, but setting it to `false` bypasses the validation guard and is not a repair procedure.
 
 ### Table conventions
 
@@ -290,7 +306,7 @@ CREATE DATABASE mateclaw CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 
 ```bash
 export SPRING_PROFILES_ACTIVE=mysql
-export MYSQL_ROOT_PASSWORD=your-password
+export DB_PASSWORD=your-password
 mvn spring-boot:run
 ```
 

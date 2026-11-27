@@ -9,10 +9,13 @@ import org.springframework.ai.chat.messages.SystemMessage;
 import org.springframework.ai.chat.messages.UserMessage;
 import org.springframework.ai.content.Media;
 import org.springframework.core.io.FileSystemResource;
+import org.springframework.core.io.ByteArrayResource;
+import org.springframework.core.io.Resource;
 import org.springframework.util.MimeType;
 import reactor.core.publisher.Flux;
 import vip.mate.agent.context.ChatOrigin;
 import vip.mate.agent.context.ChatOriginHolder;
+import vip.mate.agent.context.GoalContinuationContext;
 import vip.mate.approval.ApprovalPlaceholderUtil;
 import vip.mate.llm.model.ModelConfigEntity;
 import vip.mate.llm.routing.MediaCaptionService;
@@ -21,8 +24,12 @@ import vip.mate.llm.routing.model.MultimodalRoutingDecision;
 import vip.mate.llm.service.ModelCapabilityService;
 import org.springframework.ai.chat.messages.ToolResponseMessage;
 import vip.mate.workspace.conversation.ConversationService;
+import vip.mate.workspace.conversation.MessageMetadataJson;
 import vip.mate.workspace.conversation.model.MessageContentPart;
 import vip.mate.workspace.conversation.model.MessageEntity;
+import vip.mate.workspace.core.service.MemberFileAccess;
+import vip.mate.workspace.core.service.MemberFileIsolation;
+import vip.mate.workspace.core.service.ChatUploadLocationResolver;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -56,6 +63,9 @@ public abstract class BaseAgent {
 
     /** 系统提示词 */
     protected String systemPrompt;
+
+    protected vip.mate.agent.context.ChannelHistoryPolicy channelHistoryPolicy =
+            new vip.mate.agent.context.ChannelHistoryPolicy(new vip.mate.config.ChannelHistoryProperties());
 
     /**
      * Max ReAct iterations (one reasoning + action + observation step counts as one).
@@ -123,6 +133,7 @@ public abstract class BaseAgent {
      */
     protected MultimodalRouter multimodalRouter;
     protected MediaCaptionService mediaCaptionService;
+    protected ChatUploadLocationResolver chatUploadLocationResolver;
 
     /**
      * RFC 48 — wired by {@link AgentGraphBuilder#build} so the agent's
@@ -256,6 +267,8 @@ public abstract class BaseAgent {
         // The gate is an explicit ChatOrigin signal, so a normal Web or
         // channel turn can never take this path.
         ChatOrigin chatOrigin = ChatOriginHolder.get();
+        boolean channelHistory = channelHistoryPolicy.applies(chatOrigin);
+        java.time.LocalDateTime historyNow = java.time.LocalDateTime.now();
         if (chatOrigin != null && chatOrigin.cronOrigin()) {
             log.info("[{}] Scheduled-job run: LLM context isolated (no conversation history replayed)",
                     agentName);
@@ -265,7 +278,7 @@ public abstract class BaseAgent {
         // ===== 两阶段加载：短对话全量，长对话分页（递进式） =====
         long totalCount = conversationService.countMessages(conversationId);
         if (totalCount <= 0) {
-            return List.of();
+            return channelHistory ? List.of(new SystemMessage(channelHistoryPolicy.guidance(historyNow))) : List.of();
         }
 
         int windowSize = getEffectiveWindowSize();
@@ -290,7 +303,7 @@ public abstract class BaseAgent {
         boolean boundaryFoundInWindow = false;
         for (int i = history.size() - 1; i >= 0; i--) {
             MessageEntity msg = history.get(i);
-            if ("system".equals(msg.getRole()) && isCompressionSummary(msg)) {
+            if (!channelHistory && "system".equals(msg.getRole()) && isCompressionSummary(msg)) {
                 history = new ArrayList<>(history.subList(i, history.size()));
                 boundaryFoundInWindow = true;
                 log.info("[{}] Found latest compression boundary at index {}; loading {} messages forward",
@@ -306,7 +319,7 @@ public abstract class BaseAgent {
         // original list and never made it into `history`. Without prepending
         // it, the model would forget the original goal even though we already
         // paid the LLM cost to produce a structured summary.
-        if (!boundaryFoundInWindow && totalCount > windowSize) {
+        if (!channelHistory && !boundaryFoundInWindow && totalCount > windowSize) {
             try {
                 MessageEntity latestBoundary = conversationService.findLatestCompressionBoundary(conversationId);
                 if (latestBoundary != null) {
@@ -330,11 +343,17 @@ public abstract class BaseAgent {
             }
         }
 
+        if (channelHistory) {
+            history = channelHistoryPolicy.select(history.subList(0, limit), historyNow);
+            limit = history.size();
+        }
+
         if (limit <= 0) {
-            return List.of();
+            return channelHistory ? List.of(new SystemMessage(channelHistoryPolicy.guidance(historyNow))) : List.of();
         }
 
         List<Message> messages = new ArrayList<>(limit);
+        if (channelHistory) messages.add(new SystemMessage(channelHistoryPolicy.guidance(historyNow)));
         for (int i = 0; i < limit; i += 1) {
             messages.addAll(expandToSpringMessages(history.get(i)));
         }
@@ -811,8 +830,15 @@ public abstract class BaseAgent {
         if (msg == null) return List.of();
         String metadata = msg.getMetadata();
         if (metadata == null || metadata.isEmpty()) return List.of();
-        if (!metadata.contains("\"directToolNames\"")) return List.of();
-        java.util.regex.Matcher arrayMatcher = DIRECT_TOOL_NAMES_ARRAY.matcher(metadata);
+        // Guard on the bare key, not on `"directToolNames"`: the escaped form
+        // reads \"directToolNames\", where the quotes are no longer adjacent to
+        // the name, so a quoted guard exits early on every H2-backed row and the
+        // badge silently disappears. Bare-key matching holds for both forms and
+        // keeps the common case (no such key) allocation-free; the exact match
+        // then runs against normalized JSON.
+        if (!metadata.contains("directToolNames")) return List.of();
+        java.util.regex.Matcher arrayMatcher =
+                DIRECT_TOOL_NAMES_ARRAY.matcher(MessageMetadataJson.normalize(metadata));
         if (!arrayMatcher.find()) return List.of();
         String inner = arrayMatcher.group(1);
         java.util.regex.Matcher nameMatcher = DIRECT_TOOL_NAMES_INNER.matcher(inner);
@@ -885,9 +911,18 @@ public abstract class BaseAgent {
                 renderedContent = directToolHistoryPlaceholder(directNames);
             }
         }
+        if (channelHistoryPolicy.applies(ChatOriginHolder.get()) && message.getCreateTime() != null) {
+            renderedContent = "[Historical message at " + message.getCreateTime() + "]\n" + renderedContent;
+        }
         return switch (message.getRole()) {
             case "assistant" -> new AssistantMessage(renderedContent);
-            case "system" -> new SystemMessage(renderedContent);
+            case "system" -> isCompressionSummary(message)
+                    // Compression boundaries are persisted as system rows so
+                    // the loader can find the latest boundary cheaply. They
+                    // are still model-generated history context, not durable
+                    // instructions, so replay them at user priority.
+                    ? new UserMessage(renderedContent)
+                    : new SystemMessage(renderedContent);
             // History user messages: text only. Re-injecting Media on every replay
             // accumulates attachments across turns — many providers cap at 1 video
             // per request (e.g. Zhipu GLM-5V returns code 1210). The current turn
@@ -951,6 +986,12 @@ public abstract class BaseAgent {
                 : MultimodalRoutingDecision.none();
 
         StringBuilder textBuilder = new StringBuilder(renderedContent == null ? "" : renderedContent);
+        if (MemberFileIsolation.isEnabled()
+                && decision.strategy() == MultimodalRoutingDecision.Strategy.SIDECAR) {
+            // The sidecar still loads host paths itself, so it cannot receive member attachments.
+            decision = MultimodalRoutingDecision.none();
+            textBuilder.append("\n\n[系统提示] 成员文件隔离模式暂不支持图片旁路识别。请明确告知用户此限制，并建议使用原生支持图片输入的模型。");
+        }
         java.util.Set<String> sidecarHandledIdentifiers = new java.util.HashSet<>();
         if (decision.strategy() == MultimodalRoutingDecision.Strategy.SIDECAR
                 && mediaCaptionService != null
@@ -968,7 +1009,7 @@ public abstract class BaseAgent {
                         && !contentType.contains("svg");
                 if (!isImage) continue;
                 MediaCaptionService.CaptionResult result = mediaCaptionService.caption(
-                        decision.sidecarModel(), part, userLocale, userQuestion);
+                        decision.sidecarModel(), part, userLocale, userQuestion, ChatOriginHolder.get());
                 if (result.isFailure()) {
                     log.warn("[{}] Sidecar caption failed for {}: {}",
                             agentName, part.getFileName(), result.failure().getMessage());
@@ -1064,8 +1105,8 @@ public abstract class BaseAgent {
             }
 
             // 解析媒体文件路径：先尝试 path，再尝试 mediaId（IM 渠道下载后存在 mediaId 中），再拼接工作目录
-            Path mediaPath = resolveImagePath(part.getPath());
-            if (mediaPath == null && part.getMediaId() != null) {
+            Path mediaPath = resolveAttachmentPath(part);
+            if (mediaPath == null && part.getMediaId() != null && !isWebUpload(part)) {
                 mediaPath = resolveImagePath(part.getMediaId());
             }
             if (mediaPath == null) {
@@ -1076,7 +1117,7 @@ public abstract class BaseAgent {
             }
             try {
                 MimeType mimeType = MimeType.valueOf(contentType);
-                Media media = new Media(mimeType, new FileSystemResource(mediaPath));
+                Media media = new Media(mimeType, mediaResource(mediaPath));
                 mediaList.add(media);
                 log.debug("[{}] Injected {} into prompt: {} ({})",
                         agentName, isVideo ? "video" : "image", part.getFileName(), mediaPath);
@@ -1095,7 +1136,9 @@ public abstract class BaseAgent {
             // either. With a media tool the LLM may legitimately choose to
             // delegate to the tool — never instruct it not to use tools.
             if (!hasMediaCapableTools()) {
-                textBuilder.append("\n请用对话语言清晰、友好地告诉用户：当前模型无法处理这类附件，建议切换到具备相应能力的多模态模型，或在「设置 → 模型」中配置视觉/视频模型作为旁路。");
+                textBuilder.append(MemberFileIsolation.isEnabled()
+                        ? "\n请明确告知用户附件未能加载；成员文件隔离模式仅支持读取本人的文件，请使用原生支持此类附件的多模态模型，旁路识别暂不可用。"
+                        : "\n请用对话语言清晰、友好地告诉用户：当前模型无法处理这类附件，建议切换到具备相应能力的多模态模型，或在「设置 → 模型」中配置视觉/视频模型作为旁路。");
             }
         }
 
@@ -1196,7 +1239,14 @@ public abstract class BaseAgent {
      * {@link UserMessage} and the routing decision the caller should persist as
      * {@code metadata.routing} and surface to the SSE consumer.
      */
-    public record CurrentTurnUserMessage(UserMessage userMessage, MultimodalRoutingDecision routingDecision) {}
+    public record CurrentTurnUserMessage(UserMessage userMessage, MultimodalRoutingDecision routingDecision) {
+        public CurrentTurnUserMessage {
+            var metadata = new java.util.HashMap<>(userMessage.getMetadata());
+            metadata.put(vip.mate.agent.graph.PayloadReduction.REAL_USER_INPUT, true);
+            userMessage = UserMessage.builder().text(userMessage.getText()).media(userMessage.getMedia())
+                    .metadata(metadata).build();
+        }
+    }
 
     /**
      * Extract a routing-decision payload from the graph input map (placed there
@@ -1250,6 +1300,12 @@ public abstract class BaseAgent {
      * the primary model can't already handle.
      */
     protected CurrentTurnUserMessage buildCurrentUserMessageWithRouting(String conversationId, String userMessageText) {
+        // Autonomous segments have no new persisted user row. Reconstructing
+        // from the last user would replace the continuation/recovery instruction.
+        // History is still loaded normally; queued user turns retain attachment routing.
+        if (GoalContinuationContext.explicitPrompt()) {
+            return new CurrentTurnUserMessage(new UserMessage(userMessageText), null);
+        }
         // Scheduled-job run (issue #142): the task text is the explicit
         // userMessageText argument. Never reconstruct it from the conversation
         // — a shared cron conversation under concurrent runs has no reliable
@@ -1309,17 +1365,19 @@ public abstract class BaseAgent {
             for (int j = currentIdx - 1; j >= from; j--) {
                 MessageEntity m = history.get(j);
                 if (m == null || !"user".equals(m.getRole())) continue;
+                if (channelHistoryPolicy.applies(ChatOriginHolder.get())
+                        && !channelHistoryPolicy.isHot(m, java.time.LocalDateTime.now())) continue;
                 List<MessageContentPart> parts = conversationService.parseMessageParts(m);
                 for (int k = parts.size() - 1; k >= 0; k--) {
                     MessageContentPart part = parts.get(k);
                     if (!isResolvableImagePart(part)) continue;
-                    Path imgPath = resolveImagePath(part.getPath());
-                    if (imgPath == null && part.getMediaId() != null) imgPath = resolveImagePath(part.getMediaId());
+                    Path imgPath = resolveAttachmentPath(part);
+                    if (imgPath == null && part.getMediaId() != null && !isWebUpload(part)) imgPath = resolveImagePath(part.getMediaId());
                     if (imgPath == null) continue;
                     String contentType = part.getContentType();
                     if (contentType == null || "image/*".equals(contentType)) contentType = "image/jpeg";
                     try {
-                        Media carried = new Media(MimeType.valueOf(contentType), new FileSystemResource(imgPath));
+                        Media carried = new Media(MimeType.valueOf(contentType), mediaResource(imgPath));
                         UserMessage orig = built.userMessage();
                         String name = part.getFileName() == null ? "image" : part.getFileName();
                         String text = (orig.getText() == null ? "" : orig.getText())
@@ -1363,9 +1421,43 @@ public abstract class BaseAgent {
         return isImage && !contentType.contains("svg");
     }
 
+    private Resource mediaResource(Path path) throws java.io.IOException {
+        if (!MemberFileIsolation.isEnabled()) return new FileSystemResource(path);
+        Path root = Path.of(MemberFileIsolation.scope(ChatOriginHolder.get()).workspaceBasePath());
+        // Snapshot through descriptor-relative access; never defer a host path read to the model client.
+        return new ByteArrayResource(MemberFileAccess.read(root, path, 32 * 1024 * 1024));
+    }
+
+    private Path resolveAttachmentPath(MessageContentPart part) {
+        ChatOrigin origin = ChatOriginHolder.get();
+        if (chatUploadLocationResolver != null && origin != null
+                && "web".equals(origin.channelType()) && part.getStoredName() != null) {
+            // The client-visible path is informational; the stored name is resolved
+            // under the authenticated conversation's actual upload root.
+            return chatUploadLocationResolver.resolveExistingFile(origin, part.getStoredName());
+        }
+        return resolveImagePath(part.getPath());
+    }
+
+    private boolean isWebUpload(MessageContentPart part) {
+        ChatOrigin origin = ChatOriginHolder.get();
+        return chatUploadLocationResolver != null && origin != null
+                && "web".equals(origin.channelType()) && part.getStoredName() != null;
+    }
+
     protected Path resolveImagePath(String relativePath) {
         if (relativePath == null || relativePath.isBlank()) {
             return null;
+        }
+        if (MemberFileIsolation.isEnabled()) {
+            try {
+                Path root = Path.of(MemberFileIsolation.scope(ChatOriginHolder.get()).workspaceBasePath());
+                Path resolved = MemberFileIsolation.validate(root, relativePath);
+                return Files.isRegularFile(resolved, java.nio.file.LinkOption.NOFOLLOW_LINKS) ? resolved : null;
+            } catch (SecurityException | IllegalArgumentException denied) {
+                log.debug("[{}] Member media path rejected", agentName);
+                return null;
+            }
         }
         // 1. 如果已经是绝对路径且存在，直接用
         Path path = Paths.get(relativePath);

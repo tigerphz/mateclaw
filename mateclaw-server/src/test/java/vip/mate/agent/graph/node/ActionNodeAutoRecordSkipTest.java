@@ -7,6 +7,8 @@ import org.junit.jupiter.api.Test;
 import org.springframework.ai.chat.messages.ToolResponseMessage;
 import vip.mate.agent.progress.ProgressLedger;
 import vip.mate.agent.progress.ProgressLedgerService;
+import vip.mate.agent.GraphEventPublisher;
+import vip.mate.agent.graph.state.ActionExecutionLedger;
 
 import java.util.List;
 import java.util.Map;
@@ -108,10 +110,25 @@ class ActionNodeAutoRecordSkipTest {
                 resp("load_skill", "loaded"),
                 resp("enable_tool", "enabled"),
                 resp("progress_update", "ok"),
+                resp("get_progress", "{\"entries\":[]}"),
                 resp("listAvailableSkills", "[]"),
                 resp("readSkillFile", "..."),
                 resp("runSkillScript", "...")));
 
         assertTrue(ledger.load(conv).isEmpty());
+    }
+
+    @Test
+    @DisplayName("failed mutating tools are not auto-recorded as completed progress")
+    void failedMutationIsNotRecorded() {
+        InMemoryProgressLedgerService ledger = new InMemoryProgressLedgerService();
+        ActionNode node = nodeWith(ledger);
+        ToolResponseMessage.ToolResponse response = resp("schedule_meeting", "HTTP 500");
+        ActionExecutionLedger receipts = ActionExecutionLedger.fromEvents(List.of(
+                GraphEventPublisher.toolComplete(response.id(), response.name(), response.responseData(), false)));
+
+        node.autoRecordToolCalls("conv-failed", List.of(response), receipts);
+
+        assertTrue(ledger.load("conv-failed").isEmpty());
     }
 }

@@ -1,0 +1,160 @@
+# Structured decision layer
+
+The decision layer provides replaceable structured judgments. It does not execute tools or replace permissions, completion verification, or existing state machines. Requests use Choice, Boolean, or Score questions. Domain constraints remain authoritative after a Provider returns a suggestion.
+
+## Modes and configuration
+
+`mate.decision.mode` defaults to `SHADOW`:
+
+| Mode | Behavior |
+|---|---|
+| OFF | Returns the legacy judgment without calling the new Provider or decision record store |
+| SHADOW | Keeps the legacy judgment; a bounded background queue evaluates and records suggestions |
+| ACTIVE | Uses suggestions that pass hard constraints, type checks, and confidence checks; domain services still commit state |
+
+The following staged-rollout example observes only Goal decisions. Without scenario overrides, all three scenarios inherit the global SHADOW mode.
+
+```yaml
+mate:
+  decision:
+    mode: SHADOW
+    provider: rule
+    confidence-threshold: 0.8
+    timeout-ms: 250
+    provider-threads: 4
+    shadow-threads: 2
+    queue-capacity: 64
+    retention-days: 30
+    retention-batch-size: 500
+    retention-interval-ms: 3600000
+    scenarios:
+      GOAL_CONTINUATION: SHADOW
+      WORKER_RESULT: OFF
+      AGENT_ROUTING: OFF
+```
+
+Scenario settings override the global mode. To disable the layer completely, set the global mode to OFF and remove or disable scenario overrides. The built-in `rule` Provider evaluates deterministic scheduling rules for supported Goal v2 inputs. Other requests return the baseline without a confidence value. The `llm` Provider remains an unavailable stub; these rules do not call a new model service.
+
+## Processing
+
+1. A deterministic guard checks hard constraints and can bypass the Provider.
+2. The Provider produces a typed suggestion within a bounded executor and deadline.
+3. Invalid types or candidates, timeout, failure, abstention, or low confidence fall back to the legacy judgment.
+4. A policy override applies domain policy without bypassing the guard.
+5. The legacy value, Provider suggestion, and effective suggestion are stored separately from the actual committed outcome.
+
+SHADOW always returns the legacy judgment. Queue saturation or background recording failure reduces observation coverage. ACTIVE persists a proposal before returning it; actual outcomes participate in the caller's business transaction. A persisted proposal does not prove that business state committed.
+
+## Integration boundaries
+
+- Goal continuation preserves completion evidence, budgets and leases. An ACTIVE suggestion can conservatively defer or retry an otherwise eligible continuation.
+- Worker judging preserves deterministic invalid-result checks, checkpoint rules and approval. An ACTIVE semantic rejection fails the task through the existing state machine; it does not grant another execution attempt. Settlement rechecks the original owner, dispatch count and conversation under lock.
+- Agent routing is limited to non-Team plan steps; Team Lead decisions and explicit channel or tool routing remain outside this layer.
+
+## Observability and privacy
+
+Records use `mate_decision_record` and `mate_decision_outcome`. Metadata includes scenario, mode, Provider/version, policy/question versions, workspace and execution identifiers, pipeline evaluation duration (excluding later business commits), confidence, fallback cause, and override cause. Stored values are structured; raw prompts, answers, SQL, tool arguments, evidence text, and exception messages are excluded.
+
+| Outcome | Meaning |
+|---|---|
+| PENDING | A proposal exists without a confirmed outcome; inferred from a missing outcome row |
+| OBSERVED | The actual legacy-path result was observed |
+| APPLIED | The caller recorded an actual result at an explicit application boundary |
+| NOT_APPLIED | Concurrency checks, limits, or other constraints prevented application |
+
+Graph-local `FOLLOWUP_SUBMITTED` means a followup output was constructed and submitted. `FOLLOWUP_SUPPRESSED` means an ACTIVE DEFER/RETRY suggestion prevented the current graph followup; it does not schedule a durable retry. These outcomes do not prove subsequent nodes executed or provide an atomic database-and-graph commit guarantee.
+
+Micrometer metrics include `mate.decision.total`, `mate.decision.duration`, `mate.decision.comparison`, and `mate.decision.failure`. Business identifiers are excluded from metric tags. Comparison metrics distinguish raw Provider suggestions from effective suggestions; guards and unavailable Providers are not valid model comparisons.
+
+Routing v2 records correlate by parent Agent, conversation and PLAN_STEP phase. Step index is transient and plan/subplan IDs are not persisted in the audit, so exact audit-to-subplan reconstruction is not available. Actual assignment outcomes still commit with plan insertion.
+
+Queries must be scoped to workspace and time range. No new public query API is provided. Agreement rates must be considered alongside dropped work, failures, and missing outcomes. Agreement from the Rule provider does not establish improved model quality.
+
+## Validation and future Providers
+
+Tests use controlled Providers and do not require real models. Database tests use H2 with MySQL/PostgreSQL compatibility modes; these do not replace native MySQL/Kingbase validation.
+
+Future Providers can implement the Java SPI for rules, remote models, or local inference. Rollout requires fixed protocol/model versions, minimized input, domain evaluation including Chinese, confidence calibration, timeout/circuit-breaking policies, and gradual enablement by scenario. Language capability metadata does not currently implement language detection or calibration. Industrial writes, uncertain side effects, and retry idempotency remain governed by existing execution and approval mechanisms.
+
+## Scenario policies and routing inputs (second iteration)
+
+Keep mode overrides in `scenarios`. Optional `scenario-policies` overrides provider, confidence threshold and timeout independently; omitted fields inherit globals, so existing configuration needs no migration. This example still uses the built-in Rule provider:
+
+```yaml
+mate:
+  decision:
+    mode: SHADOW
+    provider: rule
+    confidence-threshold: 0.8
+    timeout-ms: 250
+    scenario-policies:
+      WORKER_RESULT:
+        confidence-threshold: 0.95
+        timeout-ms: 500
+      AGENT_ROUTING:
+        provider: rule
+        timeout-ms: 150
+```
+
+Overrides are validated at startup: timeouts are 1–60000 ms and thresholds are finite numbers in [0,1]. Unknown providers fall back with UNAVAILABLE rather than selecting the global provider. Each request snapshots its policy before SHADOW queuing. Dynamic configuration refresh is not provided. Example thresholds are not calibrated production recommendations; Rule baseline results do not use confidence thresholds.
+
+Routing v2 supplies the current step as transient evidence and eligible same-workspace candidates' and parent's name, description, tags and agent type as option descriptions. It excludes the full conversation, full original goal, system prompts, runtime configuration and model credentials. The original goal is only inspected locally for explicit Agent selection. Descriptions are unverified capability claims, not tool authorization. Missing parent metadata uses a generic LOCAL description.
+
+Limits: 2048 characters per step, 1024 per option description, and 8192 across step and option descriptions. Missing steps or excessive inputs guard the baseline instead of silently truncating meaning; stale candidates retain the existing LOCAL guard priority. Character limits are not tokenizer limits. Audit records contain typed results and question versions, never these transient texts. Future remote providers still require an outbound-data policy for transient inputs.
+
+This iteration adds no candidate retrieval, live tool capability verification or semantic model provider. Agreement under default SHADOW/Rule does not establish better accuracy or execution efficiency.
+
+## Goal facts and conservative scheduling (third iteration)
+
+`GoalDecisionFacts` snapshots immutable `goal-continuation-v2` inputs at submission. Boolean and numeric facts cover Goal status, automatic followups, persistence, turns, business and evaluator model calls, finite or unlimited budgets, criterion counts, and passed criteria with evidence. Call totals use long arithmetic so int overflow cannot invalidate a budget. Goal, criterion, and evidence text are excluded from the snapshot and decision audit.
+
+Criterion JSON must satisfy a field whitelist, unique IDs, and type checks. Duplicate JSON fields, trailing content, inputs over 65536 characters or 1000 criteria, and other malformed inputs are marked invalid. An actual evaluation requires a nonblank evaluator model and positive call usage; score, decision/completed consistency, and revision are validated. A valid synthetic CONTINUE with no model and zero calls is scheduling input, not a fresh acceptance verdict. Partial provenance is invalid. Full revision comparisons distinguish current from stale evaluations.
+
+Cooldown facts use the same scheduling time supplied by the adapter. With a known nonnegative configuration, the last followup determines active/ready; readiness includes the exact deadline. Missing configuration/time or date overflow remains unknown and falls back to the baseline. The compatible two-argument snapshot never invents facts from the system clock. Existing domain cooldown guards and the graph planning snapshot remain unchanged; timestamps are excluded from decision facts.
+
+The built-in rule accepts only the supported version, a complete and coherent fact schema, a Choice question, and a CONTINUE baseline. The Goal must remain eligible for continuation, with valid budget and criterion data and no Guard or Policy Override. A valid stale actual CONTINUE evaluation can propose RETRY; other supported continuable snapshots propose CONTINUE. The question must also accept that choice. Proposals carry `rule-goal-v2`. Unknown versions, incomplete facts, invalid evaluations, other scenarios, and unsupported states return BASELINE (`rule-v1`, no confidence).
+
+The rule never proposes COMPLETE or bypasses acceptance, permissions, budgets, leases, or domain scheduling constraints, and it does not schedule durable retries itself. `confidence=1` means a complete deterministic policy match, not a calibrated probability of model correctness. The default remains SHADOW: OFF and SHADOW retain the baseline, while ACTIVE requires explicit configuration and domain commit checks.
+
+## Long-task context and progress recovery
+
+This iteration borrows context ownership, tool-result recovery, and plan preservation ideas from [AgentScope Java harness 2.0.4](https://github.com/agentscope-ai/agentscope-java/tree/v2.0.4/agentscope-harness) within the existing runtime. It does not fully integrate HarnessAgent or add an external JEV service. The actual model view remains separate from canonical conversation records; compacting a display does not rewrite durable facts or authorization.
+
+When prefix budgeting is enabled, regular and automatic progress projections retain complete JSON entry boundaries and fit within the smaller of the current ledger allowance and an estimated 2000 tokens. Priority is BLOCKED, IN_PROGRESS, PENDING, then DONE, with status totals and omitted counts. Display keys, labels, and notes may be shortened; canonical entries stay complete. Very small budgets may omit the regular display. Pinned skill constraints remain complete in a separate block and still count toward the actual prompt; optional display limits cannot silently weaken them. Disabled budgeting and the legacy no-argument renderer retain compatibility behavior.
+
+Read-only `get_progress` obtains the current conversation from tool execution context and cannot select another conversation. Without a selector it pages entries (default 10, maximum 20). An exact original `stepKey` or overview `entryIndex` selects complete key, label, note, or the default serialized record text. Field chunks default to 256 and allow at most 512 UTF-16 characters; follow `nextOffset` until null. Chunks preserve surrogate pairs. Each JSON response is limited to 2400 characters, so escaping can reduce the returned page or chunk. Use entryIndex for shortened key previews or ambiguous keys across origins; refresh overview indices after ledger mutations.
+
+Reading progress does not mutate the ledger, create execution receipts, or trigger automatic progress feedback. Model-authored DONE values, labels, and notes are progress claims, not substitutes for actual tool results or Goal acceptance. Mark DONE after receiving a verifiable successful result; independent operations still execute and verify through the existing tool chain.
+
+TokenEstimator accounts for structured tool responses and tool-call arguments. Window control accounts for the actual non-history prefix, active tool schemas, history, and output reserve without double counting. Optional tail-history floors cannot exceed the remaining allowance. Retries should use the current compacted model view, preserve the prefix, original objective, and tool pairs, and obey the finite model-call ceiling. If mandatory content cannot fit, report a clear context error instead of silently slicing skill constraints or repeatedly sending oversized requests. Controlled regression checks establish these boundaries, not real-model accuracy or efficiency improvements.
+
+## Real-model validation boundary for this iteration
+
+Before these changes, clarified multi-stage prompts completed 16 DeepSeek long-task rounds; round 17 stopped with provider HTTP 402 (insufficient balance). Failed artifacts remain available, and two completed rounds required manual semantic review of final-answer consistency. Real-model testing resumed after recharge. The initial post-change suite accepted 19/20 rounds; one failed for an invented recovery statement, motivating the execution-grounding follow-up. Consult the current verification report for final rerun results. This baseline is not post-change acceptance evidence and does not establish a performance improvement.
+
+After final-answer verification changes, a fresh frozen-version suite accepted 20 rounds with 132 independent stages and 20 separate aggregates. Rounds 5/10/15/20 also received manual semantic review. Round 20 triggered a negation false positive in the old regex; the original result was retained and only that verified false positive was accepted. A 32k-window probe completed 64 stages with 44 actual history trims; a finite-iteration probe confirmed a real stop without fabricated completion. Verification added 20 logical calls reporting 89552 prompt and 1176 output tokens. These synthetic fixtures and returned usage do not guarantee arbitrary-task reliability, complete billing coverage or performance improvement. Earlier genuine recovery-narrative failures remain retained.
+
+
+Pre-run history compaction and retry compaction share the same model-call guard. Actual pre-run summary calls and provider-reported token/cache usage seed the initial run state; cancellation after a successful summary preserves that usage and stops further execution. Finite call budgets reserve a subsequent reasoning opportunity, and known oversized summary prompts stop before transmission. Legacy entry points without a configured window remain compatible. Output reserves follow actual model options, including OpenAI maxCompletionTokens and Anthropic thinking overhead. Window estimates are not exact billing measurements.
+
+## HTTP 413 payload limits
+
+HTTP 413 is distinct from token context overflow. After an explicit upstream payload rejection, the runtime makes at most one model-free local history reduction and sends the smaller view. It does not repeat an unchanged payload, fail over or penalize provider health for request size. Reduction preserves system instructions, user objectives, media, skill results and complete associated tool batches; canonical conversation records remain unchanged.
+
+Mandatory oversized input, irreducible history or another payload rejection terminates with an explicit incomplete result. Plan-Execute does not mark the step complete or replan around this terminal condition. Split tasks or media, inspect enabled tools, and check the actual rejecting proxy or model service limits. Token estimates do not establish serialized HTTP byte limits. Default gateway limits were not changed, and the Issue author's deployment remains unverified.
+
+Execution facts supply exact tool-failure counts, including zero, before final answers. ReAct, bounded wrap-up and the Plan-Execute final summary share this constraint. Opaque operation identities hash the strictly validated tool name and original argument string with SHA-256; no original code or credential text is added by this metadata. Whitespace, key ordering or numeric spelling changes produce different identities, conservatively avoiding semantic equivalence claims. Wrappers, legacy records, absent arguments and conflicting evidence remain unknown. Unknown or different identities cannot establish recovery, and matching identities cannot prove whole-task completion. These facts improve model input; they do not guarantee all natural-language claims, which still require receipt comparison.
+
+Runtime guidance includes an ACTIVE snapshot when the current reasoning call is admitted: the iteration guard has not requested termination at that point, and tools keep their existing permissions. Later cancellation, timeout and termination signals take precedence. The runtime enforces its cap; configured limits, trimming and ledger size should not make the model end unfinished work by itself. Guidance also states the actual iteration configuration: non-positive values mean UNLIMITED (no configured iteration soft cap), not zero or exhausted budget. A configured finite cap is not evidence that it has been reached. History trimming, ledger size and per-response output tokens are distinct from whole-task iteration limits. Budget-stop explanations require runtime termination evidence; cancellation and timeout protections remain active. Guidance supplies facts rather than forcing continuation or replacing task acceptance.
+
+## Verification before final-answer publication
+
+ReAct answers after tool execution and Plan-Execute final summaries hold candidate prose until a bounded receipt-based check accepts it. The check distinguishes task completion, narrative correction and continued execution. Recovery requires a later successful receipt for the same original request. Unavailable or malformed verification, insufficient evidence or mandatory context that cannot fit produces an explicit incomplete result; a model completion claim is not an execution receipt.
+
+Each user run allows at most two correction or continuation attempts. Verification and corrective calls, including provider-reported usage, count toward the original run budget. Cancellation, timeout, context boundaries and actual iteration limits take precedence. Reaching a limit does not grant extra tool access or restart a plan. Verification requests have no tools, receipt previews are treated as data, and the canonical ledger remains complete.
+
+Tool, thinking and progress events remain live. Candidate final prose is published once after acceptance and final formatting, matching the persisted answer. The first tool-enabled answer is also held to avoid leaking prose before tool execution, so an ordinary answer that uses no tools may show its text later. Verification adds model calls and latency. The finalization_check events record those calls and reported token usage; they do not establish a complete provider bill or a performance improvement. Structured checks still depend on model judgment, so real long-task acceptance also compares tool arguments, context cost and final answers.
+
+Verification reserves space for the complete latest substantive output, recovered by call ID, tool name and original length from retained tool responses or events, before adding older receipt previews. Preview metadata states completeness and omitted characters. Missing, conflicting or oversized required evidence produces an incomplete result. Injected memory remains background; the verifier extracts the current request separately so historical tasks do not become current acceptance criteria.
+
+Long-form chunks accumulate privately before the complete answer is checked. Natural continuation uses the original runtime budget without spending gate correction attempts. A replacement answer does not concatenate an obsolete rejected draft. If a review incorrectly links two real receipts as recovery, Java can only request removal of that unsupported claim within the existing two-attempt allowance. Forged receipts, wrong statuses or incorrect counts still fail closed. Eventual task completion after a failure is distinct from successfully retrying the original operation.

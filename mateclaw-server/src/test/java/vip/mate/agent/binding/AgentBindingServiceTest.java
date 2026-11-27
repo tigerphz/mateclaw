@@ -249,17 +249,37 @@ class AgentBindingServiceTest {
     }
 
     @Test
-    @DisplayName("bindSkill 允许 MCP 虚拟 skill（McpServerEntity 无 workspace，全局共享）")
+    @DisplayName("bindSkill allows existing global MCP virtual skills")
     void bindSkillAllowsVirtualMcpSkill() {
-        // Virtual MCP id range starts at McpSkillBridge.VIRTUAL_ID_BASE (9e18).
-        // No mate_skill or mate_mcp_server seeding needed — the bridge is
-        // bypassed entirely for MCP because there's no workspace to compare.
+        seedMcp(42L, null);
         long virtualMcpId = vip.mate.skill.mcp.McpSkillBridge.VIRTUAL_ID_BASE + 42L;
         assertDoesNotThrow(() -> bindingService.bindSkill(agentId, virtualMcpId));
 
         Set<Long> ids = bindingService.getBoundSkillIds(agentId);
         assertNotNull(ids);
         assertTrue(ids.contains(virtualMcpId), "MCP virtual binding 应当落到 mate_agent_skill");
+    }
+
+    private void seedMcp(long id, Long workspaceId) {
+        jdbcTemplate.update("MERGE INTO mate_mcp_server (id,name,transport,url,enabled,workspace_id,deleted,create_time,update_time) "
+                + "KEY(id) VALUES (?,?,'sse','https://example.invalid/mcp',TRUE,?,0,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+                id, "binding-mcp-" + id, workspaceId);
+    }
+
+    @Test void mcpSkillAndAtomicToolBindingsRejectForeignAndMissingServers() {
+        long serverId = 778001L;
+        seedMcp(serverId, 2L);
+        long skill = vip.mate.skill.mcp.McpSkillBridge.VIRTUAL_ID_BASE + serverId;
+        String tool = vip.mate.tool.mcp.runtime.McpToolNameResolver.prefixedName(serverId, "search");
+        assertThrows(vip.mate.exception.MateClawException.class, () -> bindingService.bindSkill(agentId, skill));
+        assertThrows(vip.mate.exception.MateClawException.class, () -> bindingService.bindTool(agentId, tool));
+        assertThrows(vip.mate.exception.MateClawException.class, () -> bindingService.setToolBindings(agentId, List.of(tool)));
+        assertDoesNotThrow(() -> bindingService.setToolBindings(agentId, List.of()));
+        seedMcp(serverId, 1L);
+        assertDoesNotThrow(() -> bindingService.bindSkill(agentId, skill));
+        assertDoesNotThrow(() -> bindingService.bindTool(agentId, tool));
+        assertThrows(vip.mate.exception.MateClawException.class, () -> bindingService.bindSkill(agentId,
+                vip.mate.skill.mcp.McpSkillBridge.VIRTUAL_ID_BASE + 778002L));
     }
 
     @Test
@@ -387,6 +407,107 @@ class AgentBindingServiceTest {
                         + "实际 allowlist: " + effective);
     }
 
+    @Test
+    void skillsDisabledSelectedMcpExcludesUncheckedCapabilities() {
+        seedMcpServerWithOneTool(8_888_664L, "issue664-selected", "search");
+        seedMcpServerWithOneTool(8_888_665L, "issue664-other", "search");
+        String selected = mcpToolNameForServer(8_888_664L);
+        String other = mcpToolNameForServer(8_888_665L);
+        assertNotNull(selected);
+        assertNotNull(other);
+        setSkillsDisabledFlag(true);
+        bindingService.setToolBindings(agentId, List.of(selected));
+
+        Set<String> effective = bindingService.getEffectiveToolNames(agentId);
+        assertTrue(effective.contains(selected));
+        assertFalse(effective.contains(other));
+        assertScopedInternalTools(effective);
+        assertUncheckedBusinessToolsAbsent(effective);
+    }
+
+    @Test
+    void skillsDisabledStaleMcpBindingDoesNotAutoJoinAvailableMcp() {
+        seedMcpServerWithOneTool(8_888_666L, "issue664-offline", "search");
+        seedMcpServerWithOneTool(8_888_667L, "issue664-online", "search");
+        String selected = mcpToolNameForServer(8_888_666L);
+        String other = mcpToolNameForServer(8_888_667L);
+        assertNotNull(selected);
+        assertNotNull(other);
+        setSkillsDisabledFlag(true);
+        bindingService.setToolBindings(agentId, List.of(selected));
+        jdbcTemplate.update("UPDATE mate_mcp_server SET enabled = FALSE, last_status = 'disconnected' WHERE id = ?",
+                8_888_666L);
+
+        Set<String> effective = bindingService.getEffectiveToolNames(agentId);
+        assertTrue(effective.contains(selected), "Saved binding remains scoped even when its provider goes offline");
+        assertFalse(effective.contains(other), "Unavailable selection must not authorize another provider");
+        assertScopedInternalTools(effective);
+        assertUncheckedBusinessToolsAbsent(effective);
+    }
+
+    @Test
+    void skillsDisabledExplicitEmptyBindingDoesNotInheritBusinessToolsOrMcp() {
+        seedMcpServerWithOneTool(8_888_668L, "issue664-empty", "search");
+        setSkillsDisabledFlag(true);
+        bindingService.bindTool(agentId, "disabled_binding_probe");
+        jdbcTemplate.update("UPDATE mate_agent_tool SET enabled = FALSE WHERE agent_id = ?", agentId);
+        assertEquals(Set.of(), bindingService.getBoundToolNames(agentId));
+
+        Set<String> effective = bindingService.getEffectiveToolNames(agentId);
+        assertScopedInternalTools(effective);
+        assertUncheckedBusinessToolsAbsent(effective);
+        assertFalse(effective.contains("disabled_binding_probe"));
+        assertFalse(effective.stream().anyMatch(name -> name.startsWith("mcp_")));
+    }
+
+    @Test
+    void skillsDisabledExplicitBuiltinSelectionIsPreservedWithoutMcpAutoJoin() {
+        seedBuiltinTool("web_search");
+        seedMcpServerWithOneTool(8_888_669L, "issue664-mixed", "search");
+        seedMcpServerWithOneTool(8_888_670L, "issue664-unselected", "search");
+        String selected = mcpToolNameForServer(8_888_669L);
+        assertNotNull(selected);
+        setSkillsDisabledFlag(true);
+        bindingService.setToolBindings(agentId, List.of(selected, "web_search"));
+
+        Set<String> effective = bindingService.getEffectiveToolNames(agentId);
+        assertTrue(effective.containsAll(Set.of(selected, "web_search")));
+        assertFalse(effective.contains(mcpToolNameForServer(8_888_670L)));
+        assertFalse(effective.contains("browser_use"));
+        assertFalse(effective.contains("execute_shell_command"));
+        assertScopedInternalTools(effective);
+    }
+
+    @Test
+    void skillsDisabledBuiltinOnlySelectionDoesNotAutoJoinMcp() {
+        seedBuiltinTool("builtin_only_probe");
+        seedMcpServerWithOneTool(8_888_671L, "issue664-builtin-only", "search");
+        setSkillsDisabledFlag(true);
+        bindingService.setToolBindings(agentId, List.of("builtin_only_probe"));
+
+        Set<String> effective = bindingService.getEffectiveToolNames(agentId);
+        assertTrue(effective.contains("builtin_only_probe"));
+        assertScopedInternalTools(effective);
+        assertUncheckedBusinessToolsAbsent(effective);
+        assertFalse(effective.stream().anyMatch(name -> name.startsWith("mcp_")));
+    }
+
+    private void assertScopedInternalTools(Set<String> effective) {
+        assertNotNull(effective);
+        assertTrue(effective.containsAll(Set.of("read_file", "record_lesson", "get_progress",
+                "getManagedGoalJsonSlots", "publishManagedGoalJson", "checkManagedGoalJson",
+                "enable_tool", "tool_search", "tool_describe", "tool_call")));
+    }
+
+    private void assertUncheckedBusinessToolsAbsent(Set<String> effective) {
+        for (String name : Set.of("web_search", "browser_use", "execute_code", "execute_shell_command",
+                "delegateToAgent", "delegateParallel", "delegateAsync", "taskOutput", "listAvailableAgents",
+                "write_file", "append_file", "edit_file", "send_file", "renderDocx", "image_generate",
+                "wiki_create_page", "load_skill", "runSkillScript", "listAvailableSkills")) {
+            assertFalse(effective.contains(name), "Unchecked capability must not be exposed: " + name);
+        }
+    }
+
     /** Picker name the UI would save for the (only) MCP tool of {@code serverId}. */
     private String mcpToolNameForServer(long serverId) {
         return availableToolService.listAvailable().stream()
@@ -507,7 +628,7 @@ class AgentBindingServiceTest {
     }
 
     @Test
-    @DisplayName("issue #184 matrix (T,F,*,>0): skillsDisabled + 显式 tool 绑定 → 仅这些 tool + SYSTEM + MCP-rule")
+    @DisplayName("issue #184 matrix (T,F,*,>0): skillsDisabled + 显式 tool 绑定 → 仅这些 tool + minimal internal + read_file")
     void skillsDisabledWithToolBindingsScopesToTools() {
         seedBuiltinTool("scoped_tool_probe");
         setSkillsDisabledFlag(true);
@@ -533,7 +654,10 @@ class AgentBindingServiceTest {
 
         Set<String> effective = bindingService.getEffectiveToolNames(agentId);
         assertNotNull(effective, "toolsDisabled=true 时绝不能返回 null（那会让全局默认工具又流回来）");
+        assertTrue(effective.contains("get_progress"), "own-conversation recovery stays reachable with tools disabled");
         assertTrue(effective.contains("record_lesson"), "system-level memory 工具必须保留");
+        assertTrue(effective.containsAll(Set.of("getManagedGoalJsonSlots", "publishManagedGoalJson", "checkManagedGoalJson")),
+                "选中的 JSON 要求不能因业务技能绑定失去受管发布和检查入口");
         boolean hasMcp = effective.stream().anyMatch(n -> n != null && n.startsWith("mcp_"));
         assertFalse(hasMcp,
                 "toolsDisabled=true 时 enabled MCP 工具绝不能自动并入 —— 否则用户的 '禁用所有工具' 意图被违背。"
@@ -572,12 +696,13 @@ class AgentBindingServiceTest {
         assertTrue(effective.contains("record_lesson"), "system-level 必须保留");
         boolean hasMcp = effective.stream().anyMatch(n -> n != null && n.startsWith("mcp_"));
         assertFalse(hasMcp, "两 flag 全开时 MCP 必须完全隐藏");
-        // Sanity: the set should be roughly the SYSTEM_LEVEL_TOOLS list —
-        // we don't enforce equality (the constant evolves) but it should be
-        // substantially smaller than the catalog of every enabled tool.
-        assertTrue(effective.size() < 100,
-                "两 flag 全开时返回的应该只是 system-level 内核工具，体积明显小于完整默认集。"
-                        + "实际大小: " + effective.size());
+        for (String name : Set.of("execute_code", "execute_shell_command", "read_file", "append_file",
+                "write_file", "edit_file", "web_search", "browser_use", "delegateToAgent", "delegateAsync",
+                "renderDocx", "image_generate", "wiki_create_page")) {
+            assertFalse(effective.contains(name), "Explicit opt-out must not restore " + name);
+        }
+        assertFalse(effective.contains("load_skill"));
+        assertFalse(effective.contains("runSkillScript"));
     }
 
     @Test

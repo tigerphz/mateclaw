@@ -1,5 +1,8 @@
 # Quick Start
 
+3.1.0 stable release · **2026-11-19**: lesson withdrawal and restore previews, precise memory editing, chat status, and execution/channel reliability. See [Releases](https://github.com/mateaix/mateclaw/releases) for packages and read the [upgrade guidance](./changelog#upgrade-and-validation).
+
+
 Sixty seconds to first message. **One path. Desktop app.**
 
 If you want Docker or local development instead, those live in [Configuration](./config) and [Contributing](./contributing). This page does one thing only — get you from zero to a working agent as fast as humanly possible.
@@ -8,11 +11,11 @@ If you want Docker or local development instead, those live in [Configuration](.
 
 ## 1. Download
 
-Grab the latest installer from [GitHub Releases](https://github.com/mateaix/mateclaw/releases).
+Download a published installer from [GitHub Releases](https://github.com/mateaix/mateclaw/releases). Available platforms and filenames depend on that release's actual assets.
 
 - **Windows** — `MateClaw-Setup-x.y.z.exe`
 - **macOS** — `MateClaw-x.y.z.dmg`
-- **Linux** — `MateClaw-x.y.z.AppImage`
+- **Linux** — `MateClaw-x.y.z.AppImage` (when provided by that release)
 
 No Java install. No Node install. No Maven. The desktop app bundles JRE 21 and the server JAR.
 
@@ -78,7 +81,7 @@ First run should Just Work. If it didn't:
 ## Other ways to run MateClaw
 
 - **Docker** — `cp .env.example .env`, set the passwords, then `docker compose up -d --build`. Full prerequisites, Maven mirror selection (China vs US), browser-tool self-check, and upgrade flow live in [Docker Deployment](./docker-deploy).
-- **From source** — `mvn spring-boot:run` in `mateclaw-server/` and `pnpm dev` in `mateclaw-ui/`. See [Contributing](./contributing).
+- **From source** — start the backend from the repository root with explicit root `data/` database/workspace paths, and run `npm run dev -- --host 127.0.0.1` in `mateclaw-ui/`. See [Contributing](./contributing).
 - **Desktop internals** — packaging, code signing, auto-update. See [Desktop App](./desktop).
 
 ---

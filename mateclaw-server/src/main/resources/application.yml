@@ -4,6 +4,11 @@ server:
     context-path: /
 
 spring:
+  http:
+    converters:
+      preferred-json-mapper: jackson2
+  application:
+    name: mateclaw-server
   messages:
     basename: messages
     encoding: UTF-8
@@ -14,6 +19,8 @@ spring:
   threads:
     virtual:
       enabled: true
+  profiles:
+    active: dev
 
   # 数据源（默认 H2，生产切换为 mysql 或 kingbase profile）
   datasource:
@@ -63,16 +70,7 @@ spring:
       enabled: ${H2_CONSOLE_ENABLED:false}
       path: /h2-console
 
-  # Spring AI Alibaba (DashScope) — Spring AI Alibaba 1.1.x configuration path.
-  #
-  # The api-key here is only consumed by Spring AI Alibaba's auto-configured beans
-  # as a *fallback*. The real source of truth for every provider/key/model is the
-  # admin UI ("Settings → Models", persisted in mate_model_provider /
-  # mate_model_config); AgentDashScopeChatModelBuilder resolves the key per-request
-  # from the provider row first, only falling back to this property when the row
-  # is incomplete. The placeholder default keeps DashScopeChatAutoConfiguration
-  # happy at startup when no env var is set (Docker / fresh install) — leave it
-  # alone unless you know what you're doing.
+  # Native provider fallback; persisted provider/model settings take precedence.
   ai:
     dashscope:
       api-key: ${DASHSCOPE_API_KEY:configure-in-admin-ui}
@@ -109,7 +107,9 @@ spring:
 mybatis-plus:
   configuration:
     map-underscore-to-camel-case: true
-    log-impl: org.apache.ibatis.logging.slf4j.Slf4jImpl
+    # SQL parameter values can contain prompts/model thinking. Keep them out of
+    # logs by default; operators may explicitly opt in for short-lived diagnosis.
+    log-impl: ${MATECLAW_MYBATIS_LOG_IMPL:org.apache.ibatis.logging.nologging.NoLoggingImpl}
 
 # SpringDoc OpenAPI
 # 注意：/swagger-ui*、/v3/api-docs*、/webjars/** 落在 SecurityConfig 的
@@ -125,6 +125,49 @@ springdoc:
 
 # MateClaw 自定义配置
 mateclaw:
+  execution-evidence:
+    # Observe receipts only. Enforcement requires managed verification scopes and is not available yet.
+    mode: observe
+    # On-demand detail probe only; matching bytes remain UNKNOWN without managed scopes. 0 disables.
+    artifact-version-check-max-bytes: 1048576
+    retention-days: 90
+    max-summary-bytes: 2048
+    max-observations: 32
+    default-list-limit: 20
+    max-list-limit: 100
+    cleanup-interval-ms: 60000
+    cleanup-max-batches: 10
+  a2a:
+    enabled: ${MATECLAW_A2A_ENABLED:false}
+    # Public base URL for Agent Cards. Production deployments should set this
+    # explicitly so peers do not depend on proxy-derived request headers.
+    base-url: ${MATECLAW_A2A_BASE_URL:}
+    call-timeout-ms: ${MATECLAW_A2A_CALL_TIMEOUT_MS:120000}
+    max-tasks: ${MATECLAW_A2A_MAX_TASKS:1000}
+    task-ttl-seconds: ${MATECLAW_A2A_TASK_TTL_SECONDS:3600}
+    max-response-bytes: ${MATECLAW_A2A_MAX_RESPONSE_BYTES:1048576}
+    outbound-timeout-ms: ${MATECLAW_A2A_OUTBOUND_TIMEOUT_MS:120000}
+    allow-private-outbound: ${MATECLAW_A2A_ALLOW_PRIVATE_OUTBOUND:false}
+    sweep-interval-ms: ${MATECLAW_A2A_SWEEP_INTERVAL_MS:60000}
+
+  # DeepSeek Harness runtime. The executable and Cordis composition are kept
+  # outside the Spring classpath and can be supplied by environment variables.
+  agent:
+    runtime:
+        dsh:
+          containment:
+            mode: ${MATECLAW_DSH_CONTAINMENT_MODE:native}
+            docker-executable: ${MATECLAW_DSH_DOCKER_EXECUTABLE:docker}
+            images-json: ${MATECLAW_DSH_DOCKER_IMAGES_JSON:}
+          command: ${DSH_JSONRPC_AGENT:}
+          cordis-config: ${DSH_CORDIS_CONFIG:}
+          working-directory: ${DSH_CWD:}
+          base-url: ${DEEPSEEK_BASE_URL:}
+          model-name: ${DEEPSEEK_MODEL:}
+          api-key: ${DEEPSEEK_API_KEY:}
+          manifest-url: ${DSH_MANIFEST_URL:}
+          github-release-url: ${DSH_GITHUB_RELEASE_URL:https://api.github.com/repos/deepseek-ai/deepseek-harness/releases/latest}
+          install-root: ${DSH_INSTALL_ROOT:${user.home}/.mateclaw/runtimes/deepseek-harness}
   server:
     # Public base URL used to build absolute download links for tool-generated
     # files (e.g. https://mateclaw.example.com). Leave empty to fall back to the
@@ -147,7 +190,7 @@ mateclaw:
     # 生产数据库 profile（mysql/kingbase/postgres）默认覆盖为 false。
     expose-ui: ${MATECLAW_OPENAPI_EXPOSE_UI:true}
   jwt:
-    secret: ${JWT_SECRET:MateClaw-JWT-Secret-Key-2024-Please-Change-In-Production}
+    secret: ${JWT_SECRET:}
     expiration: 86400000
   sso:
     # 全局开关（默认关闭，不影响现有部署）
@@ -170,12 +213,16 @@ mateclaw:
     enabled: true
   tools:
     disclosure:
-      # progressive: extension-tier tools are hidden behind the extension-tools
-      #   catalog until the model calls enable_tool. By default that's the heavy
-      #   generative / browser tools; MCP servers default to core (visible) and
-      #   an admin can move a noisy one to extension per server.
+      # progressive: deferred schemas stay behind tool_search/tool_describe and
+      #   execute through tool_call in the same action round. enable_tool remains
+      #   available only for backwards compatibility with older conversations.
       # legacy: advertise every bound tool up front (pre-disclosure behavior).
       mode: ${MATECLAW_TOOLS_DISCLOSURE_MODE:progressive}
+  context:
+    prefix-budget:
+      # Ratio remains useful for small contexts; this hard ceiling is what keeps
+      # a provider-declared 1M window from advertising ~30k schema tokens forever.
+      tool-schema-max-tokens: ${MATECLAW_TOOL_SCHEMA_MAX_TOKENS:4000}
   workspace:
     sandbox:
       # Global fallback filesystem boundary for file/shell tools. When a
@@ -201,6 +248,73 @@ mateclaw:
       # server's local date (a UTC container groups by UTC days).
       date-folders: ${MATECLAW_CHAT_UPLOAD_DATE_FOLDERS:true}
   skill:
+    reflection:
+      # Out-of-band skill reflection: after a conversation reaches the cadence
+      # below, an async reviewer reads the recent window and creates or
+      # improves skills through the same skill_manage pipeline the agent uses.
+      # Runs off the request thread, so it never consumes the live turn's
+      # context window.
+      # Explicit opt-in: transcript/catalog content may be sent to the selected
+      # model provider. auto-apply is a second, independent mutation gate.
+      enabled: ${MATECLAW_SKILL_REFLECTION_ENABLED:false}
+      auto-apply: ${MATECLAW_SKILL_REFLECTION_AUTO_APPLY:false}
+      # Review once this many new messages have accumulated since the last
+      # attempt. 0 disables the cadence gate entirely.
+      review-turn-interval: ${MATECLAW_SKILL_REFLECTION_TURN_INTERVAL:8}
+      # Substance floor — a window with fewer assistant turns than this rarely
+      # contains a reusable workflow, so the review is skipped before any LLM
+      # call is made.
+      min-assistant-turns: ${MATECLAW_SKILL_REFLECTION_MIN_ASSISTANT_TURNS:2}
+      # Most recent messages handed to the reviewer.
+      max-messages: ${MATECLAW_SKILL_REFLECTION_MAX_MESSAGES:24}
+      # Per-conversation cooldown between reviews, in minutes. Applies on top
+      # of the cadence gate, so a busy conversation reviews at most this often.
+      cooldown-minutes: ${MATECLAW_SKILL_REFLECTION_COOLDOWN_MINUTES:30}
+      # Hard cap on create/edit/patch actions applied by a single review.
+      max-actions-per-run: ${MATECLAW_SKILL_REFLECTION_MAX_ACTIONS:3}
+      # Character budget for the existing-skill catalog shown to the reviewer.
+      # Skill bodies are truncated to fit; the reviewer is told not to target
+      # truncated text with a patch.
+      catalog-char-budget: ${MATECLAW_SKILL_REFLECTION_CATALOG_BUDGET:8000}
+      # Reviewer model id. Empty follows the system default model.
+      model-id: ${MATECLAW_SKILL_REFLECTION_MODEL_ID:}
+    routine:
+      # Routine mining: a nightly cross-session pass that clusters the opening
+      # request of recent conversations and promotes the ones the user makes
+      # habitually into class-level skills. Recurrence is invisible to the
+      # per-conversation reflection reviewer above — inside one window a weekly
+      # request is indistinguishable from a one-off — so this pass supplies the
+      # cross-session evidence that reviewer structurally cannot see.
+      # Explicit opt-in because mining persists conversation-derived patterns
+      # and promotion sends evidence to the selected model provider.
+      enabled: ${MATECLAW_SKILL_ROUTINE_ENABLED:false}
+      cron: ${MATECLAW_SKILL_ROUTINE_CRON:0 0 3 * * *}
+      # How far back each sweep looks. A routine the user stops doing decays
+      # out of this window on its own.
+      lookback-days: ${MATECLAW_SKILL_ROUTINE_LOOKBACK_DAYS:30}
+      # Shingle-similarity above which two openers count as the same request.
+      # Tuned toward precision — a false merge invents a routine the user does
+      # not have, which is worse than missing one until the next sweep.
+      similarity-threshold: ${MATECLAW_SKILL_ROUTINE_SIMILARITY:0.62}
+      # Promotion gate. Both must hold: occurrences proves repetition, distinct
+      # days proves habit rather than one afternoon of retries.
+      min-occurrences: ${MATECLAW_SKILL_ROUTINE_MIN_OCCURRENCES:3}
+      min-distinct-days: ${MATECLAW_SKILL_ROUTINE_MIN_DISTINCT_DAYS:3}
+      # Shortest opener worth clustering, and the prefix length fed to the
+      # shingler.
+      min-opener-chars: ${MATECLAW_SKILL_ROUTINE_MIN_OPENER_CHARS:8}
+      max-opener-chars: ${MATECLAW_SKILL_ROUTINE_MAX_OPENER_CHARS:400}
+      # Conversation ids retained per candidate as promotion evidence.
+      max-samples-per-candidate: ${MATECLAW_SKILL_ROUTINE_MAX_SAMPLES:8}
+      # Candidates promoted per sweep, bounding LLM cost per run.
+      max-promotions-per-run: ${MATECLAW_SKILL_ROUTINE_MAX_PROMOTIONS:2}
+      # Conversations scanned per sweep, bounding query and memory cost.
+      max-conversations-per-run: ${MATECLAW_SKILL_ROUTINE_MAX_CONVERSATIONS:1000}
+      # Transcript shaping for the synthesis prompt.
+      transcript-messages-per-sample: ${MATECLAW_SKILL_ROUTINE_TRANSCRIPT_MESSAGES:12}
+      transcript-truncate-chars: ${MATECLAW_SKILL_ROUTINE_TRANSCRIPT_TRUNCATE:800}
+      # Synthesis model id. Empty follows the system default model.
+      model-id: ${MATECLAW_SKILL_ROUTINE_MODEL_ID:}
     upload:
       # Size caps for skill bundle ZIPs (upload endpoint and marketplace
       # install). The archive is buffered in memory during extraction, so
@@ -213,7 +327,7 @@ mateclaw:
       # relocate it onto a persistent volume — in Docker this is pointed at
       # /app/data/skills so the existing server_data volume persists installed
       # skills, accumulated LESSONS.md, and skill runtime files across restarts.
-      root: ${MATECLAW_SKILL_WORKSPACE_ROOT:./.mateclaw/skills}
+      root: ${MATECLAW_SKILL_WORKSPACE_ROOT:${user.home}/.mateclaw/skills}
       auto-init: true
       delete-policy: archive
     disclosure:
@@ -227,10 +341,19 @@ mateclaw:
       cron: "0 0 2 * * *"         # daily 02:00 — staggered away from wiki / backup jobs
       stale-after-days: 30
       archive-after-days: 90
+      # AGENT_CREATED scopes the sweep to skills written autonomously
+      # (origin=agent|routine). Skills a user asked for in a conversation are
+      # stamped origin=user and are never aged out under this scope.
       scope: AGENT_CREATED         # AGENT_CREATED | ALL_DYNAMIC | OFF
       protect-prefixes:
         - "sys-"
         - "ops-"
+      # Restore point captured before every mutating sweep. The sweep archives
+      # skills and, with consolidation on, rewrites their bodies — unattended
+      # and overnight, so a bad pass is usually noticed long after it ran.
+      # Disabling this makes those changes one-way.
+      backup-enabled: ${MATECLAW_SKILL_CURATOR_BACKUP_ENABLED:true}
+      backup-keep: ${MATECLAW_SKILL_CURATOR_BACKUP_KEEP:5}
     hub:
       base-url: https://clawhub.ai
       search-path: /api/v1/search
@@ -240,7 +363,7 @@ mateclaw:
       http-retries: 3
   plugin:
     enabled: true
-    user-dir: ./.mateclaw/plugins
+    user-dir: ${user.home}/.mateclaw/plugins
   # RFC-017: 声明式 Hook 系统
   hooks:
     enabled: true
@@ -281,6 +404,9 @@ mateclaw:
         enabled: true
         failure-threshold: 3
         cooldown-ms: 300000
+        # Shared by agent conversations and fallback models of the same provider.
+        max-concurrent-requests: ${MATECLAW_LLM_MAX_CONCURRENT_REQUESTS:1}
+        admission-timeout-ms: ${MATECLAW_LLM_ADMISSION_TIMEOUT_MS:120000}
   # Multi-agent delegation (DelegateAgentTool).
   delegation:
     # Wall-clock budget for one delegateParallel batch (shared across all
@@ -289,9 +415,25 @@ mateclaw:
     # models (Kimi / GLM / MiniMax) routinely take 90–290 s per LLM turn
     # when the child must produce multi-section structured output.
     parallel-timeout-seconds: 300
+    # Default wall-clock budget for detached delegateAsync children. A caller
+    # may request a different positive timeout up to 86400 seconds; keeping a
+    # default bound prevents abandoned background children from running forever.
+    async-timeout-seconds: 3600
 
 # MateClaw Agent 配置
 mate:
+  decision:
+    mode: SHADOW
+    scenarios: {}
+    provider: rule
+    confidence-threshold: 0.8
+    timeout-ms: 250
+    provider-threads: 4
+    shadow-threads: 2
+    queue-capacity: 64
+    retention-days: 30
+    retention-batch-size: 500
+    retention-interval-ms: 3600000
   channel:
     # 入站消息去重：IM 平台在 ack 迟到 / 丢失 / 非 200 时会重投同一条消息，
     # 不去重则每次重投都会跑一轮完整 Agent 回合，用户看到重复答复。
@@ -305,6 +447,13 @@ mate:
     # ---, table pipe alignment) before persistence / channel delivery. Set to
     # false to pass model output through verbatim.
     markdown-normalize-enabled: true
+    reasoning:
+      # How much of a turn's reasoning reaches the message record.
+      #   all      — every iteration's reasoning, kept where it happened. The
+      #              reasoning behind each tool call is what a replay needs.
+      #   terminal — only the iteration that produced the final answer. Smaller
+      #              rows, but a long tool loop persists as a bare conclusion.
+      retention: all
     graph:
       observation:
         # 与 GraphObservationProperties.java 默认值对齐，参考 openclaw token-budget 设计
@@ -317,6 +466,13 @@ mate:
     tool:
       timeout:
         default-timeout-seconds: 300
+        # Per-tool overrides use registered names, e.g. sendToSubagent, not
+        # model-emitted aliases such as send_to_subagent. For long child follow-ups:
+        # per-tool:
+        #   sendToSubagent: 900
+        # Plan steps retain a separate 600s wall-clock budget.
+        # delegateParallel also has mateclaw.delegation.parallel-timeout-seconds;
+        # its outer tool timeout must allow enough time for that batch to finish.
         per-category:
           shell: 120
           web: 30
@@ -389,6 +545,10 @@ mate:
     soul-update-interval: 20                   # 20 writes trigger one SOUL.md LLM update (0 = off)
     provider-retry-attempts: 1                 # 1 = no retry (enable when external providers added)
     provider-metrics-enabled: false            # actuator dependency now present; enable when external providers added
+    provider-prefetch-timeout-ms: 1500          # per-provider recall deadline; 0 = unlimited
+    provider-prefetch-total-budget-ms: 2500     # deadline for the complete recall chain; 0 = unlimited
+    provider-circuit-failure-threshold: 3       # consecutive recall failures before opening the circuit
+    provider-circuit-cooldown-seconds: 30       # open-circuit delay before one half-open probe
     # Phase 3: fact projection
     fact:
       projection-enabled: true

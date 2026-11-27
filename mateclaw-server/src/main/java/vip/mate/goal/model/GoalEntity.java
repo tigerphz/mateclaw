@@ -53,11 +53,17 @@ public class GoalEntity {
     /** Long-form objective. Always non-null but may be short. */
     private String description;
 
+    /** Advances on evaluation-definition edits, independently of optimistic-lock/usage version. */
+    private long evaluationRevision;
+
+    /** User-selected managed JSON acceptance; never falls back to semantic completion. */
+    private boolean jsonAcceptanceRequired;
+
     /** LLM-readable exit criteria; evaluator scores against this. Nullable. */
     @TableField(value = "exit_criteria", updateStrategy = FieldStrategy.ALWAYS)
     private String exitCriteria;
 
-    /** Optional per-goal evaluator prompt override; nullable -> default. */
+    /** Optional evaluation guidance; does not replace platform evidence/output rules. */
     @TableField(value = "success_check_prompt", updateStrategy = FieldStrategy.ALWAYS)
     private String successCheckPrompt;
 
@@ -67,7 +73,10 @@ public class GoalEntity {
      */
     private GoalStatus status;
 
-    /** Maximum evaluation turns before exhaustion. */
+    /** Opts into durable continuation; zero budgets mean unlimited only in this mode. */
+    private Boolean persistentExecution;
+
+    /** Maximum evaluation turns; zero is unlimited only for persistent execution. */
     private Integer turnBudget;
 
     /** Cumulative turns evaluated; bumped by GoalEvaluationNode. */
@@ -126,6 +135,8 @@ public class GoalEntity {
     public int totalLlmCallsUsed() {
         int a = agentLlmCallsUsed != null ? agentLlmCallsUsed : 0;
         int e = evalLlmCallsUsed != null ? evalLlmCallsUsed : 0;
-        return a + e;
+        // A wrapped negative count would make an exhausted finite budget look unused.
+        // Keep the existing int API while saturating only at its representable maximum.
+        return (int) Math.min(Integer.MAX_VALUE, (long) a + e);
     }
 }

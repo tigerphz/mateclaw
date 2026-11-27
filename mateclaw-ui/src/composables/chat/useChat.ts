@@ -13,6 +13,8 @@ import { ref, computed } from 'vue'
 import { useMessages } from './useMessages'
 import { useStream } from './useStream'
 import { useMessageQueue } from './useMessageQueue'
+import { supersedesProvisionalNarration, markSuperseded } from './supersede'
+import { stripCompletedPlanStepOutput } from './planStepOutput'
 import { useGoalStore } from '@/stores/useGoalStore'
 import { useSystemSettingsStore } from '@/stores/useSystemSettingsStore'
 import { storeToRefs } from 'pinia'
@@ -95,12 +97,14 @@ export interface UseChatOptions {
    * The caller should perform history reconcile / persistence in this callback.
    */
   onStreamEnd?: (meta: StreamEndMeta) => void
+  /** A legacy queued message was saved as text but needs a fresh request. */
+  onQueuedInputSkipped?: (reason: string) => void
 }
 
 /** Metadata emitted when a stream ends */
 export interface StreamEndMeta {
   conversationId: string
-  reason: 'completed' | 'stopped' | 'interrupted' | 'failed' | 'error' | 'awaiting_approval'
+  reason: 'completed' | 'incomplete' | 'stopped' | 'interrupted' | 'failed' | 'error' | 'awaiting_approval'
   /** Backend-persisted assistant message ID, if available */
   assistantMessageId?: number
   /** Whether the backend has already persisted the message */
@@ -189,14 +193,36 @@ export interface SendMessageOptions {
    * row is inserted and `content` is ignored server-side.
    */
   regenerate?: boolean
+  /** Exact approval selected by the user when several pendings coexist. */
+  pendingApprovalId?: string
+}
+
+export function buildChatStreamRequestBody(content: string, options: SendMessageOptions): Record<string, any> {
+  const body: Record<string, any> = {
+    agentId: String(options.agentId),
+    message: content,
+    conversationId: options.conversationId,
+    contentParts: options.contentParts || [],
+  }
+  if (options.thinkingLevel) {
+    body.thinkingLevel = options.thinkingLevel
+  }
+  if (options.modelProvider && options.modelName) {
+    body.modelProvider = options.modelProvider
+    body.modelName = options.modelName
+  }
+  if (options.regenerate) {
+    body.regenerate = true
+  }
+  if (options.pendingApprovalId) {
+    body.pendingApprovalId = options.pendingApprovalId
+  }
+  return body
 }
 
 export function useChat(options: UseChatOptions): UseChatReturn {
-  let { baseUrl, token, onStreamEnd } = options
+  const { baseUrl, token, onStreamEnd, onQueuedInputSkipped } = options
   const thinkingLevelRef = options.thinkingLevel
-
-  const API_PREFIX = import.meta.env.PROD ? '/api-bomclaw' : ''
-  baseUrl = `${baseUrl}${API_PREFIX}`
 
   /**
    * Authenticated fetch wrapper — reads the token from localStorage (consistent with useStream / http.ts).
@@ -236,6 +262,16 @@ export function useChat(options: UseChatOptions): UseChatReturn {
   const genSegId = () => `seg-${Date.now()}-${segIdCounter.value++}`
 
   /**
+   * Tool observations completed so far this turn, and the count each content
+   * segment was opened at. A provisional narration is only replaced once an
+   * observation actually landed after it, so the live collapse needs both the
+   * running total and each span's mark — the same bookkeeping the backend
+   * tracker does. Turn-scoped: reset with the rest of the streaming state.
+   */
+  let observationCount = 0
+  const segmentObservationMark = new Map<string, number>()
+
+  /**
    * Fine-grained lifecycle stage exposed to the UI for the "connecting → started
    * → context_prepared → llm_request_sent → streaming" loading bar. Reset on
    * every new turn; transitions to `streaming` implicitly when the first
@@ -271,6 +307,8 @@ export function useChat(options: UseChatOptions): UseChatReturn {
   function resetCurrentTurnState() {
     currentSegments.value = []
     segIdCounter.value = 0
+    observationCount = 0
+    segmentObservationMark.clear()
     bufferedText = ''
     bufferedThinking = ''
     activeTurnId = `turn-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`
@@ -498,18 +536,19 @@ export function useChat(options: UseChatOptions): UseChatReturn {
         // Close any running thinking segment first
         const thinkingSeg = segs.findLast((s: MessageSegment) => s.type === 'thinking' && s.status === 'running')
         if (thinkingSeg) thinkingSeg.status = 'completed'
+        // The content span that precedes the one about to open — the only
+        // candidate this span can replace.
+        const prevContent = segs.findLast((s: MessageSegment) => s.type === 'content')
         contentSeg = { id: genSegId(), type: 'content', status: 'running', text: '', timestamp: Date.now() }
         applyIterationTags(contentSeg)
-        // Later content supersedes any earlier provisional narration of the
-        // same turn — collapse it in place, live, instead of waiting for the
-        // persisted-metadata annotations in the done payload. Mirrors the
-        // backend tracker's rule for kind-tagged segments.
-        for (const s of segs) {
-          if (s.type === 'content' && s.kind === 'pre_tool_narration' && !s.superseded) {
-            s.superseded = true
-            s.supersededBySegmentId = String(contentSeg.id)
-            s.supersededReason = 'pre_tool_content_replaced_by_post_tool_answer'
-          }
+        segmentObservationMark.set(String(contentSeg.id), observationCount)
+        // Later content supersedes an earlier provisional narration — collapse
+        // it in place, live, instead of waiting for the persisted-metadata
+        // annotations in the done payload. Rule and guards live in
+        // supersede.ts, mirroring the backend tracker.
+        const prevMark = prevContent ? (segmentObservationMark.get(String(prevContent.id)) ?? 0) : 0
+        if (prevContent && supersedesProvisionalNarration(prevContent, observationCount, prevMark)) {
+          markSuperseded(prevContent, String(contentSeg.id))
         }
         segs.push(contentSeg)
         flushSegmentsToMessage() // sync once when a new content segment is created
@@ -614,6 +653,16 @@ export function useChat(options: UseChatOptions): UseChatReturn {
     }
   })
 
+  stream.on('finish_reason', (data) => {
+    if (isStaleEvent(data) || !currentAssistantId.value || typeof data.reason !== 'string') return
+    const message = getMessage(currentAssistantId.value)
+    if (!message) return
+    updateMessage(currentAssistantId.value, {
+      ...message,
+      metadata: { ...parseMetadata(message.metadata), finishReason: data.reason },
+    })
+  })
+
   stream.on('message_complete', (data) => {
     if (isStaleEvent(data)) return
     if (currentAssistantId.value) {
@@ -697,6 +746,9 @@ export function useChat(options: UseChatOptions): UseChatReturn {
     // server-annotation merge below reads metadata.segments.
     if (!streamEnabled.value) revealBufferedTurn()
 
+    const finishReason = typeof data.finishReason === 'string' ? data.finishReason
+      : currentAssistantId.value ? parseMetadata(getMessage(currentAssistantId.value)?.metadata)?.finishReason : undefined
+
     if (currentAssistantId.value) {
       const existingMsg = getMessage(currentAssistantId.value)
       if (existingMsg?.status !== 'failed') {
@@ -714,6 +766,9 @@ export function useChat(options: UseChatOptions): UseChatReturn {
         if (data.reasoningTokens !== undefined) msg.reasoningTokens = data.reasoningTokens
         if (data.runtimeModel) msg.runtimeModel = data.runtimeModel
         if (data.runtimeProvider) msg.runtimeProvider = data.runtimeProvider
+        if (typeof finishReason === 'string') {
+          msg.metadata = { ...parseMetadata(msg.metadata), finishReason }
+        }
         // Replace the local temp ID with the backend-persisted ID so reconcile can match by ID
         if (data.assistantMessageId) {
           msg.id = data.assistantMessageId
@@ -787,13 +842,18 @@ export function useChat(options: UseChatOptions): UseChatReturn {
       currentAssistantId.value = null
     }
 
-    streamPhase.value = data.status === 'awaiting_approval' ? 'awaiting_approval'
+    streamPhase.value = errorFired ? 'idle'
+      : data.status === 'awaiting_approval' ? 'awaiting_approval'
       : data.status === 'stopped' ? 'stopped' : 'completed'
     if (data.status !== 'awaiting_approval') {
       phaseInfo.value = null
       compactStatus.value = null
       lifecycleStage.value = null
-      expirePendingApprovals(data.status === 'stopped' ? 'stopped' : 'completed')
+      // An error may be followed by a protocol-level done event. Its status
+      // does not resolve an approval or turn the failed request into success.
+      if (!errorFired) {
+        expirePendingApprovals(data.status === 'stopped' ? 'stopped' : 'completed')
+      }
     }
 
     // Safety cleanup for queue state (no-op if queued_input_started already handled it)
@@ -808,14 +868,17 @@ export function useChat(options: UseChatOptions): UseChatReturn {
     const reason = data.status === 'stopped' ? 'stopped'
       : data.status === 'interrupted' ? 'interrupted'
       : data.status === 'awaiting_approval' ? 'awaiting_approval'
+      : finishReason === 'incomplete' ? 'incomplete'
       : 'completed'
-    onStreamEnd?.({
-      conversationId: data.conversationId || streamConversationId,
-      reason,
-      assistantMessageId: data.assistantMessageId,
-      persisted: data.persisted,
-      messageCount: data.messageCount,
-    })
+    if (!errorFired) {
+      onStreamEnd?.({
+        conversationId: data.conversationId || streamConversationId,
+        reason,
+        assistantMessageId: data.assistantMessageId,
+        persisted: data.persisted,
+        messageCount: data.messageCount,
+      })
+    }
 
     // Re-attach SSE if any generative task is still in flight, so the eventual
     // async_task_completed event reaches us live (otherwise the user has to
@@ -824,7 +887,7 @@ export function useChat(options: UseChatOptions): UseChatReturn {
     const reconnectableStatus = !data.status
       || data.status === 'completed'
       || data.status === 'idle'
-    if (reconnectableStatus
+    if (!errorFired && reconnectableStatus
         && !reconnectingForAsyncTasks
         && pendingAsyncTaskIds.size > 0
         && streamConversationId) {
@@ -881,7 +944,8 @@ export function useChat(options: UseChatOptions): UseChatReturn {
     lifecycleStage.value = null
     // Clear queue on error to avoid stale state
     messageQueue.clear()
-    expirePendingApprovals('failed')
+    // The approval may still be pending after a rejected request. The view
+    // reconciles it against the server's pending list in onStreamEnd.
 
     if (errorFired) return
     errorFired = true
@@ -940,6 +1004,11 @@ export function useChat(options: UseChatOptions): UseChatReturn {
   // Body of tool_call_completed — see handleToolCallStarted.
   function handleToolCallCompleted(data: any) {
     if (isStaleEvent(data)) return
+    // Counted regardless of success: a failed tool still produces an
+    // observation, and the content written after it is grounded in that
+    // failure. Counted before the segment work below so a content span opened
+    // later in this turn sees the higher mark.
+    observationCount++
     if (currentAssistantId.value) {
       const msg = getMessage(currentAssistantId.value)
       if (msg) {
@@ -948,15 +1017,16 @@ export function useChat(options: UseChatOptions): UseChatReturn {
         // Match by toolCallId when available, fall back to "first running" for legacy events.
         let target = -1
         if (data.toolCallId) {
-          target = toolCalls.findIndex((tc: any) => tc.toolCallId === data.toolCallId && tc.status === 'running')
+          target = toolCalls.findIndex((tc: any) => tc.toolCallId === data.toolCallId)
         }
-        if (target < 0) {
+        if (!data.toolCallId) {
           target = toolCalls.findIndex((tc: any) => tc.status === 'running' && tc.name === data.toolName)
         }
         if (target >= 0) {
           toolCalls[target] = {
             ...toolCalls[target],
             result: data.result,
+            structuredContent: data.structuredContent,
             success: data.success,
             status: 'completed'
           }
@@ -978,20 +1048,21 @@ export function useChat(options: UseChatOptions): UseChatReturn {
           metadata: { ...metadata, toolCalls, runningToolName: undefined, generatedFiles }
         } as any)
       }
-      // Segments: prefer toolCallId match, fall back to first-running by toolName.
+      // Explicit IDs also match replayed completions; only ID-less events use the running-name fallback.
       const segs = currentSegments.value
       let toolSeg: MessageSegment | undefined
       if (data.toolCallId) {
         toolSeg = segs.find((s: MessageSegment) =>
-          s.type === 'tool_call' && s.status === 'running' && s.toolCallId === data.toolCallId)
+          s.type === 'tool_call' && s.toolCallId === data.toolCallId)
       }
-      if (!toolSeg) {
+      if (!data.toolCallId) {
         toolSeg = segs.find((s: MessageSegment) =>
           s.type === 'tool_call' && s.status === 'running' && s.toolName === data.toolName)
       }
       if (toolSeg) {
         toolSeg.status = data.success !== false ? 'completed' : 'error'
         toolSeg.toolResult = data.result
+        toolSeg.structuredContent = data.structuredContent
         toolSeg.toolSuccess = data.success
       }
       flushSegmentsToMessage()
@@ -1556,11 +1627,27 @@ export function useChat(options: UseChatOptions): UseChatReturn {
           const plan = { ...metadata.plan }
           const stepResults = [...(plan.stepResults || [])]
           stepResults[data.index] = { result: data.result, status: 'completed' }
+
+          // Step output is progress, not the turn's canonical answer. It is now
+          // durable and inspectable in PlanStepsPanel, so remove its live text
+          // from the main assistant body before the next step/final summary
+          // starts. Otherwise StepExecution + PlanSummary concatenate into
+          // "answeranswer" (and non-streamed mode reveals the same duplicate at
+          // done). Thinking/tool/delegation segments remain intact.
+          bufferedText = ''
+          const stripped = stripCompletedPlanStepOutput(
+            currentSegments.value,
+            msg.contentParts || [],
+          )
+          currentSegments.value = stripped.segments
           updateMessage(currentAssistantId.value, {
             ...msg,
+            content: '',
+            contentParts: stripped.contentParts,
             metadata: {
               ...metadata,
-              plan: { ...plan, stepResults }
+              plan: { ...plan, stepResults },
+              segments: [...currentSegments.value],
             }
           } as any)
         }
@@ -1779,6 +1866,19 @@ export function useChat(options: UseChatOptions): UseChatReturn {
     lifecycleStage.value = { stage: 'connecting', since: Date.now() }
   })
 
+  stream.on('queued_input_skipped', (data) => {
+    if (isStaleEvent(data)) return
+    // The server saved this legacy queued input as user text without running
+    // it. Remove only that queue entry; later queued inputs may still run.
+    const queued = messageQueue.dequeue()
+    const content = data.message || queued?.content || ''
+    if (content) {
+      createUserMessage(content, queued?.contentParts, data.conversationId || streamConversationId)
+    }
+    streamPhase.value = messageQueue.hasQueued.value ? 'queued' : 'idle'
+    onQueuedInputSkipped?.(data.reason || '')
+  })
+
   // ===== Async task completion events (video / image / music generation) =====
   stream.on('async_task_completed', (data) => {
     if (isStaleEvent(data)) return
@@ -1994,24 +2094,7 @@ export function useChat(options: UseChatOptions): UseChatReturn {
       currentAssistantId.value = assistantMessage.id as string
 
       // contentParts already includes file entries from buildOutgoingParts — do not re-merge attachments
-      const body: Record<string, any> = {
-        agentId,
-        message: content,
-        conversationId,
-        contentParts,
-      }
-      if (options.thinkingLevel) {
-        body.thinkingLevel = options.thinkingLevel
-      }
-      // Per-conversation model: the backend pins it onto the conversation row
-      // so switching the model here never leaks into other conversations.
-      if (options.modelProvider && options.modelName) {
-        body.modelProvider = options.modelProvider
-        body.modelName = options.modelName
-      }
-      if (options.regenerate) {
-        body.regenerate = true
-      }
+      const body = buildChatStreamRequestBody(content, { ...options, contentParts })
       await stream.connect(body)
     } catch (e) {
       error.value = e instanceof Error ? e : new Error(String(e))
@@ -2038,7 +2121,7 @@ export function useChat(options: UseChatOptions): UseChatReturn {
         method: 'POST',
         body: JSON.stringify({
           message: content,
-          agentId,
+          agentId: String(agentId),
           contentParts: options.contentParts || [],
         }),
       })
@@ -2105,6 +2188,36 @@ export function useChat(options: UseChatOptions): UseChatReturn {
   // backend to return a 'done' event. This ensures onStreamEnd fires and message/conversation
   // state is updated correctly.
   // A 3-second fallback timeout guards against 'done' never arriving due to network issues.
+  const finalizeStoppedLocally = (convId: string, assistantId: string | null) => {
+    // A fallback from an older turn must never tear down a newer conversation.
+    if (streamConversationId !== convId && streamConversationId) return
+
+    stream.disconnect()
+
+    if (currentAssistantId.value === assistantId && assistantId) {
+      const stoppedAt = Date.now()
+      currentSegments.value.forEach((segment: MessageSegment) => {
+        if (segment.status === 'running') {
+          segment.status = 'completed'
+          segment.endTimestamp ??= stoppedAt
+        }
+      })
+      setMessageStatus(assistantId, 'stopped')
+      // Persist the frozen segment snapshot before dropping the active id;
+      // otherwise thinking/tool/delegation rows keep animating forever.
+      flushSegmentsToMessage(true)
+      currentAssistantId.value = null
+    }
+
+    streamPhase.value = 'stopped'
+    phaseInfo.value = null
+    compactStatus.value = null
+    lifecycleStage.value = null
+    messageQueue.clear()
+    expirePendingApprovals('stopped')
+    onStreamEnd?.({ conversationId: convId, reason: 'stopped' })
+  }
+
   const stopGeneration = async () => {
     // Freeze identifiers and install the fallback timer before any await, so a concurrent
     // resetForNewConversation cannot clear context out from under us.
@@ -2125,8 +2238,10 @@ export function useChat(options: UseChatOptions): UseChatReturn {
     // Cancel queued message first
     messageQueue.clear()
 
-    // Mark as stopped immediately so the UI gives instant feedback
-    streamPhase.value = 'stopped'
+    // Stop is a transition, not an instantaneous terminal state. Keep the
+    // assistant message generating until the server's done envelope arrives,
+    // but expose an explicit phase so the button cannot be clicked repeatedly.
+    streamPhase.value = 'interrupting'
     phaseInfo.value = null
     compactStatus.value = null
 
@@ -2135,18 +2250,7 @@ export function useChat(options: UseChatOptions): UseChatReturn {
     stopFallbackTimer = setTimeout(() => {
       stopFallbackTimer = null
       console.warn('[useChat] Stop fallback: done event not received within 3s, force cleanup')
-      // Only disconnect if the stream still belongs to the old conversation — avoids killing a new session's stream
-      if (streamConversationId === convId || !streamConversationId) {
-        stream.disconnect()
-      }
-      if (currentAssistantId.value === assistantId && assistantId) {
-        setMessageStatus(assistantId, 'stopped')
-        currentAssistantId.value = null
-      }
-      onStreamEnd?.({
-        conversationId: convId,
-        reason: 'stopped',
-      })
+      finalizeStoppedLocally(convId, assistantId)
     }, 3000)
 
     // Cancel the fallback timer when the done/error event arrives
@@ -2159,12 +2263,22 @@ export function useChat(options: UseChatOptions): UseChatReturn {
       unsubscribeError()
     })
 
-    // Send the backend stop request (fire-and-forget, does not block resetForNewConversation)
+    // SSE remains authoritative for final content/status. An HTTP failure
+    // accelerates local cleanup instead of leaving the UI in "interrupting".
     if (convId) {
       fetchWithAuth(`${baseUrl}/api/v1/chat/${convId}/stop`, {
         method: 'POST',
+      }).then(response => {
+        if (!response.ok) throw new Error(`Stop request failed (${response.status})`)
       }).catch(e => {
         console.warn('[useChat] Stop API failed:', e)
+        if (stopFallbackTimer) {
+          clearTimeout(stopFallbackTimer)
+          stopFallbackTimer = setTimeout(() => {
+            stopFallbackTimer = null
+            finalizeStoppedLocally(convId, assistantId)
+          }, 250)
+        }
       })
     }
   }

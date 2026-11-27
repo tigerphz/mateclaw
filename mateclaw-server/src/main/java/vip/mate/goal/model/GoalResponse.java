@@ -30,6 +30,11 @@ public class GoalResponse {
 
     private GoalStatus status;
 
+    private boolean jsonAcceptanceRequired;
+
+    /** Opts into durable continuation; zero budgets mean unlimited only in this mode. */
+    private Boolean persistentExecution;
+
     private Integer turnBudget;
     private Integer turnsUsed;
     private Integer llmCallBudget;

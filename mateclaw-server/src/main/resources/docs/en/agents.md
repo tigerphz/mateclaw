@@ -4,7 +4,7 @@ description: MateClaw's multi-agent system runs in two modes — ReAct for real-
 head:
   - - meta
     - name: keywords
-      content: multi-agent,ReAct,Plan-and-Execute,agent delegation,Spring AI Alibaba,AI agent
+      content: multi-agent,ReAct,Plan-and-Execute,agent delegation,Spring AI,AgentScope,AI agent
 ---
 
 # Multi-Agent Engine
@@ -38,31 +38,81 @@ You can have many employees. Each one is specialized. You give them different jo
 | **Max iterations** | How many reasoning loops are allowed before forced convergence |
 | **Enabled flag** | Off switch |
 
-Notice what's *not* here: the model. A single global default model (set in `Settings → Models`) is used for every agent at runtime. The `model_name` field on the agent row is a legacy artifact — it's ignored. This is intentional: swapping models across your whole deployment is one click, not thirty.
+Models resolve in this order: **conversation pin → agent model override → global default**. A conversation may temporarily pin an enabled provider/model, and an agent may select its own primary model; a blank agent choice inherits the global default. If a pin is later disabled or removed, runtime falls back to the agent override or global default instead of failing the conversation. Each agent can also maintain an ordered provider/model failover preference chain.
 
 ---
 
 ## Templates: hire a coworker who already knows the job
 
-You don't start from scratch. `Digital Employees → New` opens a two-tier template picker.
+You do not have to start from scratch. The employee page's **Hire Employee** action opens a picker with builtin templates and custom templates from the current workspace; you can also skip templates and continue to the blank form.
 
-### 5 career templates (recommended)
+### 6 built-in templates (recommended)
 
 Each one ships with a role, goal, backstory, the right toolset, a pixel-art avatar, and a color that belongs to the role. **Open one, it works:**
 
-- **Product Researcher** — competitive scans, market tracking, interview synthesis
-- **Customer Support** — catch every question, look it up in the KB, escalate what they can't resolve
-- **Knowledge Curator** — feed scattered material into the LLM Wiki, maintain bidirectional links, periodic consolidation
+- **General Assistant** — search, writing, analysis, and everyday work
+- **Product Assistant** — clarify users, scenarios, and requirements before shaping product decisions
+- **Research Analyst** — decompose complex research with web search and Wiki context
+- **Customer Support** — empathize, search available knowledge, solve or escalate
 - **Data Analyst** — query datasources, run SQL, build charts, write conclusions
-- **Executive Assistant** — calendar, email drafts, cross-tool coordination
+- **Code Reviewer** — inspect code, identify issues, and recommend improvements
 
-### Generic templates (blank or half-finished)
+Selecting a built-in template creates the corresponding agent immediately; workspace templates require a new employee name first. Skipping templates opens the fully editable custom form. Name, role, goal, model, skills, tools, and knowledge-base scope remain editable after creation.
 
-- **General Assistant** — the default chat employee
-- **Research / Code / Writing / Knowledge Curator / Data Analyst** — semi-finished, organized by purpose
-- **Custom** — fully blank, if you know exactly what you want
+---
 
-Pick one, give them a name, adjust the role and goal, save. **Working coworker in under a minute.** Every field is editable after creation.
+### Workspace templates
+
+These custom-template actions describe `dev` / `3.2.0-SNAPSHOT`, not the published 3.1.0 package.
+
+After configuring a native employee, choose **Save as template** in its card actions. Workspace members and higher roles can save and recruit:
+
+1. Enter the template name and description.
+2. Select shared configuration documents to copy, or leave the selection empty.
+3. On the employee page, open **Hire Employee → Workspace templates**.
+4. Enter an unused employee name in the current workspace and choose **Recruit employee**.
+
+A template is an independent snapshot: editing or deleting the source employee does not rewrite it, and deleting the template does not delete recruited employees. Save another template for later revisions; in-place editing and cross-workspace export are not currently offered. The template creator or a workspace administrator can delete it.
+
+| Configuration | Save and recruitment behavior |
+|---------------|-------------------------------|
+| Identity and basic settings | Preserve the system prompt, description, type, icon, tags, iteration budget, thinking depth and enabled state; a disabled source produces a disabled employee |
+| Skill, tool and knowledge-base scope | Preserve binding rows and enabled states, distinguishing inheritance, explicit opt-out and explicit bindings; inherited defaults still refer to current workspace resources rather than freezing their content |
+| Model and knowledge-base preferences | Preserve model name, ordered provider/model preferences and the primary knowledge-base reference; validate dependencies without copying resource contents |
+| Shared configuration documents | Copy only explicitly selected `AGENTS.md`, `SOUL.md`, `TOOLS.md`, `IDENTITY.md`, `HEARTBEAT.md` and `PROACTIVE.md`, retaining enabled state and ordering |
+| Runtime data and credential settings | Exclude chat, personal memory, daily notes, runtime paths, raw runtime/binding configuration JSON and credential settings |
+
+Prompt text and selected shared documents are copied verbatim; secrets written in that text are not automatically redacted. Templates do not bundle skill packages, MCP/ACP backends, knowledge-base materials or model credentials. Valid global builtin skills and MCP/ACP virtual skills accessible to the current workspace can still be referenced.
+
+**Custom recruitment validates dependencies strictly.** Missing, disabled or out-of-scope references produce a dependency error before creation. Restore the dependency and retry; recruitment does not silently widen capability scope. Built-in templates retain their existing compatibility behavior for missing skills or unavailable tools.
+
+**Initial scope:** custom snapshots support native employees in the current workspace. Saving a DSH employee is unavailable in the UI and explicitly rejected by the API; it neither copies credentials/host paths nor silently converts the employee to native. Coordinator identity belongs to [team settings](./teams) and is not copied with an employee template.
+
+### Employee template API
+
+Use the existing authentication mechanism and the `X-Workspace-Id` header. Transmit IDs as strings.
+
+| Endpoint | Access and purpose |
+|----------|--------------------|
+| `GET /api/v1/templates` | Existing builtin-template list, unchanged |
+| `POST /api/v1/templates/{id}/apply` | Existing builtin recruitment; workspace member or higher |
+| `GET /api/v1/templates/custom` | Custom template summaries; viewer or higher; no raw snapshot JSON |
+| `POST /api/v1/templates/custom` | Save a snapshot from an employee in the same workspace; member or higher |
+| `POST /api/v1/templates/custom/{id}/apply` | Recruit with a new employee name; member or higher |
+| `DELETE /api/v1/templates/custom/{id}` | Viewer or higher, plus template creator, workspace administrator or system administrator |
+
+Example save request:
+
+```json
+{
+  "sourceAgentId": "1234567890123456789",
+  "name": "Research configuration",
+  "description": "Reusable research workflow",
+  "workspaceFileNames": ["SOUL.md", "AGENTS.md"]
+}
+```
+
+The server constructs the snapshot from the source employee; callers do not upload arbitrary snapshot content. List summaries contain `id`, `name`, `description`, `icon`, `agentType`, `creatorUserId`, `createTime`, `schemaVersion` and `canDelete`. Custom recruitment accepts `{"name":"Researcher copy"}` and returns the new employee. Responses retain the `R<T>` envelope.
 
 ---
 
@@ -126,7 +176,34 @@ Three delegation tools, one per cadence:
 
 - **`delegateToAgent`** — synchronous. Hand a sub-task to a specific employee, wait for it to finish, and return only after the child's final result. Optional `inheritParentContext` carries the parent conversation's recent context to the child, so you don't have to re-explain the background.
 - **`delegateParallel`** — fan out. Delegate to several children at once; each runs in its own isolated session and the results are collected together.
-- **`delegateAsync`** — background. Returns a `task_id` immediately while the child runs in the background; fetch the result later with **`taskOutput`**. `taskOutput` has an **attribution gate** — only the **same conversation + the same user** that spawned the task can read its result, preventing cross-conversation / cross-user leakage.
+- **`delegateAsync`** — background. Returns a `task_id` immediately while the child runs in the background; fetch the result later with **`taskOutput`**. Background runs have a bounded execution budget (default 3600 seconds, configurable with `mateclaw.delegation.async-timeout-seconds`, or per call with `timeoutSeconds`, max 86400). On timeout MateClaw stops the child session and persists a failed result instead of leaving an orphan run. `taskOutput` has an **attribution gate** — only the **same conversation + the same user** that spawned the task can read its result, preventing cross-conversation / cross-user leakage.
+
+#### Async long tasks: scheduling, polling, and acceptance
+
+`delegateAsync` uses the shared async-task pool. A user can currently run at most **3** async tasks at once; delegation, image, video, and other async workloads share that allowance. For a batch, start at most three tasks, poll until one reaches a terminal state, and then refill the free slot. A call rejected by the concurrency limit returns no `task_id` and must not be counted as started.
+
+`taskOutput` parameters and response semantics:
+
+| Field | Meaning |
+|---|---|
+| `taskId` | Required; pass the `task_id` returned by `delegateAsync` |
+| `block` | Optional, default `false`; when `true`, wait for a terminal state within this call |
+| `timeoutSeconds` | Controls only one blocking poll, default 30 seconds and max 120; it does not change the child's execution budget |
+| `status` | `pending` / `running` / `succeeded` / `failed` |
+| `progress` | Lifecycle progress; local delegation currently usually stays at 0 while running and becomes 100 at termination, so it is not content-completion percentage |
+| `duration_ms` | Wall-clock duration, returned only for a terminal task |
+
+::: warning `succeeded` does not mean the deliverable passed acceptance
+`succeeded` only means that the child did not finish with a runtime exception or timeout. A model may return only an outline, a required tool may have failed, or a quantitative target may be missed while the task still becomes `succeeded`. The parent must verify business evidence before aggregating the result or completing a goal.
+:::
+
+Use at least these acceptance gates:
+
+1. Required files, links, or structured results actually exist and are readable; do not rely only on a claim that they were generated.
+2. Word, chapter, scenario, and similar quantitative targets have reproducible counts.
+3. No plan or checklist items remain, and the final answer contains no “continue later” or “remaining work” declaration.
+4. Critical write, read, and execution tools succeeded; if content was returned inline after an artifact failure, record that fallback explicitly.
+5. Put this evidence into the [goal checklist](./goals), and complete the goal only when every criterion passes.
 
 Children deny a default set of tools so the tree can't run away:
 
@@ -235,7 +312,7 @@ Not every question deserves deep reasoning, but some do. MateClaw lets you turn 
 
 `Digital Employees → New`:
 
-1. Pick a template (one of the 5 career templates, a generic template, or Custom)
+1. Pick a built-in template, or start from a custom configuration
 2. Name them, choose an avatar (pixel-art library, or upload your own)
 3. Write a one-sentence **Role**, a one-sentence **Goal**, a few-sentence **Backstory**
 4. Write a one-line **employee-card tagline** — the self-introduction shown on the card
@@ -485,4 +562,8 @@ You'll see node-by-node execution: state transitions, dispatcher routing, iterat
 - [Memory](./memory) — how agents remember across conversations
 - [Workflow](./workflow) (1.3.0+) — orchestrate multiple digital employees and system actions into a business process
 - [Triggers](./triggers) (1.3.0+) — let events automatically start workflows or agent conversations
-- [Architecture](./architecture) — the StateGraph runtime in depth
+- [Architecture](./architecture) — native ReAct and plan runtime in depth
+
+## Execution and tool boundaries (3.0.0)
+
+AgentScope 2 drives native ReAct and plan-step loops. MateClaw retains actual tool execution through approvals, permissions and audit. Explicit tool opt-out remains effective and employee-draft JSON may follow reasoning blocks.

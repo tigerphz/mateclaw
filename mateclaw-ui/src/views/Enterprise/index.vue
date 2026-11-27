@@ -3,12 +3,16 @@
     <header class="enterprise-head">
       <div class="enterprise-eyebrow">{{ t('enterprise.eyebrow') }}</div>
       <h1 class="enterprise-title">{{ t('enterprise.title') }}</h1>
+      <a class="enterprise-website" href="https://mate.vip/enterprise/" target="_blank" rel="noopener noreferrer">{{ t('enterprise.offer.website') }} ↗</a>
       <p class="enterprise-subtitle">{{ t('enterprise.subtitle') }}</p>
     </header>
 
     <nav class="enterprise-tabs">
-      <button v-for="tab in tabs" :key="tab.key" class="enterprise-tab" :class="{ active: activeTab === tab.key }"
-        @click="activeTab = tab.key">
+      <button
+        v-for="tab in tabs" :key="tab.key"
+        class="enterprise-tab" :class="{ active: activeTab === tab.key }"
+        @click="activeTab = tab.key"
+      >
         <span class="tab-label">{{ tab.label }}</span>
         <span v-if="tab.count != null" class="tab-count">{{ tab.count }}</span>
       </button>
@@ -41,7 +45,7 @@ const caseFocus = ref<string | null>(null)
 const tabs = computed<{ key: TabKey; label: string; count: number | null }[]>(() => [
   { key: 'overview', label: t('enterprise.tabs.overview'), count: null },
   { key: 'contract', label: t('enterprise.tabs.contract'), count: 23 },
-  { key: 'account', label: t('enterprise.tabs.account'), count: 14 },
+  { key: 'account',  label: t('enterprise.tabs.account'),  count: 14 },
   { key: 'approvals', label: t('enterprise.tabs.approvals'), count: 5 },
   { key: 'audit', label: t('enterprise.tabs.audit'), count: null },
 ])
@@ -58,7 +62,7 @@ function onOpenCase(id: string) {
   flex-direction: column;
   flex: 1;
   min-height: 0;
-  padding: 20px;
+  padding: 28px 32px 24px;
   gap: 18px;
   background: var(--mc-bg);
   /* Constrain the inner body so each tab can decide how to overflow:
@@ -68,12 +72,8 @@ function onOpenCase(id: string) {
   overflow: hidden;
 }
 
-.enterprise-head {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-
+.enterprise-website { align-self: flex-start; color: var(--mc-primary); font-size: 13px; text-underline-offset: 3px; }
+.enterprise-head { display: flex; flex-direction: column; gap: 4px; }
 .enterprise-eyebrow {
   font-size: var(--mc-text-xs);
   color: var(--mc-primary);
@@ -81,7 +81,6 @@ function onOpenCase(id: string) {
   letter-spacing: 0.12em;
   font-weight: 600;
 }
-
 .enterprise-title {
   margin: 0;
   font-size: 26px;
@@ -89,7 +88,6 @@ function onOpenCase(id: string) {
   font-weight: 700;
   color: var(--mc-text-primary);
 }
-
 .enterprise-subtitle {
   margin: 0;
   font-size: 14px;
@@ -107,7 +105,6 @@ function onOpenCase(id: string) {
   border-radius: 14px;
   gap: 2px;
 }
-
 .enterprise-tab {
   border: none;
   background: none;
@@ -122,18 +119,13 @@ function onOpenCase(id: string) {
   gap: 8px;
   transition: all 0.15s;
 }
-
-.enterprise-tab:hover {
-  color: var(--mc-text-primary);
-}
-
+.enterprise-tab:hover { color: var(--mc-text-primary); }
 .enterprise-tab.active {
   background: var(--mc-bg-elevated);
   color: var(--mc-primary);
   font-weight: 600;
-  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.06);
+  box-shadow: 0 1px 4px rgba(0,0,0,0.06);
 }
-
 .tab-count {
   font-size: 11px;
   font-weight: 600;
@@ -142,11 +134,7 @@ function onOpenCase(id: string) {
   background: var(--mc-primary-bg);
   color: var(--mc-primary-hover);
 }
-
-.enterprise-tab.active .tab-count {
-  background: var(--mc-primary);
-  color: white;
-}
+.enterprise-tab.active .tab-count { background: var(--mc-primary); color: white; }
 
 /* The body fills the remaining height and gives its single child a strict
    height contract via flex. Page roots must declare `flex: 1; min-height: 0;`

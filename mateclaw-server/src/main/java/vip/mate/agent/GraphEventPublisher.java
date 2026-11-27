@@ -1,17 +1,18 @@
 package vip.mate.agent;
 
-import com.alibaba.cloud.ai.graph.NodeOutput;
+import vip.mate.agent.runtime.state.RunStep;
 import vip.mate.agent.graph.state.MateClawStateKeys;
 
 import java.util.List;
 import java.util.Map;
+import java.util.LinkedHashMap;
 
 /**
  * Graph 事件发布工具
  * <p>
  * 所有方法都是 static，不做状态管理。
  * 节点内部收集 List&lt;GraphEvent&gt;，最终写入 PENDING_EVENTS。
- * StateGraph*Agent 从 NodeOutput 中读取这些事件。
+ * StateGraph*Agent 从 RunStep 中读取这些事件。
  *
  * @author MateClaw Team
  */
@@ -114,19 +115,20 @@ public final class GraphEventPublisher {
     }
 
     public static GraphEvent toolComplete(String toolCallId, String toolName, String result, boolean success) {
+        return toolComplete(toolCallId, toolName, result, success, null);
+    }
+
+    public static GraphEvent toolComplete(String toolCallId, String toolName, String result, boolean success,
+                                          Map<String, Object> structuredContent) {
         long ts = System.currentTimeMillis();
-        // Carry the full tool result; transport-layer chunking lives in
-        // ChatStreamTracker.broadcastChunked, which splits oversize payloads
-        // into ordered tool_result_chunk events when they exceed the 8 KB
-        // single-event budget. The previous unconditional 500-char truncation
-        // here destroyed data that the front-end could otherwise render in full.
-        return new GraphEvent(EVENT_TOOL_COMPLETE, Map.of(
-                "toolCallId", toolCallId != null ? toolCallId : "",
-                "toolName", toolName,
-                "result", result != null ? result : "",
-                "success", success,
-                "timestamp", ts
-        ), ts);
+        Map<String, Object> data = new LinkedHashMap<>();
+        data.put("toolCallId", toolCallId != null ? toolCallId : "");
+        data.put("toolName", toolName);
+        data.put("result", result != null ? result : "");
+        data.put("success", success);
+        data.put("timestamp", ts);
+        if (success && structuredContent != null) data.put("structuredContent", structuredContent);
+        return new GraphEvent(EVENT_TOOL_COMPLETE, data, ts);
     }
 
     public static GraphEvent planCreated(Long planId, List<String> steps) {
@@ -160,8 +162,14 @@ public final class GraphEventPublisher {
 
     public static GraphEvent toolApprovalRequested(String pendingId, String toolName,
                                                     String arguments, String reason) {
+        return toolApprovalRequested(null, pendingId, toolName, arguments, reason);
+    }
+
+    public static GraphEvent toolApprovalRequested(String toolCallId, String pendingId, String toolName,
+                                                    String arguments, String reason) {
         long ts = System.currentTimeMillis();
         return new GraphEvent(EVENT_TOOL_APPROVAL_REQUESTED, Map.of(
+                "toolCallId", toolCallId != null ? toolCallId : "",
                 "pendingId", pendingId,
                 "toolName", toolName != null ? toolName : "",
                 "arguments", arguments != null ? arguments : "",
@@ -177,8 +185,16 @@ public final class GraphEventPublisher {
                                                     String arguments, String reason,
                                                     String summary, String maxSeverity,
                                                     List<Map<String, Object>> findings) {
+        return toolApprovalRequested(null, pendingId, toolName, arguments, reason, summary, maxSeverity, findings);
+    }
+
+    public static GraphEvent toolApprovalRequested(String toolCallId, String pendingId, String toolName,
+                                                    String arguments, String reason,
+                                                    String summary, String maxSeverity,
+                                                    List<Map<String, Object>> findings) {
         long ts = System.currentTimeMillis();
         java.util.Map<String, Object> data = new java.util.LinkedHashMap<>();
+        data.put("toolCallId", toolCallId != null ? toolCallId : "");
         data.put("pendingId", pendingId);
         data.put("toolName", toolName != null ? toolName : "");
         data.put("arguments", arguments != null ? arguments : "");
@@ -269,10 +285,10 @@ public final class GraphEventPublisher {
     // ===== 提取方法 =====
 
     /**
-     * 从 NodeOutput 中提取 PENDING_EVENTS
+     * 从 RunStep 中提取 PENDING_EVENTS
      */
     @SuppressWarnings("unchecked")
-    public static List<GraphEvent> extractEvents(NodeOutput output) {
+    public static List<GraphEvent> extractEvents(RunStep output) {
         if (output == null || output.state() == null) {
             return List.of();
         }

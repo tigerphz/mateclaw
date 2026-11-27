@@ -1,17 +1,22 @@
 package vip.mate.agent.graph.node;
 
-import com.alibaba.cloud.ai.graph.OverAllState;
+import vip.mate.agent.runtime.state.RunState;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.ai.chat.messages.AssistantMessage;
 import org.springframework.ai.chat.messages.Message;
 import org.springframework.ai.chat.messages.SystemMessage;
+import org.springframework.ai.chat.messages.ToolResponseMessage;
+import vip.mate.agent.context.ConversationWindowManager;
+import vip.mate.config.ConversationWindowProperties;
 import org.springframework.ai.chat.model.ChatModel;
 import org.springframework.ai.chat.prompt.Prompt;
 import org.springframework.ai.tool.ToolCallback;
 import vip.mate.agent.AgentToolSet;
+import vip.mate.agent.GraphEventPublisher;
 import vip.mate.agent.graph.NodeStreamingChatHelper;
+import vip.mate.agent.graph.state.ActionExecutionLedger;
 import vip.mate.agent.graph.state.SourceEvidenceLedger;
 import vip.mate.channel.web.ChatStreamTracker;
 
@@ -54,7 +59,7 @@ class ReasoningNodeOutputTest {
     }
 
     /** 构建包含前一轮残留标志的 stale state */
-    private OverAllState buildStaleState() {
+    private RunState buildStaleState() {
         Map<String, Object> map = new HashMap<>();
         map.put(CONVERSATION_ID, "test-conv");
         map.put(SYSTEM_PROMPT, "you are a helper");
@@ -67,7 +72,7 @@ class ReasoningNodeOutputTest {
         // 前一轮残留标志
         map.put(NEEDS_TOOL_CALL, true);
         map.put(SHOULD_SUMMARIZE, true);
-        return new OverAllState(map);
+        return new RunState(map);
     }
 
     // ===== 控制流标志断言辅助 =====
@@ -104,6 +109,330 @@ class ReasoningNodeOutputTest {
     }
 
     @Test
+    @DisplayName("plain long-form requests reject hallucinated artifact tool calls")
+    void plainLongFormArtifactToolCall_continuesWithoutExecutingTool() throws Exception {
+        AssistantMessage.ToolCall toolCall = new AssistantMessage.ToolCall(
+                "docx-1", "function", "renderDocx", "{\"filename\":\"novel\"}");
+        AssistantMessage assistant = AssistantMessage.builder()
+                .content("我将生成文档")
+                .toolCalls(List.of(toolCall))
+                .build();
+        NodeStreamingChatHelper.StreamResult result = new NodeStreamingChatHelper.StreamResult(
+                "我将生成文档", "", assistant, List.of(toolCall), true, 100, 50);
+        when(streamingHelper.streamCall(any(), any(), anyString(), anyString())).thenReturn(result);
+
+        Map<String, Object> state = baseStateMap();
+        state.put(USER_MESSAGE, "帮我写个 5000 字的玄幻短篇小说，角色和剧情都你自己编。");
+        Map<String, Object> output = createNode().apply(new RunState(state));
+
+        assertEquals(false, output.get(NEEDS_TOOL_CALL));
+        assertEquals(true, output.get(CONTINUE_REASONING));
+        assertEquals(List.of(), output.get(TOOL_CALLS));
+    }
+
+    @Test
+    @DisplayName("action-required text-only candidate requests one reasoning continuation")
+    void actionRequiredTextOnly_continuesOnce() throws Exception {
+        NodeStreamingChatHelper.StreamResult result = new NodeStreamingChatHelper.StreamResult(
+                "预约成功", "", new AssistantMessage("预约成功"),
+                List.of(), false, 100, 50);
+        when(streamingHelper.streamCall(any(), any(), anyString(), anyString())).thenReturn(result);
+
+        Map<String, Object> state = baseStateMap();
+        state.put(ACTION_COMPLETION_REQUIRED, true);
+        Map<String, Object> output = createNode().apply(new RunState(state));
+
+        assertEquals(true, output.get(CONTINUE_REASONING));
+        assertEquals(1, output.get(ACTION_COMPLETION_RETRY_COUNT));
+        assertEquals("", output.get(FINAL_ANSWER));
+        assertEquals(2, ((List<?>) output.get(MESSAGES)).size());
+    }
+
+    @Test
+    @DisplayName("action-required text-only candidate becomes unverified after bounded continuation")
+    void actionRequiredTextOnly_retryExhausted() throws Exception {
+        NodeStreamingChatHelper.StreamResult result = new NodeStreamingChatHelper.StreamResult(
+                "预约成功", "", new AssistantMessage("预约成功"),
+                List.of(), false, 100, 50);
+        when(streamingHelper.streamCall(any(), any(), anyString(), anyString())).thenReturn(result);
+
+        Map<String, Object> state = baseStateMap();
+        state.put(ACTION_COMPLETION_REQUIRED, true);
+        state.put(ACTION_COMPLETION_RETRY_COUNT, 1);
+        Map<String, Object> output = createNode().apply(new RunState(state));
+
+        assertEquals(false, output.get(CONTINUE_REASONING));
+        assertEquals("action_unverified", output.get(FINISH_REASON));
+        assertTrue(((String) output.get(FINAL_ANSWER)).contains("未观察到实际"));
+    }
+
+    @Test
+    @DisplayName("long-form text request continues when generated content is far below requested length")
+    void longFormTextRequest_continuesUntilRequestedLength() throws Exception {
+        String partial = "玄".repeat(1200);
+        NodeStreamingChatHelper.StreamResult result = new NodeStreamingChatHelper.StreamResult(
+                partial, "", new AssistantMessage(partial),
+                List.of(), false, 100, 900);
+        when(streamingHelper.streamCall(any(), any(), anyString(), anyString())).thenReturn(result);
+
+        Map<String, Object> state = baseStateMap();
+        state.put(USER_MESSAGE, "帮我写个 10000 字的玄幻小说，角色和剧情都你自己编。");
+        state.put(MAX_ITERATIONS, 100);
+        Map<String, Object> output = createNode().apply(new RunState(state));
+
+        assertEquals(true, output.get(CONTINUE_REASONING));
+        assertEquals("", output.get(FINAL_ANSWER));
+        assertEquals(1, output.get(CURRENT_ITERATION));
+        assertEquals(partial, output.get("long_form_draft"),
+                "Each continuation must retain the generated body for the terminal answer");
+        List<?> appended = (List<?>) output.get(MESSAGES);
+        assertEquals(2, appended.size());
+        assertTrue(appended.get(1) instanceof org.springframework.ai.chat.messages.UserMessage);
+        assertTrue(((org.springframework.ai.chat.messages.UserMessage) appended.get(1)).getText()
+                        .contains("继续写"),
+                "Continuation prompt should ask the model to keep writing instead of ending the run");
+    }
+
+    @Test
+    @DisplayName("runtime error placeholder cannot satisfy or continue a long-form request")
+    void longFormTextRequest_runtimeErrorPlaceholderFailsImmediately() throws Exception {
+        String internalError = "[错误] Bad request: account subscription expired";
+        NodeStreamingChatHelper.StreamResult result = new NodeStreamingChatHelper.StreamResult(
+                internalError, "", new AssistantMessage(internalError),
+                List.of(), false, 100, 0);
+        when(streamingHelper.streamCall(any(), any(), anyString(), anyString())).thenReturn(result);
+
+        Map<String, Object> state = baseStateMap();
+        state.put(USER_MESSAGE, "请输出不少于 8000 字的技术报告");
+        state.put(MAX_ITERATIONS, 150);
+        Map<String, Object> output = createNode().apply(new RunState(state));
+
+        assertEquals(false, output.get(CONTINUE_REASONING));
+        assertEquals("error_fallback", output.get(FINISH_REASON));
+        assertEquals(internalError, output.get(FINAL_ANSWER));
+        assertNull(output.get("long_form_draft"));
+    }
+
+    @Test
+    @DisplayName("long-form continuation persists all chunks as one final answer")
+    void longFormTextRequest_combinesContinuationChunksInFinalAnswer() throws Exception {
+        String firstChunk = "甲".repeat(6000);
+        String finalChunk = "乙".repeat(4000);
+        NodeStreamingChatHelper.StreamResult result = new NodeStreamingChatHelper.StreamResult(
+                finalChunk, "", new AssistantMessage(finalChunk),
+                List.of(), false, 100, 900);
+        when(streamingHelper.streamCall(any(), any(), anyString(), anyString())).thenReturn(result);
+
+        Map<String, Object> state = baseStateMap();
+        state.put(USER_MESSAGE, "帮我写个 10000 字的玄幻小说，角色和剧情都你自己编。");
+        state.put(MAX_ITERATIONS, 100);
+        state.put(CURRENT_ITERATION, 1);
+        state.put("long_form_draft", firstChunk);
+
+        Map<String, Object> output = createNode().apply(new RunState(state));
+
+        assertEquals(false, output.get(CONTINUE_REASONING));
+        assertEquals(firstChunk + finalChunk, output.get(FINAL_ANSWER));
+        assertEquals(true, output.get(CONTENT_STREAMED),
+                "The combined answer was already streamed chunk by chunk and must not be broadcast twice");
+    }
+
+    @Test
+    @DisplayName("configured max iterations stops long-form continuation at the configured boundary")
+    void longFormTextRequest_honorsConfiguredMaxIterations() throws Exception {
+        String partial = "玄".repeat(1200);
+        NodeStreamingChatHelper.StreamResult result = new NodeStreamingChatHelper.StreamResult(
+                partial, "", new AssistantMessage(partial),
+                List.of(), false, 100, 900);
+        when(streamingHelper.streamCall(any(), any(), anyString(), anyString())).thenReturn(result);
+
+        Map<String, Object> state = baseStateMap();
+        state.put(USER_MESSAGE, "帮我写个 10000 字的玄幻小说，角色和剧情都你自己编。");
+        state.put(MAX_ITERATIONS, 1);
+
+        Map<String, Object> output = createNode().apply(new RunState(state));
+
+        assertEquals(false, output.get(CONTINUE_REASONING));
+        assertEquals(partial, output.get(FINAL_ANSWER));
+    }
+
+    @Test
+    @DisplayName("long-form length parser accepts a grouped 10,000-character request")
+    void requestedLongFormChars_acceptsGroupedNumber() {
+        assertEquals(10_000, ReasoningNode.requestedLongFormChars("写一篇 10,000 字小说").orElseThrow());
+    }
+
+    @Test
+    @DisplayName("plain long-form writing stays inline and cannot terminate through artifact render tools")
+    void plainLongFormRequest_filtersArtifactDeliveryTools() {
+        ToolCallback renderDocx = mockTool("renderDocxFromFiles");
+        ToolCallback writeFile = mockTool("write_file");
+        ToolCallback progress = mockTool("progress_update");
+
+        List<ToolCallback> filtered = ReasoningNode.filterLongFormArtifactTools(
+                "帮我写个 10000 字的玄幻小说，角色和剧情都你自己编。",
+                List.of(renderDocx, writeFile, progress));
+
+        assertEquals(List.of(progress), filtered);
+    }
+
+    @Test
+    @DisplayName("explicit document delivery keeps artifact render tools available")
+    void explicitLongFormDocumentRequest_keepsArtifactDeliveryTools() {
+        ToolCallback renderDocx = mockTool("renderDocxFromFiles");
+
+        List<ToolCallback> filtered = ReasoningNode.filterLongFormArtifactTools(
+                "写一篇 10000 字小说并生成 Word 文档给我下载。",
+                List.of(renderDocx));
+
+        assertEquals(List.of(renderDocx), filtered);
+    }
+
+    @Test
+    @DisplayName("artifact words from injected memory do not override the current plain writing request")
+    void injectedMemoryArtifactPreference_doesNotKeepArtifactTools() {
+        ToolCallback writeFile = mockTool("write_file");
+        String augmentedMessage = """
+                <memory-context>
+                用户偏好 Word 文档、文件下载和保存到工作区。
+                </memory-context>
+                帮我写个 10000 字的玄幻小说，角色和剧情都你自己编。
+                """;
+
+        List<ToolCallback> filtered = ReasoningNode.filterLongFormArtifactTools(
+                augmentedMessage, List.of(writeFile));
+
+        assertTrue(filtered.isEmpty());
+    }
+
+    @Test
+    void structuredWorkerSourceLengthDoesNotTriggerLongFormContinuation() throws Exception {
+        String answer = "{\"status\":\"COMPLETED\",\"result\":\"HEAD/TAIL/130 verified\",\"evidence\":\"team_tasks output and read_file\"}";
+        when(streamingHelper.streamCall(any(), any(), anyString(), anyString())).thenReturn(
+                new NodeStreamingChatHelper.StreamResult(answer, "", new AssistantMessage(answer),
+                        List.of(), false, 100, 100));
+        Map<String, Object> state = baseStateMap();
+        String request = "[Team task]\n源任务完整长回复（约 10731 字符）已持久化。请检索并核验，最终 JSON 小于800字符。\n"
+                + "[Final result contract]\n"
+                + vip.mate.agent.runtime.WorkerResultContract.INSTRUCTIONS
+                + "Keep the entire JSON under 8000 characters.\n";
+        state.put(USER_MESSAGE, request);
+        state.put(MAX_ITERATIONS, 30);
+        Map<String, Object> output = createNode().apply(new RunState(state));
+        assertEquals(false, output.get(CONTINUE_REASONING));
+        assertEquals(answer, output.get(FINAL_ANSWER));
+        assertTrue(ReasoningNode.requestedLongFormChars(request).isEmpty());
+    }
+
+    @Test
+    void sourceSizeAndUpperBoundsDoNotRequestLongFormProse() {
+        for (String request : List.of("源任务完整长回复（约 10731 字符）已保存。请核验并简短回复。",
+                "完整回复10975字符，与前置约10731字符一致（含封装头尾）。",
+                "完整输出约10000字，请核验首尾。", "读取一万字报告，仅回复结论。",
+                "Read the 10,000 words source report; answer briefly.",
+                "请输出不超过 10000 字的报告", "Write at most 10,000 words.",
+                "Write no more than 10000 words", "请写一篇不要超过10000字的报告")) {
+            assertTrue(ReasoningNode.requestedLongFormChars(request).isEmpty(), request);
+        }
+        assertEquals(3000, ReasoningNode.requestedLongFormChars(
+                "读取 10731 字符原文，写一篇 3000 字摘要。").orElseThrow());
+        assertEquals(10_000, ReasoningNode.requestedLongFormChars("帮我写一万字小说。").orElseThrow());
+        assertEquals(10_000, ReasoningNode.requestedLongFormChars("Write 10,000 words of fiction.").orElseThrow());
+    }
+
+    @Test
+    void explicitChineseWritingIntentsStillEnforceTheirRequestedLength() {
+        for (String request : List.of("请你写一篇10000字小说", "请把这个故事扩写到10000字",
+                "请根据工具结果写一篇10000字技术报告", "请写一篇小说，要求10000字",
+                "Write a report; length: 10000 words")) {
+            assertEquals(10_000, ReasoningNode.requestedLongFormChars(request).orElseThrow(), request);
+        }
+    }
+
+    private static ToolCallback mockTool(String name) {
+        ToolCallback callback = mock(ToolCallback.class);
+        org.springframework.ai.tool.definition.ToolDefinition definition =
+                mock(org.springframework.ai.tool.definition.ToolDefinition.class);
+        when(definition.name()).thenReturn(name);
+        when(callback.getToolDefinition()).thenReturn(definition);
+        return callback;
+    }
+
+    @Test
+    void successfulNumericFactsSurviveActualAgedHistoryCompactionBeforeStreaming() throws Exception {
+        String numericResult = "{\"k\":3,\"n\":3300,\"sum\":11984445550}";
+        var result = new NodeStreamingChatHelper.StreamResult(numericResult, "", new AssistantMessage(numericResult),
+                List.of(), false, 100, 50);
+        when(streamingHelper.streamCall(any(), any(), anyString(), anyString())).thenReturn(result);
+        var history = new java.util.ArrayList<Message>();
+        for (int i = 0; i < 4; i++) {
+            String id = "call-" + i;
+            history.add(AssistantMessage.builder().content("").toolCalls(List.of(
+                    new AssistantMessage.ToolCall(id, "function", "execute_code", "{}"))).build());
+            history.add(ToolResponseMessage.builder().responses(List.of(new ToolResponseMessage.ToolResponse(
+                    id, "execute_code", i == 0 ? numericResult + "x".repeat(1000) : "latest"))).build());
+        }
+        Map<String, Object> state = baseStateMap();
+        state.put(MESSAGES, history);
+        state.put(ACTION_EXECUTION_LEDGER, ActionExecutionLedger.fromEvents(List.of(
+                GraphEventPublisher.toolComplete("call-0", "execute_code", numericResult, true))));
+        var manager = new ConversationWindowManager(new ConversationWindowProperties(), null, null);
+        var node = new ReasoningNode(chatModel, toolSet, null, streamingHelper, manager, streamTracker);
+
+        Map<String, Object> output = node.apply(new RunState(state));
+
+        var prompt = forClass(Prompt.class);
+        verify(streamingHelper).streamCall(any(), prompt.capture(), anyString(), anyString());
+        assertFalse(prompt.getValue().getInstructions().stream().filter(ToolResponseMessage.class::isInstance)
+                .map(ToolResponseMessage.class::cast).flatMap(message -> message.getResponses().stream())
+                .anyMatch(response -> response.responseData().contains("11984445550")));
+        assertTrue(prompt.getValue().getInstructions().stream().anyMatch(message ->
+                message instanceof SystemMessage && message.getText().contains("11984445550")));
+        assertEquals(result.text(), output.get(FINAL_ANSWER));
+        assertEquals(true, output.get(CONTENT_STREAMED));
+    }
+
+    @Test
+    void failedExecutionFactsAreIncludedBeforeAnswerStreaming() throws Exception {
+        var result = new NodeStreamingChatHelper.StreamResult(
+                "Finished with an earlier failed attempt.", "", new AssistantMessage("Finished with an earlier failed attempt."),
+                List.of(), false, 100, 50);
+        when(streamingHelper.streamCall(any(), any(), anyString(), anyString())).thenReturn(result);
+        Map<String, Object> state = baseStateMap();
+        state.put(ACTION_EXECUTION_LEDGER, ActionExecutionLedger.fromEvents(List.of(
+                GraphEventPublisher.toolComplete("failed-call", "tool_call", "missing language", false),
+                GraphEventPublisher.toolComplete("other-call", "tool_call", "ok", true))));
+
+        Map<String, Object> output = createNode().apply(new RunState(state));
+
+        var prompt = forClass(Prompt.class);
+        verify(streamingHelper).streamCall(any(), prompt.capture(), anyString(), anyString());
+        assertTrue(prompt.getValue().getInstructions().stream().anyMatch(message ->
+                message instanceof SystemMessage && message.getText().contains("failed-call")
+                        && message.getText().contains("does not establish recovery")));
+        assertEquals(result.text(), output.get(FINAL_ANSWER));
+        assertEquals(true, output.get(CONTENT_STREAMED));
+    }
+
+    @Test
+    @DisplayName("failed action receipt overrides a model success claim")
+    void failedActionReceipt_blocksSuccessClaim() throws Exception {
+        NodeStreamingChatHelper.StreamResult result = new NodeStreamingChatHelper.StreamResult(
+                "预约成功", "", new AssistantMessage("预约成功"),
+                List.of(), false, 100, 50);
+        when(streamingHelper.streamCall(any(), any(), anyString(), anyString())).thenReturn(result);
+
+        Map<String, Object> state = baseStateMap();
+        state.put(ACTION_COMPLETION_REQUIRED, true);
+        state.put(ACTION_EXECUTION_LEDGER, ActionExecutionLedger.fromEvents(List.of(
+                GraphEventPublisher.toolComplete("call-1", "schedule_meeting", "HTTP 500", false))));
+        Map<String, Object> output = createNode().apply(new RunState(state));
+
+        assertEquals("action_failed", output.get(FINISH_REASON));
+        assertTrue(((String) output.get(FINAL_ANSWER)).contains("执行失败"));
+    }
+
+    @Test
     @DisplayName("源码证据不足的 final answer：原文进 streamedContent，警告作为 finalAnswer 追加")
     void evidenceInsufficientFinalAnswer_splitsPersistedContentAndWarning() throws Exception {
         NodeStreamingChatHelper.StreamResult result = new NodeStreamingChatHelper.StreamResult(
@@ -123,7 +452,7 @@ class ReasoningNodeOutputTest {
         stateMap.put(SOURCE_EVIDENCE_LEDGER, SourceEvidenceLedger.empty()
                 .withSourcePath("src/main/java/vip/mate/skill/controller/SkillController.java"));
 
-        Map<String, Object> output = createNode().apply(new OverAllState(stateMap));
+        Map<String, Object> output = createNode().apply(new RunState(stateMap));
 
         assertControlFlagsCleared(output, "evidenceInsufficientFinalAnswer");
         assertEquals("evidence_insufficient", output.get(FINISH_REASON));
@@ -202,6 +531,23 @@ class ReasoningNodeOutputTest {
                 "Thinking transcript must be preserved for the UI's collapse panel");
     }
 
+    @Test
+    void thinkingTokenLimit_explainsBudgetAndDoesNotRetryOrExposeReasoningAsAnswer() throws Exception {
+        var result = new NodeStreamingChatHelper.StreamResult(
+                "", "unfinished reasoning", new AssistantMessage(""), List.of(), false,
+                100, 256, true, "thinking_token_limit", NodeStreamingChatHelper.ErrorType.NONE);
+        when(streamingHelper.streamCall(any(), any(), anyString(), anyString())).thenReturn(result);
+        Map<String, Object> output = createNode().apply(buildStaleState());
+        assertControlFlagsCleared(output, "thinkingTokenLimit");
+        assertEquals("incomplete", output.get(FINISH_REASON));
+        assertEquals("unfinished reasoning", output.get(FINAL_THINKING));
+        String answer = (String) output.get(FINAL_ANSWER);
+        assertTrue(answer.contains("token 预算"));
+        assertTrue(answer.contains("关闭思考"));
+        assertFalse(answer.contains("unfinished reasoning"));
+        verify(streamingHelper, times(1)).streamCall(any(), any(), anyString(), anyString());
+    }
+
     // ===== CancellationException (no content stop) =====
 
     @Test
@@ -235,5 +581,18 @@ class ReasoningNodeOutputTest {
         assertLlmCallCountWritten(output, "stoppedWithPartial");
         assertEquals("stopped", output.get(FINISH_REASON));
         assertEquals("部分内容", output.get(FINAL_ANSWER));
+    }
+
+    private Map<String, Object> baseStateMap() {
+        Map<String, Object> state = new HashMap<>();
+        state.put(CONVERSATION_ID, "test-conv");
+        state.put(SYSTEM_PROMPT, "you are a helper");
+        state.put(USER_MESSAGE, "book the meeting");
+        state.put(MESSAGES, List.of());
+        state.put(CURRENT_ITERATION, 0);
+        state.put(MAX_ITERATIONS, 10);
+        state.put(LLM_CALL_COUNT, 0);
+        state.put(FORCED_TOOL_CALL, "");
+        return state;
     }
 }

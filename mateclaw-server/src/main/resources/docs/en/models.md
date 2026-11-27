@@ -1,5 +1,11 @@
 # Models
 
+## 3.1.0: validate parameters before saving
+
+Model/provider writes validate options consumed by the runtime: temperature must be finite and nonnegative, top-p must be between 0 and 1, and output limits must be positive integers. Explicit context windows range from 1,024 to 20,000,000 tokens; nonpositive values select inference. `chatOptions` / `chat_options` must be JSON objects. Unknown vendor extensions remain the endpoint's responsibility.
+
+Providers share concurrency limits, with busy/cooldown states distinguished from ordinary model failures. Failover identity and usage telemetry use the actual fallback model. Azure unified OpenAI endpoints retain required query parameters.
+
 **Pick a model. Just one. Add more later.**
 
 MateClaw doesn't care which LLM you use. It talks to every mainstream provider through five protocol adapters, supports 15+ cloud providers and 4 local runtimes, and lets you swap models at runtime without touching agent configuration. The only opinion MateClaw has is that you should **start with one and add more when you need them** — not configure everything on day one.
@@ -508,8 +514,38 @@ If you're on DashScope, here's the rough shape of the lineup:
 
 ---
 
+## Per-model context windows (2.1.0+)
+
+MateClaw no longer treats every model as a global 128K window. Runtime resolution follows **operator override → live local-model probe or provider limit-error cache → built-in model catalog → the existing global fallback**. To avoid I/O, model-list rendering shows only override or catalog values; unknown models still use the caller's global default. The result budgets system prompts, memory, Wiki context, history, and tool schemas.
+
+- known models, including GLM-5V-Turbo and Kimi coding aliases, use catalogued windows;
+- custom/private models can declare an accurate maximum input-token count in model management;
+- the API is `PUT /api/v1/models/{providerId}/models/context-window` with `modelId` and `maxInputTokens`; null or non-positive clears the override;
+- workspace members reading provider binding choices receive only id/display name, never keys or connection settings.
+
+The OpenAI-compatible path also preserves `integer` / `number` in tool JSON Schemas. Only non-reserved top-level `generateKwargs` entries pass through to the request body; temperature, token limits, `topP`, `reasoningEffort`, search, headers, and path keys use one consistent reserved-key reader. Unknown nested `chatOptions` keys are not forwarded, and `reasoningEffort` is sent only to explicitly supported model families.
+
+---
+
 ## Next
 
 - [Configuration](./config) — full config reference
 - [Agents](./agents) — how agents use models
 - [Admin Console](./console) — UI for model management
+
+## Model probes and cancellation (3.0.0)
+
+A probe requires a valid completed response; connection success or empty output does not prove model availability. Stopping generation cancels HTTP calls owned by the request and prevents subsequent failover.
+
+## Context budgets and request preparation (3.0.0)
+
+The native AgentScope runtime continues to call the existing Spring AI/provider adapters. `PromptBudget` estimates the effective request without changing its prompt or options, using Spring AI's native option combination to inherit defaults when runtime options are partial.
+
+- Count messages (including structured tool-call content), effective tool callback schemas and one output reserve.
+- A non-null runtime callback list replaces default callbacks; an explicitly empty list contributes no inherited tool schemas.
+- Reserve the declared output maximum, including OpenAI `maxCompletionTokens`; retain a provider-specific runtime maximum as a conservative floor when generic options cannot represent it. Use the caller's fallback only when no maximum is available.
+- Use long arithmetic for totals so a large output limit cannot overflow into an apparently safe request.
+
+Initial preparation, structured-compaction retries and empty-response retries share this estimate. Summary-model calls check the same components before claiming their call budget or reaching the provider. Existing call limits, usage accounting, cancellation and Goal protections remain in force.
+
+These are local safety estimates, not exact tokenizer or billing measurements. A provider can still reject a request, and fitting a context window does not establish that the answer is correct.

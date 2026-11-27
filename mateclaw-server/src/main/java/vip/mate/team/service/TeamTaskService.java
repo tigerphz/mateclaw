@@ -7,12 +7,18 @@ import com.baomidou.mybatisplus.core.toolkit.Wrappers;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
+import org.springframework.beans.factory.annotation.Autowired;
+import vip.mate.decision.api.DecisionTicket;
+import vip.mate.decision.api.DecisionMode;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.annotation.Isolation;
 import vip.mate.team.model.AgentTeamEntity;
 import vip.mate.team.model.TeamTaskCommentEntity;
 import vip.mate.team.model.TeamTaskCreateCommand;
 import vip.mate.team.model.TeamTaskEntity;
 import vip.mate.team.model.TeamTaskStatus;
+import vip.mate.team.model.TeamRunEntity;
+import vip.mate.team.model.TeamRunStatus;
 import vip.mate.team.model.TeamTaskEventEntity;
 import vip.mate.team.repository.TeamTaskCommentMapper;
 import vip.mate.team.repository.TeamTaskEventMapper;
@@ -26,6 +32,9 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * Shared task board service. All status transitions are guarded conditional
@@ -39,6 +48,13 @@ import java.util.Objects;
 @Service
 @RequiredArgsConstructor
 public class TeamTaskService {
+
+    public static final int MAX_RESULT_CHARS = 8000;
+
+    private static final int MAX_STAGED_REPLAY_RESULT_CHARS = 8000;
+
+    private static final Pattern CHECKPOINT_RANGE = Pattern.compile(
+            "(?i)R(\\d{3})\\s*[-–—]\\s*R(\\d{3})");
 
     /** Execution lease length; renewed by the runner while the member works. */
     static final int LOCK_MINUTES = 60;
@@ -57,14 +73,112 @@ public class TeamTaskService {
     private final TeamTaskCommentMapper commentMapper;
     private final TeamTaskEventMapper eventMapper;
     private final TeamService teamService;
+    private final TeamRunProjectionScheduler projectionScheduler;
+    private final TeamRunService runService;
+
+    private WorkerDecisionAdapter decisionAdapter;
+
+    @Autowired(required = false)
+    public void setDecisionAdapter(WorkerDecisionAdapter adapter) { this.decisionAdapter = adapter; }
+
+    public record Completion(boolean applied, List<Long> released, String status) {}
+
+    /** Lock the execution row before applying an ACTIVE result or attaching its artifact. */
+    private TeamTaskEntity lockWorkerAttempt(Long taskId, WorkerDecisionAdapter.Snapshot snapshot) {
+        if (snapshot == null || !Objects.equals(taskId, snapshot.taskId())) return null;
+        TeamTaskEntity locked = taskMapper.selectOne(Wrappers.<TeamTaskEntity>lambdaQuery()
+                .eq(TeamTaskEntity::getId, snapshot.taskId()).last("FOR UPDATE"));
+        return snapshot.matches(locked) ? locked : null;
+    }
+
+    private boolean allowWorkerMutation(Long taskId, DecisionTicket ticket, WorkerDecisionAdapter.Snapshot snapshot) {
+        if (ticket == null || ticket.mode() != DecisionMode.ACTIVE || lockWorkerAttempt(taskId, snapshot) != null) return true;
+        decisionAdapter.outcome(ticket, false, "STALE_ATTEMPT");
+        return false;
+    }
+
+    @Transactional
+    public Completion completeTask(Long taskId, Long agentId, String result, DecisionTicket ticket,
+                                   WorkerDecisionAdapter.Snapshot snapshot) {
+        TeamTaskEntity locked = null;
+        if (ticket != null && ticket.mode() == DecisionMode.ACTIVE) {
+            locked = lockWorkerAttempt(taskId, snapshot);
+            if (locked == null) {
+                decisionAdapter.outcome(ticket, false, "STALE_ATTEMPT");
+                return new Completion(false, List.of(), null);
+            }
+        }
+        Completion completed = completeTaskInternal(taskId, agentId, result, false, locked);
+        if (decisionAdapter != null) decisionAdapter.outcome(ticket, completed.applied(), completed.status());
+        return completed;
+    }
+
+    @Transactional
+    public boolean failTask(Long taskId, String reason, DecisionTicket ticket, WorkerDecisionAdapter.Snapshot snapshot) {
+        if (!allowWorkerMutation(taskId, ticket, snapshot)) return false;
+        boolean applied = failTask(taskId, reason);
+        if (decisionAdapter != null) decisionAdapter.outcome(ticket, applied, applied ? TeamTaskStatus.FAILED : "TRANSITION_REJECTED");
+        return applied;
+    }
+
+    @Transactional
+    public boolean requeueUnusableResult(Long taskId, String reason, DecisionTicket ticket,
+                                        WorkerDecisionAdapter.Snapshot snapshot) {
+        if (!allowWorkerMutation(taskId, ticket, snapshot)) return false;
+        boolean applied = requeueUnusableResult(taskId, reason);
+        if (decisionAdapter != null) decisionAdapter.outcome(ticket, applied, applied ? TeamTaskStatus.PENDING : "TRANSITION_REJECTED");
+        return applied;
+    }
+
+    @Transactional
+    public String settleUnusableResult(Long taskId, String reason, boolean retryAllowed, DecisionTicket ticket,
+                                       WorkerDecisionAdapter.Snapshot snapshot) {
+        if (!allowWorkerMutation(taskId, ticket, snapshot)) return null;
+        String actual = retryAllowed && requeueUnusableResult(taskId, reason) ? TeamTaskStatus.PENDING
+                : failTask(taskId, reason) ? TeamTaskStatus.FAILED : null;
+        if (decisionAdapter != null) decisionAdapter.outcome(ticket, actual != null,
+                actual == null ? "TRANSITION_REJECTED" : actual);
+        return actual;
+    }
+
+    @Transactional
+    public boolean parkWorkerCheckpoint(Long taskId, int percent, String step, DecisionTicket ticket,
+                                        WorkerDecisionAdapter.Snapshot snapshot) {
+        if (!allowWorkerMutation(taskId, ticket, snapshot)) return false;
+        boolean applied = updateProgress(taskId, null, percent, step);
+        if (decisionAdapter != null) decisionAdapter.outcome(ticket, applied,
+                applied ? TeamTaskStatus.IN_PROGRESS : "TRANSITION_REJECTED");
+        return applied;
+    }
+
+    @Transactional
+    public boolean addWorkerDeliverable(WorkerDecisionAdapter.Snapshot snapshot, Long agentId, String name, String url) {
+        if (snapshot == null) return false;
+        TeamTaskEntity locked = lockWorkerAttempt(snapshot.taskId(), snapshot);
+        if (locked == null) return false;
+        addDeliverableInternal(locked, agentId, name, url);
+        return true;
+    }
 
     // ==================== creation ====================
 
-    @Transactional
+    // Roster checks after a team-lock wait must see newly committed changes.
+    @Transactional(isolation = Isolation.READ_COMMITTED)
     public TeamTaskEntity createTask(TeamTaskCreateCommand cmd) {
+        teamService.lockTeam(cmd.getTeamId());
         AgentTeamEntity team = teamService.getTeam(cmd.getTeamId());
         if (team == null || !TeamService.STATUS_ACTIVE.equals(team.getStatus())) {
             throw new IllegalArgumentException("team not found or not active: " + cmd.getTeamId());
+        }
+        TeamRunEntity run = null;
+        if (cmd.getRunId() != null) {
+            run = runService.requireRun(cmd.getRunId(), team.getWorkspaceId());
+            if (!cmd.getTeamId().equals(run.getTeamId())) {
+                throw new IllegalArgumentException("team task and run must belong to the same team");
+            }
+            if (!TeamRunStatus.PLANNING.equals(run.getStatus())) {
+                throw new IllegalStateException("team run must be planning to accept tasks: " + cmd.getRunId());
+            }
         }
         if (cmd.getSubject() == null || cmd.getSubject().isBlank()) {
             throw new IllegalArgumentException("subject is required");
@@ -92,6 +206,9 @@ public class TeamTaskService {
             if (blocker == null || !blocker.getTeamId().equals(cmd.getTeamId())) {
                 throw new IllegalArgumentException("blocking task not found in this team: " + blockerId);
             }
+            if (!Objects.equals(blocker.getRunId(), cmd.getRunId())) {
+                throw new IllegalArgumentException("blocking task must belong to the same run: " + blockerId);
+            }
             if (TeamTaskStatus.isTerminal(blocker.getStatus())) {
                 throw new IllegalArgumentException("blocking task " + blockerId
                         + " is already " + blocker.getStatus()
@@ -101,6 +218,7 @@ public class TeamTaskService {
 
         TeamTaskEntity task = new TeamTaskEntity();
         task.setTeamId(cmd.getTeamId());
+        task.setRunId(cmd.getRunId());
         task.setTaskNumber(teamService.nextTaskNumber(cmd.getTeamId()));
         task.setSubject(cmd.getSubject());
         task.setDescription(cmd.getDescription());
@@ -115,7 +233,7 @@ public class TeamTaskService {
         task.setLeadConversationId(cmd.getLeadConversationId());
         task.setUsername(cmd.getUsername());
         task.setChannel(cmd.getChannel());
-        task.setMetadata(cmd.getMetadata());
+        task.setMetadata(TeamTaskBriefing.capture(cmd, run == null ? null : run.getObjective()));
         taskMapper.insert(task);
         recordEvent(cmd.getTeamId(), task.getId(), TeamTaskEventEntity.CREATED,
                 cmd.getCreatedByAgentId() != null ? AUTHOR_AGENT
@@ -125,6 +243,7 @@ public class TeamTaskService {
                 "assignee: agent " + assignee);
         log.info("Team {} task #{} created ({}), assignee={} status={}",
                 cmd.getTeamId(), task.getTaskNumber(), task.getId(), assignee, task.getStatus());
+        projectTask(task);
         return task;
     }
 
@@ -135,13 +254,17 @@ public class TeamTaskService {
      * get false. The WHERE clause is the mutex.
      */
     public boolean claimTask(Long taskId, Long agentId) {
-        return taskMapper.update(null, Wrappers.<TeamTaskEntity>lambdaUpdate()
+        boolean claimed = taskMapper.update(null, Wrappers.<TeamTaskEntity>lambdaUpdate()
                 .eq(TeamTaskEntity::getId, taskId)
                 .eq(TeamTaskEntity::getStatus, TeamTaskStatus.PENDING)
                 .isNull(TeamTaskEntity::getOwnerAgentId)
                 .set(TeamTaskEntity::getStatus, TeamTaskStatus.IN_PROGRESS)
                 .set(TeamTaskEntity::getOwnerAgentId, agentId)
                 .set(TeamTaskEntity::getLockExpiresAt, newLease())) == 1;
+        if (claimed) {
+            projectTask(taskId);
+        }
+        return claimed;
     }
 
     /**
@@ -149,12 +272,17 @@ public class TeamTaskService {
      * this overrides a previously set owner but still requires pending status.
      */
     public boolean assignTask(Long taskId, Long agentId) {
-        return taskMapper.update(null, Wrappers.<TeamTaskEntity>lambdaUpdate()
+        boolean assigned = taskMapper.update(null, Wrappers.<TeamTaskEntity>lambdaUpdate()
                 .eq(TeamTaskEntity::getId, taskId)
                 .eq(TeamTaskEntity::getStatus, TeamTaskStatus.PENDING)
                 .set(TeamTaskEntity::getStatus, TeamTaskStatus.IN_PROGRESS)
                 .set(TeamTaskEntity::getOwnerAgentId, agentId)
+                .set(TeamTaskEntity::getReason, null)
                 .set(TeamTaskEntity::getLockExpiresAt, newLease())) == 1;
+        if (assigned) {
+            projectTask(taskId);
+        }
+        return assigned;
     }
 
     /** Record the member conversation executing the task. */
@@ -177,7 +305,16 @@ public class TeamTaskService {
      */
     @Transactional
     public List<Long> completeTask(Long taskId, Long agentId, String result) {
-        TeamTaskEntity task = requireTask(taskId);
+        return completeTaskInternal(taskId, agentId, result, true, null).released();
+    }
+
+    private Completion completeTaskInternal(Long taskId, Long agentId, String result, boolean observe, TeamTaskEntity locked) {
+        if (result != null && result.length() > MAX_RESULT_CHARS) {
+            throw new IllegalArgumentException("result summary must not exceed " + MAX_RESULT_CHARS
+                    + " characters; keep a concise summary here and put full content in your final reply"
+                    + " or attach a deliverable");
+        }
+        TeamTaskEntity task = locked == null ? requireTask(taskId) : locked;
         if (TeamTaskStatus.PENDING.equals(task.getStatus()) && agentId != null) {
             if (task.getAssigneeAgentId() != null && !agentId.equals(task.getAssigneeAgentId())) {
                 throw new IllegalStateException("task #" + task.getTaskNumber()
@@ -200,6 +337,7 @@ public class TeamTaskService {
                 .set(TeamTaskEntity::getLockExpiresAt, null)
                 .set(TeamTaskEntity::getProgressPercent, 100));
         if (rows != 1) {
+            if (locked != null) return new Completion(false, List.of(), "TRANSITION_REJECTED");
             throw new IllegalStateException("task #" + task.getTaskNumber()
                     + " is " + task.getStatus() + " and cannot be completed");
         }
@@ -207,7 +345,10 @@ public class TeamTaskService {
                 toReview ? TeamTaskEventEntity.IN_REVIEW : TeamTaskEventEntity.COMPLETED,
                 agentId != null ? AUTHOR_AGENT : AUTHOR_SYSTEM,
                 agentId != null ? String.valueOf(agentId) : null, null);
-        return toReview ? List.of() : releaseDependents(task);
+        List<Long> released = toReview ? List.of() : releaseDependents(task);
+        projectTask(task);
+        if (observe && decisionAdapter != null && decisionAdapter.enabled()) decisionAdapter.observeCompletion(task, target);
+        return new Completion(true, released, target);
     }
 
     /** Human approval of an in_review task; releases dependents. */
@@ -221,7 +362,9 @@ public class TeamTaskService {
         if (rows != 1) {
             throw new IllegalStateException("task #" + task.getTaskNumber() + " is not awaiting review");
         }
-        return releaseDependents(task);
+        List<Long> released = releaseDependents(task);
+        projectTask(task);
+        return released;
     }
 
     /** Human rejection of an in_review task; cancels it and releases dependents. */
@@ -236,11 +379,14 @@ public class TeamTaskService {
         if (rows != 1) {
             throw new IllegalStateException("task #" + task.getTaskNumber() + " is not awaiting review");
         }
-        return releaseDependents(task);
+        List<Long> released = releaseDependents(task);
+        projectTask(task);
+        return released;
     }
 
     /** Fail a task (blocker escalation, runner error, circuit breaker). Does NOT release dependents. */
     public boolean failTask(Long taskId, String reason) {
+        TeamTaskEntity task = taskMapper.selectById(taskId);
         boolean failed = taskMapper.update(null, Wrappers.<TeamTaskEntity>lambdaUpdate()
                 .eq(TeamTaskEntity::getId, taskId)
                 .in(TeamTaskEntity::getStatus,
@@ -249,9 +395,9 @@ public class TeamTaskService {
                 .set(TeamTaskEntity::getReason, reason)
                 .set(TeamTaskEntity::getLockExpiresAt, null)) == 1;
         if (failed) {
-            TeamTaskEntity task = taskMapper.selectById(taskId);
             recordEvent(task == null ? null : task.getTeamId(), taskId,
                     TeamTaskEventEntity.FAILED, AUTHOR_SYSTEM, null, reason);
+            projectTask(taskId);
         }
         return failed;
     }
@@ -270,25 +416,83 @@ public class TeamTaskService {
         if (rows != 1) {
             throw new IllegalStateException("task #" + task.getTaskNumber() + " is already terminal");
         }
-        return releaseDependents(task);
+        List<Long> released = releaseDependents(task);
+        projectTask(task);
+        return released;
     }
 
-    /** Manual retry of a failed/stale task: back to pending, owner and breaker reset. */
+    /** Human-requested retry only: explicitly grants a fresh dispatch budget. */
+    @Transactional(isolation = Isolation.READ_COMMITTED)
     public boolean retryTask(Long taskId) {
-        return taskMapper.update(null, Wrappers.<TeamTaskEntity>lambdaUpdate()
+        return retryTask(taskId, true);
+    }
+
+    /** Lead retries share the original task's budget and retain failure feedback. */
+    @Transactional(isolation = Isolation.READ_COMMITTED)
+    public boolean retryTaskFromLead(Long taskId) {
+        return retryTask(taskId, false);
+    }
+
+    private boolean retryTask(Long taskId, boolean resetBudget) {
+        // Serialize retries for this task before validating its current roster.
+        // READ_COMMITTED ensures validation stays fresh after the team-lock wait;
+        // historical failed tasks must not resurrect work for removed members.
+        TeamTaskEntity task = taskMapper.selectOne(Wrappers.<TeamTaskEntity>lambdaQuery()
+                .eq(TeamTaskEntity::getId, taskId).last("FOR UPDATE"));
+        if (task == null || task.getStatus() == null || !TeamTaskStatus.RETRYABLE.contains(task.getStatus())) return false;
+        teamService.lockTeam(task.getTeamId());
+        AgentTeamEntity team = teamService.getTeam(task.getTeamId());
+        if (team == null || !TeamService.STATUS_ACTIVE.equals(team.getStatus())
+                || task.getAssigneeAgentId() == null
+                || task.getAssigneeAgentId().equals(team.getLeadAgentId())
+                || !teamService.isMember(task.getTeamId(), task.getAssigneeAgentId())) return false;
+        var update = Wrappers.<TeamTaskEntity>lambdaUpdate()
                 .eq(TeamTaskEntity::getId, taskId)
                 .in(TeamTaskEntity::getStatus, TeamTaskStatus.FAILED, TeamTaskStatus.STALE)
                 .set(TeamTaskEntity::getStatus, TeamTaskStatus.PENDING)
                 .set(TeamTaskEntity::getOwnerAgentId, null)
+                .set(TeamTaskEntity::getLockExpiresAt, null);
+        if (resetBudget) {
+            update.set(TeamTaskEntity::getReason, null).set(TeamTaskEntity::getDispatchCount, 0);
+        } else {
+            // Keep the cap in the same conditional UPDATE as the state transition;
+            // a read/check/write sequence would allow concurrent retries to race.
+            update.lt(TeamTaskEntity::getDispatchCount, MAX_DISPATCHES);
+        }
+        boolean retried = taskMapper.update(null, update) == 1;
+        if (retried) {
+            projectTask(taskId);
+        }
+        return retried;
+    }
+
+    /**
+     * Requeue an automatically dispatched task whose member result is unusable.
+     * Unlike a manual retry this deliberately preserves {@code dispatchCount},
+     * so the existing dispatch circuit breaker remains the hard upper bound.
+     */
+    public boolean requeueUnusableResult(Long taskId, String reason) {
+        TeamTaskEntity task = taskMapper.selectById(taskId);
+        boolean requeued = taskMapper.update(null, Wrappers.<TeamTaskEntity>lambdaUpdate()
+                .eq(TeamTaskEntity::getId, taskId)
+                .eq(TeamTaskEntity::getStatus, TeamTaskStatus.IN_PROGRESS)
+                .set(TeamTaskEntity::getStatus, TeamTaskStatus.PENDING)
+                .set(TeamTaskEntity::getOwnerAgentId, null)
                 .set(TeamTaskEntity::getLockExpiresAt, null)
-                .set(TeamTaskEntity::getReason, null)
-                .set(TeamTaskEntity::getDispatchCount, 0)) == 1;
+                .set(TeamTaskEntity::getReason, reason)) == 1;
+        if (requeued) {
+            recordEvent(task == null ? null : task.getTeamId(), taskId,
+                    TeamTaskEventEntity.RETRIED, AUTHOR_SYSTEM, null, reason);
+            projectTask(taskId);
+        }
+        return requeued;
     }
 
     // ==================== progress / comments ====================
 
     /** Update progress and renew the execution lease in one shot. */
     public boolean updateProgress(Long taskId, Long agentId, Integer percent, String step) {
+        TeamTaskEntity task = taskMapper.selectById(taskId);
         boolean updated = taskMapper.update(null, Wrappers.<TeamTaskEntity>lambdaUpdate()
                 .eq(TeamTaskEntity::getId, taskId)
                 .eq(TeamTaskEntity::getStatus, TeamTaskStatus.IN_PROGRESS)
@@ -297,13 +501,282 @@ public class TeamTaskService {
                 .set(step != null, TeamTaskEntity::getProgressStep, step)
                 .set(TeamTaskEntity::getLockExpiresAt, newLease())) == 1;
         if (updated) {
-            TeamTaskEntity task = taskMapper.selectById(taskId);
             recordEvent(task == null ? null : task.getTeamId(), taskId,
                     TeamTaskEventEntity.PROGRESS, AUTHOR_AGENT,
                     agentId != null ? String.valueOf(agentId) : null,
                     (percent != null ? percent + "%" : "") + (step != null ? " — " + step : ""));
+            projectTask(taskId);
         }
         return updated;
+    }
+
+    /** Park a running worker task until its guarded tool call receives a human decision. */
+    public boolean parkForToolApproval(Long taskId, String pendingId, String summary) {
+        if (pendingId == null || pendingId.isBlank()) {
+            throw new IllegalArgumentException("pending approval id is required");
+        }
+        TeamTaskEntity task = taskMapper.selectById(taskId);
+        if (task == null) {
+            return false;
+        }
+        JSONObject metadata;
+        try {
+            metadata = task.getMetadata() == null || task.getMetadata().isBlank()
+                    ? new JSONObject() : JSONUtil.parseObj(task.getMetadata());
+        } catch (RuntimeException invalid) {
+            metadata = new JSONObject();
+        }
+        String detail = summary == null || summary.isBlank()
+                ? "Tool approval required" : summary.strip();
+        metadata.set("toolApproval", new JSONObject()
+                .set("pendingId", pendingId)
+                .set("summary", detail));
+        boolean parked = taskMapper.update(null, Wrappers.<TeamTaskEntity>lambdaUpdate()
+                .eq(TeamTaskEntity::getId, taskId)
+                .in(TeamTaskEntity::getStatus, TeamTaskStatus.IN_PROGRESS,
+                        TeamTaskStatus.AWAITING_APPROVAL)
+                .set(TeamTaskEntity::getStatus, TeamTaskStatus.AWAITING_APPROVAL)
+                .set(TeamTaskEntity::getReason, detail)
+                .set(TeamTaskEntity::getMetadata, metadata.toString())
+                .set(TeamTaskEntity::getLockExpiresAt, null)) == 1;
+        if (parked) {
+            recordEvent(task.getTeamId(), taskId, TeamTaskEventEntity.AWAITING_APPROVAL,
+                    AUTHOR_SYSTEM, null, pendingId + " — " + detail);
+            projectTask(taskId);
+        }
+        return parked;
+    }
+
+    /** Resume the exact guarded tool request currently recorded on a parked task. */
+    public boolean resumeAfterToolApproval(Long taskId, String pendingId) {
+        if (pendingId == null || pendingId.isBlank()) {
+            throw new IllegalArgumentException("pending approval id is required");
+        }
+        TeamTaskEntity task = requireTask(taskId);
+        if (!TeamTaskStatus.AWAITING_APPROVAL.equals(task.getStatus())) {
+            throw new IllegalStateException("task #" + task.getTaskNumber()
+                    + " is not awaiting tool approval");
+        }
+        JSONObject metadata = parseMetadata(task.getMetadata());
+        JSONObject approval = metadata.getJSONObject("toolApproval");
+        String currentPendingId = approval == null ? null : approval.getStr("pendingId");
+        if (!pendingId.equals(currentPendingId)) {
+            throw new IllegalStateException("tool approval is no longer current for task #"
+                    + task.getTaskNumber());
+        }
+        approval.set("replayInProgress", true);
+        metadata.set("toolApproval", approval);
+        boolean resumed = taskMapper.update(null, Wrappers.<TeamTaskEntity>lambdaUpdate()
+                .eq(TeamTaskEntity::getId, taskId)
+                .eq(TeamTaskEntity::getStatus, TeamTaskStatus.AWAITING_APPROVAL)
+                .set(TeamTaskEntity::getStatus, TeamTaskStatus.IN_PROGRESS)
+                .set(TeamTaskEntity::getOwnerAgentId, task.getAssigneeAgentId())
+                .set(TeamTaskEntity::getReason, null)
+                .set(TeamTaskEntity::getMetadata, metadata.toString())
+                .set(TeamTaskEntity::getLockExpiresAt, newLease())) == 1;
+        if (resumed) {
+            projectTask(taskId);
+        }
+        return resumed;
+    }
+
+    /** Settle a parked guarded tool request as denied without executing it. */
+    public boolean denyToolApproval(Long taskId, String pendingId, String requester) {
+        TeamTaskEntity task = requireTask(taskId);
+        if (!TeamTaskStatus.AWAITING_APPROVAL.equals(task.getStatus())) {
+            throw new IllegalStateException("task #" + task.getTaskNumber()
+                    + " is not awaiting tool approval");
+        }
+        JSONObject metadata = parseMetadata(task.getMetadata());
+        JSONObject approval = metadata.getJSONObject("toolApproval");
+        if (approval == null || !Objects.equals(pendingId, approval.getStr("pendingId"))) {
+            throw new IllegalStateException("tool approval is no longer current for task #"
+                    + task.getTaskNumber());
+        }
+        metadata.remove("toolApproval");
+        String reason = "Tool request denied by "
+                + (requester == null || requester.isBlank() ? "user" : requester);
+        boolean denied = taskMapper.update(null, Wrappers.<TeamTaskEntity>lambdaUpdate()
+                .eq(TeamTaskEntity::getId, taskId)
+                .eq(TeamTaskEntity::getStatus, TeamTaskStatus.AWAITING_APPROVAL)
+                .set(TeamTaskEntity::getStatus, TeamTaskStatus.FAILED)
+                .set(TeamTaskEntity::getReason, reason)
+                .set(TeamTaskEntity::getMetadata, metadata.toString())
+                .set(TeamTaskEntity::getLockExpiresAt, null)) == 1;
+        if (denied) {
+            recordEvent(task.getTeamId(), taskId, TeamTaskEventEntity.FAILED,
+                    AUTHOR_USER, requester, reason);
+            projectTask(taskId);
+        }
+        return denied;
+    }
+
+    /** Durably stage a successful replay before consuming its approval. */
+    public boolean stageToolReplayResult(Long taskId, String pendingId, String reply) {
+        TeamTaskEntity task = requireTask(taskId);
+        JSONObject metadata = parseMetadata(task.getMetadata());
+        JSONObject currentApproval = metadata.getJSONObject("toolApproval");
+        if (!TeamTaskStatus.IN_PROGRESS.equals(task.getStatus())
+                || currentApproval == null
+                || !Objects.equals(pendingId, currentApproval.getStr("pendingId"))) {
+            throw new IllegalStateException("tool approval is no longer current for task #"
+                    + task.getTaskNumber());
+        }
+        JSONObject approval = new JSONObject()
+                .set("pendingId", pendingId)
+                .set("summary", "Approved tool completed; finalizing result")
+                .set("replayResult", truncate(reply == null ? "" : reply,
+                        MAX_STAGED_REPLAY_RESULT_CHARS));
+        metadata.set("toolApproval", approval);
+        boolean staged = taskMapper.update(null, Wrappers.<TeamTaskEntity>lambdaUpdate()
+                .eq(TeamTaskEntity::getId, taskId)
+                .eq(TeamTaskEntity::getStatus, TeamTaskStatus.IN_PROGRESS)
+                .set(TeamTaskEntity::getStatus, TeamTaskStatus.AWAITING_APPROVAL)
+                .set(TeamTaskEntity::getReason, "Approved tool completed; finalizing result")
+                .set(TeamTaskEntity::getMetadata, metadata.toString())
+                .set(TeamTaskEntity::getLockExpiresAt, null)) == 1;
+        if (staged) {
+            projectTask(taskId);
+        }
+        return staged;
+    }
+
+    /** Park a failed replay without allowing an automatic second execution. */
+    public boolean parkToolReplayUncertain(Long taskId, String pendingId, String detail) {
+        TeamTaskEntity task = requireTask(taskId);
+        JSONObject metadata = parseMetadata(task.getMetadata());
+        JSONObject approval = metadata.getJSONObject("toolApproval");
+        if (approval == null || !Objects.equals(pendingId, approval.getStr("pendingId"))) {
+            return false;
+        }
+        approval.set("replayInProgress", false);
+        approval.set("replayOutcomeUncertain", true);
+        approval.set("summary", detail);
+        metadata.set("toolApproval", approval);
+        boolean parked = taskMapper.update(null, Wrappers.<TeamTaskEntity>lambdaUpdate()
+                .eq(TeamTaskEntity::getId, taskId)
+                .eq(TeamTaskEntity::getStatus, TeamTaskStatus.IN_PROGRESS)
+                .set(TeamTaskEntity::getStatus, TeamTaskStatus.AWAITING_APPROVAL)
+                .set(TeamTaskEntity::getReason, detail)
+                .set(TeamTaskEntity::getMetadata, metadata.toString())
+                .set(TeamTaskEntity::getLockExpiresAt, null)) == 1;
+        if (parked) {
+            recordEvent(task.getTeamId(), taskId, TeamTaskEventEntity.AWAITING_APPROVAL,
+                    AUTHOR_SYSTEM, null, detail);
+            projectTask(taskId);
+        }
+        return parked;
+    }
+
+    public String stagedToolReplayResult(TeamTaskEntity task) {
+        JSONObject approval = task == null ? null : parseMetadata(task.getMetadata())
+                .getJSONObject("toolApproval");
+        return approval != null && approval.containsKey("replayResult")
+                ? approval.getStr("replayResult", "") : null;
+    }
+
+    public boolean isToolReplayMessagePersisted(TeamTaskEntity task) {
+        JSONObject approval = task == null ? null : parseMetadata(task.getMetadata())
+                .getJSONObject("toolApproval");
+        return approval != null && approval.getBool("messagePersisted", false);
+    }
+
+    public boolean isToolReplayOutcomeUncertain(TeamTaskEntity task) {
+        JSONObject approval = task == null ? null : parseMetadata(task.getMetadata())
+                .getJSONObject("toolApproval");
+        return approval != null && approval.getBool("replayOutcomeUncertain", false);
+    }
+
+    public boolean markToolReplayMessagePersisted(Long taskId, String pendingId) {
+        TeamTaskEntity task = requireTask(taskId);
+        JSONObject metadata = parseMetadata(task.getMetadata());
+        JSONObject approval = metadata.getJSONObject("toolApproval");
+        if (approval == null || !Objects.equals(pendingId, approval.getStr("pendingId"))) {
+            return false;
+        }
+        approval.set("messagePersisted", true);
+        metadata.set("toolApproval", approval);
+        return taskMapper.update(null, Wrappers.<TeamTaskEntity>lambdaUpdate()
+                .eq(TeamTaskEntity::getId, taskId)
+                .eq(TeamTaskEntity::getStatus, TeamTaskStatus.AWAITING_APPROVAL)
+                .set(TeamTaskEntity::getMetadata, metadata.toString())) == 1;
+    }
+
+    /** Stop an already-claimed replay after a failed execution attempt. */
+    public boolean abortClaimedToolReplay(Long taskId, String pendingId, String requester) {
+        TeamTaskEntity task = requireTask(taskId);
+        if (!TeamTaskStatus.AWAITING_APPROVAL.equals(task.getStatus())) {
+            throw new IllegalStateException("task #" + task.getTaskNumber()
+                    + " is not awaiting replay recovery");
+        }
+        JSONObject metadata = parseMetadata(task.getMetadata());
+        JSONObject approval = metadata.getJSONObject("toolApproval");
+        if (approval == null || !Objects.equals(pendingId, approval.getStr("pendingId"))
+                || approval.containsKey("replayResult")) {
+            throw new IllegalStateException("tool replay is no longer abortable for task #"
+                    + task.getTaskNumber());
+        }
+        metadata.remove("toolApproval");
+        String actor = requester == null || requester.isBlank() ? "user" : requester;
+        String reason = "Approved tool replay aborted by " + actor
+                + "; the previous execution outcome may be uncertain";
+        boolean aborted = taskMapper.update(null, Wrappers.<TeamTaskEntity>lambdaUpdate()
+                .eq(TeamTaskEntity::getId, taskId)
+                .eq(TeamTaskEntity::getStatus, TeamTaskStatus.AWAITING_APPROVAL)
+                .set(TeamTaskEntity::getStatus, TeamTaskStatus.FAILED)
+                .set(TeamTaskEntity::getReason, reason)
+                .set(TeamTaskEntity::getMetadata, metadata.toString())
+                .set(TeamTaskEntity::getLockExpiresAt, null)) == 1;
+        if (aborted) {
+            recordEvent(task.getTeamId(), taskId, TeamTaskEventEntity.FAILED,
+                    AUTHOR_USER, requester, reason);
+            projectTask(taskId);
+        }
+        return aborted;
+    }
+
+    private static String truncate(String value, int maxChars) {
+        return value.length() <= maxChars ? value : value.substring(0, maxChars);
+    }
+
+    /** Reopen a settled worker task for one deliberate, task-scoped follow-up turn. */
+    public boolean resumeForWorkerFeedback(Long taskId) {
+        TeamTaskEntity task = requireTask(taskId);
+        if (TeamTaskStatus.IN_PROGRESS.equals(task.getStatus())) {
+            throw new IllegalStateException("worker task is already running");
+        }
+        if (TeamTaskStatus.AWAITING_APPROVAL.equals(task.getStatus())) {
+            throw new IllegalStateException("resolve the pending tool approval before sending feedback");
+        }
+        if (TeamTaskStatus.CANCELLED.equals(task.getStatus())
+                || TeamTaskStatus.PENDING.equals(task.getStatus())
+                || TeamTaskStatus.BLOCKED.equals(task.getStatus())) {
+            throw new IllegalStateException("task #" + task.getTaskNumber()
+                    + " cannot accept worker feedback while " + task.getStatus());
+        }
+        boolean resumed = taskMapper.update(null, Wrappers.<TeamTaskEntity>lambdaUpdate()
+                .eq(TeamTaskEntity::getId, taskId)
+                .in(TeamTaskEntity::getStatus, TeamTaskStatus.COMPLETED, TeamTaskStatus.FAILED,
+                        TeamTaskStatus.STALE, TeamTaskStatus.IN_REVIEW)
+                .set(TeamTaskEntity::getStatus, TeamTaskStatus.IN_PROGRESS)
+                .set(TeamTaskEntity::getOwnerAgentId, task.getAssigneeAgentId())
+                .set(TeamTaskEntity::getReason, null)
+                .set(TeamTaskEntity::getLockExpiresAt, newLease())) == 1;
+        if (resumed) {
+            projectTask(taskId);
+        }
+        return resumed;
+    }
+
+    private static JSONObject parseMetadata(String raw) {
+        if (raw == null || raw.isBlank()) {
+            return new JSONObject();
+        }
+        try {
+            return JSONUtil.parseObj(raw);
+        } catch (RuntimeException invalid) {
+            return new JSONObject();
+        }
     }
 
     /** Extend the execution lease (runner heartbeat). */
@@ -322,15 +795,25 @@ public class TeamTaskService {
      * @return true when the comment was a blocker that failed the task
      */
     @Transactional
-    public boolean addComment(Long taskId, String authorType, String authorId,
-                              String commentType, String content) {
+    public synchronized boolean addComment(Long taskId, String authorType, String authorId,
+                                            String commentType, String content) {
         TeamTaskEntity task = requireTask(taskId);
+        String normalizedType = commentType == null ? COMMENT_NOTE : commentType;
+        String checkpointKey = checkpointEvidenceKey(content);
+        if (COMMENT_NOTE.equals(normalizedType)
+                && checkpointKey != null
+                && checkpointTerminalTag(task) != null
+                && hasCheckpointEvidence(taskId, checkpointKey)) {
+            log.debug("Skipped duplicate checkpoint evidence {} on team task {}",
+                    checkpointKey, taskId);
+            return false;
+        }
         TeamTaskCommentEntity comment = new TeamTaskCommentEntity();
         comment.setTaskId(taskId);
         comment.setTeamId(task.getTeamId());
         comment.setAuthorType(authorType);
         comment.setAuthorId(authorId);
-        comment.setCommentType(commentType == null ? COMMENT_NOTE : commentType);
+        comment.setCommentType(normalizedType);
         comment.setContent(content);
         commentMapper.insert(comment);
         recordEvent(task.getTeamId(), taskId,
@@ -353,6 +836,46 @@ public class TeamTaskService {
         return commentMapper.selectList(Wrappers.<TeamTaskCommentEntity>lambdaQuery()
                 .eq(TeamTaskCommentEntity::getTaskId, taskId)
                 .orderByAsc(TeamTaskCommentEntity::getCreateTime));
+    }
+
+    /** Persist a note once, using a semantic checkpoint key when present. */
+    @Transactional
+    public synchronized boolean addCommentOnce(Long taskId, String authorType, String authorId,
+                                               String commentType, String content) {
+        String checkpointKey = checkpointEvidenceKey(content);
+        boolean exists = checkpointKey == null
+                ? hasExactComment(taskId, content)
+                : hasCheckpointEvidence(taskId, checkpointKey);
+        if (exists) {
+            return false;
+        }
+        addComment(taskId, authorType, authorId, commentType, content);
+        return true;
+    }
+
+    private boolean hasExactComment(Long taskId, String content) {
+        Long existing = commentMapper.selectCount(Wrappers.<TeamTaskCommentEntity>lambdaQuery()
+                .eq(TeamTaskCommentEntity::getTaskId, taskId)
+                .eq(TeamTaskCommentEntity::getContent, content));
+        return existing != null && existing > 0;
+    }
+
+    private boolean hasCheckpointEvidence(Long taskId, String checkpointKey) {
+        Long existing = commentMapper.selectCount(Wrappers.<TeamTaskCommentEntity>lambdaQuery()
+                .eq(TeamTaskCommentEntity::getTaskId, taskId)
+                .like(TeamTaskCommentEntity::getContent, checkpointKey));
+        return existing != null && existing > 0;
+    }
+
+    static String checkpointEvidenceKey(String content) {
+        if (content == null || content.isBlank()) {
+            return null;
+        }
+        Matcher matcher = Pattern.compile("(?i)\\[checkpoint:(R\\d{3,})]\\s*acknowledged")
+                .matcher(content);
+        return matcher.find()
+                ? "[checkpoint:" + matcher.group(1).toUpperCase() + "] acknowledged"
+                : null;
     }
 
     // ==================== timeline events ====================
@@ -414,7 +937,11 @@ public class TeamTaskService {
      */
     @Transactional
     public void addDeliverable(Long taskId, Long agentId, String name, String url) {
-        TeamTaskEntity task = requireTask(taskId);
+        addDeliverableInternal(requireTask(taskId), agentId, name, url);
+    }
+
+    private void addDeliverableInternal(TeamTaskEntity task, Long agentId, String name, String url) {
+        Long taskId = task.getId();
         if (TeamTaskStatus.isTerminal(task.getStatus())) {
             throw new IllegalStateException("task #" + task.getTaskNumber() + " is "
                     + task.getStatus() + "; deliverables can only be attached while it is active");
@@ -439,6 +966,13 @@ public class TeamTaskService {
         JSONArray deliverables = metadata.getJSONArray("deliverables");
         if (deliverables == null) {
             deliverables = new JSONArray();
+        }
+        for (Object item : deliverables) {
+            if (item instanceof JSONObject existing
+                    && trimmedUrl.equals(existing.getStr("url"))) {
+                log.debug("Team task {} deliverable already attached: {}", taskId, trimmedUrl);
+                return;
+            }
         }
         if (deliverables.size() >= MAX_DELIVERABLES) {
             throw new IllegalStateException("task #" + task.getTaskNumber() + " already has "
@@ -524,12 +1058,20 @@ public class TeamTaskService {
      * picks at most one per assignee so a member never runs two tasks at once.
      */
     public List<TeamTaskEntity> findDispatchable(Long teamId) {
-        return taskMapper.selectList(Wrappers.<TeamTaskEntity>lambdaQuery()
+        List<TeamTaskEntity> candidates = taskMapper.selectList(Wrappers.<TeamTaskEntity>lambdaQuery()
                 .eq(TeamTaskEntity::getTeamId, teamId)
                 .eq(TeamTaskEntity::getStatus, TeamTaskStatus.PENDING)
                 .isNotNull(TeamTaskEntity::getAssigneeAgentId)
                 .orderByDesc(TeamTaskEntity::getPriority)
                 .orderByAsc(TeamTaskEntity::getCreateTime));
+        Set<Long> runIds = candidates.stream()
+                .map(TeamTaskEntity::getRunId)
+                .filter(Objects::nonNull)
+                .collect(java.util.stream.Collectors.toSet());
+        Set<Long> planningRunIds = runService.findPlanningRunIds(runIds);
+        return candidates.stream()
+                .filter(task -> task.getRunId() == null || !planningRunIds.contains(task.getRunId()))
+                .toList();
     }
 
     /** Whether the agent is already executing a task in this team. */
@@ -550,17 +1092,48 @@ public class TeamTaskService {
                 .eq(TeamTaskEntity::getStatus, TeamTaskStatus.IN_PROGRESS)
                 .isNotNull(TeamTaskEntity::getLockExpiresAt)
                 .lt(TeamTaskEntity::getLockExpiresAt, LocalDateTime.now()));
+        int staleCount = 0;
+        int uncertainReplayCount = 0;
         for (TeamTaskEntity task : expired) {
-            taskMapper.update(null, Wrappers.<TeamTaskEntity>lambdaUpdate()
+            JSONObject metadata = parseMetadata(task.getMetadata());
+            JSONObject approval = metadata.getJSONObject("toolApproval");
+            if (approval != null && approval.getBool("replayInProgress", false)) {
+                approval.set("replayInProgress", false);
+                approval.set("replayOutcomeUncertain", true);
+                approval.set("summary", "Approved tool replay was interrupted; outcome is uncertain");
+                metadata.set("toolApproval", approval);
+                String reason = "Approved tool replay lease expired; stop the replay or verify its outcome manually";
+                int rows = taskMapper.update(null, Wrappers.<TeamTaskEntity>lambdaUpdate()
+                        .eq(TeamTaskEntity::getId, task.getId())
+                        .eq(TeamTaskEntity::getStatus, TeamTaskStatus.IN_PROGRESS)
+                        .set(TeamTaskEntity::getStatus, TeamTaskStatus.AWAITING_APPROVAL)
+                        .set(TeamTaskEntity::getReason, reason)
+                        .set(TeamTaskEntity::getMetadata, metadata.toString())
+                        .set(TeamTaskEntity::getLockExpiresAt, null));
+                if (rows == 1) {
+                    uncertainReplayCount++;
+                    recordEvent(task.getTeamId(), task.getId(),
+                            TeamTaskEventEntity.AWAITING_APPROVAL,
+                            AUTHOR_SYSTEM, null, reason);
+                    projectTask(task);
+                }
+                continue;
+            }
+            int rows = taskMapper.update(null, Wrappers.<TeamTaskEntity>lambdaUpdate()
                     .eq(TeamTaskEntity::getId, task.getId())
                     .eq(TeamTaskEntity::getStatus, TeamTaskStatus.IN_PROGRESS)
                     .set(TeamTaskEntity::getStatus, TeamTaskStatus.STALE)
                     .set(TeamTaskEntity::getReason, "execution lease expired"));
-            recordEvent(task.getTeamId(), task.getId(), TeamTaskEventEntity.STALE,
-                    AUTHOR_SYSTEM, null, "execution lease expired");
+            if (rows == 1) {
+                staleCount++;
+                recordEvent(task.getTeamId(), task.getId(), TeamTaskEventEntity.STALE,
+                        AUTHOR_SYSTEM, null, "execution lease expired");
+                projectTask(task);
+            }
         }
-        if (!expired.isEmpty()) {
-            log.warn("Marked {} team task(s) stale after lease expiry", expired.size());
+        if (staleCount > 0 || uncertainReplayCount > 0) {
+            log.warn("Recovered expired team task leases: stale={}, replayOutcomeUncertain={}",
+                    staleCount, uncertainReplayCount);
         }
         return expired;
     }
@@ -569,6 +1142,12 @@ public class TeamTaskService {
 
     public TeamTaskEntity getTask(Long taskId) {
         return taskMapper.selectById(taskId);
+    }
+
+    public List<TeamTaskEntity> listTasksByRun(Long runId) {
+        return taskMapper.selectList(Wrappers.<TeamTaskEntity>lambdaQuery()
+                .eq(TeamTaskEntity::getRunId, runId)
+                .orderByAsc(TeamTaskEntity::getTaskNumber));
     }
 
     /**
@@ -584,6 +1163,44 @@ public class TeamTaskService {
                 .orderByAsc(TeamTaskEntity::getCreateTime));
     }
 
+    /**
+     * Locate the team's dedicated long-running checkpoint tracker, even when
+     * the current checkpoint belongs to a later run. Highest priority and
+     * newest creation win when historical tests left more than one candidate.
+     */
+    public java.util.Optional<TeamTaskEntity> findCheckpointTracker(Long teamId) {
+        return java.util.Optional.ofNullable(taskMapper.selectOne(
+                Wrappers.<TeamTaskEntity>lambdaQuery()
+                        .eq(TeamTaskEntity::getTeamId, teamId)
+                        .and(candidate -> candidate
+                                .like(TeamTaskEntity::getSubject, "共享跟踪")
+                                .or().like(TeamTaskEntity::getSubject, "检查点")
+                                .or().like(TeamTaskEntity::getSubject, "checkpoint"))
+                        .orderByDesc(TeamTaskEntity::getPriority)
+                        .orderByDesc(TeamTaskEntity::getCreateTime)
+                        .last("LIMIT 1")));
+    }
+
+    /** Terminal checkpoint tag declared by a long-running tracker, e.g. R300. */
+    public String checkpointTerminalTag(TeamTaskEntity task) {
+        if (task == null) {
+            return null;
+        }
+        String description = task.getDescription() == null ? "" : task.getDescription();
+        int contextStart = description.indexOf("[Plan context]");
+        if (contextStart >= 0) {
+            description = description.substring(0, contextStart);
+        }
+        String text = (task.getSubject() == null ? "" : task.getSubject()) + " " + description;
+        String lower = text.toLowerCase();
+        if (!text.contains("共享跟踪") && !text.contains("检查点")
+                && !lower.contains("checkpoint")) {
+            return null;
+        }
+        Matcher matcher = CHECKPOINT_RANGE.matcher(text);
+        return matcher.find() ? "R" + matcher.group(2) : null;
+    }
+
     public List<TeamTaskEntity> listTasks(Long teamId, List<String> statuses) {
         return listTasks(teamId, statuses, null, null);
     }
@@ -596,8 +1213,15 @@ public class TeamTaskService {
      */
     public List<TeamTaskEntity> listTasks(Long teamId, List<String> statuses,
                                           Integer limit, Integer offset) {
+        return listTasks(teamId, statuses, limit, offset, null);
+    }
+
+    /** Board query optionally scoped to one run to avoid mixing history. */
+    public List<TeamTaskEntity> listTasks(Long teamId, List<String> statuses,
+                                          Integer limit, Integer offset, Long runId) {
         return taskMapper.selectList(Wrappers.<TeamTaskEntity>lambdaQuery()
                 .eq(TeamTaskEntity::getTeamId, teamId)
+                .eq(runId != null, TeamTaskEntity::getRunId, runId)
                 .in(statuses != null && !statuses.isEmpty(), TeamTaskEntity::getStatus, statuses)
                 .orderByDesc(TeamTaskEntity::getPriority)
                 .orderByDesc(TeamTaskEntity::getCreateTime)
@@ -608,10 +1232,15 @@ public class TeamTaskService {
 
     /** Per-status task counts for the board header, computed in the database. */
     public Map<String, Long> countByStatus(Long teamId) {
+        return countByStatus(teamId, null);
+    }
+
+    public Map<String, Long> countByStatus(Long teamId, Long runId) {
         Map<String, Long> counts = new HashMap<>();
         taskMapper.selectMaps(Wrappers.<TeamTaskEntity>query()
                         .select("status", "count(*) as cnt")
                         .eq("team_id", teamId)
+                        .eq(runId != null, "run_id", runId)
                         .eq("deleted", 0)
                         .groupBy("status"))
                 .forEach(row -> counts.put(String.valueOf(row.get("status")),
@@ -659,6 +1288,7 @@ public class TeamTaskService {
                     .set(TeamTaskEntity::getStatus, TeamTaskStatus.PENDING));
             if (rows == 1) {
                 released.add(candidate.getId());
+                projectTask(candidate);
             }
         }
         if (!released.isEmpty()) {
@@ -678,6 +1308,26 @@ public class TeamTaskService {
         return task;
     }
 
+    private void projectTask(Long taskId) {
+        try {
+            projectionScheduler.scheduleTask(taskId);
+        } catch (RuntimeException error) {
+            log.warn("Team run projection failed after task {} changed: {}", taskId, error.getMessage());
+        }
+    }
+
+    private void projectTask(TeamTaskEntity task) {
+        if (task == null || task.getRunId() == null) {
+            return;
+        }
+        try {
+            projectionScheduler.scheduleRun(task.getRunId());
+        } catch (RuntimeException error) {
+            log.warn("Team run {} projection failed after task {} changed: {}",
+                    task.getRunId(), task.getId(), error.getMessage());
+        }
+    }
+
     private static LocalDateTime newLease() {
         return LocalDateTime.now().plusMinutes(LOCK_MINUTES);
     }
@@ -687,7 +1337,7 @@ public class TeamTaskService {
         return JSONUtil.toJsonStr(ids.stream().map(String::valueOf).toList());
     }
 
-    static List<Long> parseIdArray(String json) {
+    public static List<Long> parseIdArray(String json) {
         if (json == null || json.isBlank()) {
             return Collections.emptyList();
         }

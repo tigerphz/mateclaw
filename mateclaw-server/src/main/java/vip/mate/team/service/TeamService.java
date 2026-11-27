@@ -6,6 +6,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.annotation.Isolation;
 import vip.mate.agent.model.AgentEntity;
 import vip.mate.agent.repository.AgentMapper;
 import vip.mate.team.event.TeamChangedEvent;
@@ -34,6 +35,9 @@ import java.util.Optional;
 @RequiredArgsConstructor
 public class TeamService {
 
+    @org.springframework.beans.factory.annotation.Autowired
+    private vip.mate.agent.runtime.RunningConversationRegistry runningConversationRegistry;
+
     public static final String STATUS_ACTIVE = "active";
     public static final String STATUS_PAUSED = "paused";
 
@@ -41,18 +45,24 @@ public class TeamService {
     private final AgentTeamMemberMapper memberMapper;
     private final AgentMapper agentMapper;
     private final ApplicationEventPublisher eventPublisher;
+    private final TeamRosterLifecycleService rosterLifecycle;
 
-    @Transactional
-    public AgentTeamEntity createTeam(String name, String description, Long leadAgentId,
+    // Roster checks after a team-lock wait must see newly committed changes.
+    @Transactional(isolation = Isolation.READ_COMMITTED)
+    public AgentTeamEntity createTeam(Long workspaceId, String name, String description, Long leadAgentId,
                                       List<Long> memberAgentIds, String createdBy) {
-        requireAgentExists(leadAgentId, "lead");
+        List<Long> roster = new ArrayList<>();
+        roster.add(leadAgentId);
+        if (memberAgentIds != null) roster.addAll(memberAgentIds);
+        rosterLifecycle.lockAgents(roster);
+        requireAgentInWorkspace(leadAgentId, workspaceId, "lead");
         requireNotInAnyTeam(leadAgentId);
         if (memberAgentIds != null) {
             for (Long memberId : memberAgentIds) {
                 if (memberId.equals(leadAgentId)) {
                     throw new IllegalArgumentException("lead agent cannot also be listed as a member");
                 }
-                requireAgentExists(memberId, "member");
+                requireAgentInWorkspace(memberId, workspaceId, "member");
                 requireNotInAnyTeam(memberId);
             }
         }
@@ -60,6 +70,7 @@ public class TeamService {
         AgentTeamEntity team = new AgentTeamEntity();
         team.setName(name);
         team.setDescription(description);
+        team.setWorkspaceId(workspaceId);
         team.setLeadAgentId(leadAgentId);
         team.setStatus(STATUS_ACTIVE);
         team.setTaskSeq(0);
@@ -76,27 +87,31 @@ public class TeamService {
         return team;
     }
 
-    @Transactional
-    public void addMember(Long teamId, Long agentId, String role) {
-        AgentTeamEntity team = requireTeam(teamId);
+    @Transactional(isolation = Isolation.READ_COMMITTED)
+    public void addMember(Long teamId, Long workspaceId, Long agentId, String role) {
+        rosterLifecycle.lockAgents(List.of(agentId));
+        lockTeam(teamId);
+        AgentTeamEntity team = requireTeam(teamId, workspaceId);
         if (TeamRole.LEAD.equals(role)) {
             throw new IllegalArgumentException("a team has exactly one lead; role must be member or reviewer");
         }
         if (agentId.equals(team.getLeadAgentId())) {
             throw new IllegalArgumentException("agent is already the team lead");
         }
-        requireAgentExists(agentId, "member");
+        requireAgentInWorkspace(agentId, workspaceId, "member");
         requireNotInAnyTeam(agentId);
         insertMember(teamId, agentId, role == null ? TeamRole.MEMBER : role);
         notifyTeamChanged(teamId);
     }
 
-    @Transactional
-    public void removeMember(Long teamId, Long agentId) {
-        AgentTeamEntity team = requireTeam(teamId);
+    @Transactional(isolation = Isolation.READ_COMMITTED)
+    public void removeMember(Long teamId, Long workspaceId, Long agentId) {
+        lockTeam(teamId);
+        AgentTeamEntity team = requireTeam(teamId, workspaceId);
         if (agentId.equals(team.getLeadAgentId())) {
             throw new IllegalArgumentException("cannot remove the team lead; delete the team instead");
         }
+        rosterLifecycle.assertMemberRemovable(teamId, agentId);
         memberMapper.delete(Wrappers.<AgentTeamMemberEntity>lambdaQuery()
                 .eq(AgentTeamMemberEntity::getTeamId, teamId)
                 .eq(AgentTeamMemberEntity::getAgentId, agentId));
@@ -105,9 +120,11 @@ public class TeamService {
         notifyTeamChanged(teamId);
     }
 
-    @Transactional
-    public void deleteTeam(Long teamId) {
-        requireTeam(teamId);
+    @Transactional(isolation = Isolation.READ_COMMITTED)
+    public void deleteTeam(Long teamId, Long workspaceId) {
+        lockTeam(teamId);
+        requireTeam(teamId, workspaceId);
+        rosterLifecycle.assertTeamDeletable(teamId);
         // Capture membership before it is wiped so every agent gets evicted.
         List<Long> agentIds = listMembers(teamId).stream()
                 .map(AgentTeamMemberEntity::getAgentId).toList();
@@ -117,9 +134,10 @@ public class TeamService {
         eventPublisher.publishEvent(new TeamChangedEvent(agentIds));
     }
 
-    @Transactional
-    public AgentTeamEntity updateTeam(Long teamId, String name, String description, String settings) {
-        AgentTeamEntity team = requireTeam(teamId);
+    @Transactional(isolation = Isolation.READ_COMMITTED)
+    public AgentTeamEntity updateTeam(Long teamId, Long workspaceId, String name, String description, String settings) {
+        lockTeam(teamId);
+        AgentTeamEntity team = requireTeam(teamId, workspaceId);
         if (name != null) {
             team.setName(name);
         }
@@ -127,20 +145,50 @@ public class TeamService {
             team.setDescription(description);
         }
         if (settings != null) {
-            team.setSettings(settings);
+            String merged = TeamCoordinatorPolicy.mergeSettings(team.getSettings(), settings);
+            boolean before = TeamCoordinatorPolicy.enabled(team.getSettings());
+            boolean after = TeamCoordinatorPolicy.enabled(merged);
+            if (before != after && runningConversationRegistry != null
+                    && runningConversationRegistry.isAgentActive(team.getLeadAgentId())) {
+                throw new vip.mate.exception.MateClawException("err.team.coordinator_lead_active", 409, "Wait for the lead's active turn to finish before changing coordinator mode");
+            }
+            if (after) {
+                AgentEntity lead = agentMapper.selectById(team.getLeadAgentId());
+                if (lead == null) throw new IllegalArgumentException("Team lead does not exist");
+                TeamCoordinatorPolicy.requireNative(lead.getRuntimeType());
+            }
+            team.setSettings(merged);
         }
         teamMapper.updateById(team);
         notifyTeamChanged(teamId);
         return team;
     }
 
-    public List<AgentTeamEntity> listTeams() {
+    public List<AgentTeamEntity> listTeams(Long workspaceId) {
+        return teamMapper.selectList(Wrappers.<AgentTeamEntity>lambdaQuery()
+                .eq(AgentTeamEntity::getWorkspaceId, workspaceId)
+                .orderByDesc(AgentTeamEntity::getCreateTime));
+    }
+
+    /** Internal scheduler view across all workspaces. Never expose through an HTTP endpoint. */
+    public List<AgentTeamEntity> listAllTeams() {
         return teamMapper.selectList(Wrappers.<AgentTeamEntity>lambdaQuery()
                 .orderByDesc(AgentTeamEntity::getCreateTime));
     }
 
+    /** Serialize task creation/retry and roster mutation inside their existing transactions. */
+    public void lockTeam(Long teamId) {
+        rosterLifecycle.lockTeam(teamId);
+    }
+
     public AgentTeamEntity getTeam(Long teamId) {
         return teamMapper.selectById(teamId);
+    }
+
+    public AgentTeamEntity getTeam(Long teamId, Long workspaceId) {
+        return teamMapper.selectOne(Wrappers.<AgentTeamEntity>lambdaQuery()
+                .eq(AgentTeamEntity::getId, teamId)
+                .eq(AgentTeamEntity::getWorkspaceId, workspaceId));
     }
 
     public List<AgentTeamMemberEntity> listMembers(Long teamId) {
@@ -154,6 +202,10 @@ public class TeamService {
      * builder to inject team context and by the task tool to scope board access.
      */
     public Optional<AgentTeamEntity> getTeamForAgent(Long agentId) {
+        AgentEntity agent = agentMapper.selectById(agentId);
+        if (agent == null || agent.getWorkspaceId() == null) {
+            return Optional.empty();
+        }
         AgentTeamMemberEntity member = memberMapper.selectOne(Wrappers.<AgentTeamMemberEntity>lambdaQuery()
                 .eq(AgentTeamMemberEntity::getAgentId, agentId)
                 .last("LIMIT 1"));
@@ -161,13 +213,20 @@ public class TeamService {
             return Optional.empty();
         }
         AgentTeamEntity team = teamMapper.selectById(member.getTeamId());
-        if (team == null || !STATUS_ACTIVE.equals(team.getStatus())) {
+        if (team == null || !STATUS_ACTIVE.equals(team.getStatus())
+                || !agent.getWorkspaceId().equals(team.getWorkspaceId())) {
             return Optional.empty();
         }
         return Optional.of(team);
     }
 
     public boolean isMember(Long teamId, Long agentId) {
+        AgentTeamEntity team = teamMapper.selectById(teamId);
+        AgentEntity agent = agentMapper.selectById(agentId);
+        if (team == null || agent == null || team.getWorkspaceId() == null
+                || !team.getWorkspaceId().equals(agent.getWorkspaceId())) {
+            return false;
+        }
         return memberMapper.selectCount(Wrappers.<AgentTeamMemberEntity>lambdaQuery()
                 .eq(AgentTeamMemberEntity::getTeamId, teamId)
                 .eq(AgentTeamMemberEntity::getAgentId, agentId)) > 0;
@@ -209,18 +268,21 @@ public class TeamService {
         memberMapper.insert(member);
     }
 
-    private AgentTeamEntity requireTeam(Long teamId) {
-        AgentTeamEntity team = teamMapper.selectById(teamId);
+    private AgentTeamEntity requireTeam(Long teamId, Long workspaceId) {
+        AgentTeamEntity team = getTeam(teamId, workspaceId);
         if (team == null) {
             throw new IllegalArgumentException("team not found: " + teamId);
         }
         return team;
     }
 
-    private void requireAgentExists(Long agentId, String roleLabel) {
+    private void requireAgentInWorkspace(Long agentId, Long workspaceId, String roleLabel) {
         AgentEntity agent = agentMapper.selectById(agentId);
         if (agent == null) {
             throw new IllegalArgumentException(roleLabel + " agent not found: " + agentId);
+        }
+        if (!workspaceId.equals(agent.getWorkspaceId())) {
+            throw new IllegalArgumentException(roleLabel + " agent does not belong to the current workspace: " + agentId);
         }
     }
 

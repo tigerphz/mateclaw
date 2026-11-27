@@ -1,6 +1,6 @@
 package vip.mate.agent.graph.state;
 
-import com.alibaba.cloud.ai.graph.OverAllState;
+import vip.mate.agent.runtime.state.RunState;
 import org.springframework.ai.chat.messages.Message;
 import vip.mate.agent.GraphEventPublisher;
 import vip.mate.agent.context.ChatOrigin;
@@ -13,16 +13,16 @@ import static vip.mate.agent.graph.state.MateClawStateKeys.*;
 /**
  * 类型安全的状态访问器
  * <p>
- * 封装 {@link OverAllState} 的字符串 key 读写，
+ * 封装 {@link RunState} 的字符串 key 读写，
  * 提供带默认值的强类型方法，避免业务代码散落 state.value("xxx") 调用。
  *
  * @author MateClaw Team
  */
 public final class MateClawStateAccessor {
 
-    private final OverAllState state;
+    private final RunState state;
 
-    public MateClawStateAccessor(OverAllState state) {
+    public MateClawStateAccessor(RunState state) {
         this.state = Objects.requireNonNull(state, "state must not be null");
     }
 
@@ -117,6 +117,10 @@ public final class MateClawStateAccessor {
 
     public String finalAnswerDraft() {
         return state.value(FINAL_ANSWER_DRAFT, "");
+    }
+
+    public String longFormDraft() {
+        return state.value(LONG_FORM_DRAFT, "");
     }
 
     public boolean limitExceeded() {
@@ -214,6 +218,24 @@ public final class MateClawStateAccessor {
 
     public SourceEvidenceLedger sourceEvidenceLedger() {
         return state.<SourceEvidenceLedger>value(SOURCE_EVIDENCE_LEDGER).orElse(SourceEvidenceLedger.empty());
+    }
+
+    public ActionExecutionLedger actionExecutionLedger() {
+        return state.<ActionExecutionLedger>value(ACTION_EXECUTION_LEDGER).orElse(ActionExecutionLedger.empty());
+    }
+
+    public boolean actionCompletionRequired() {
+        return state.value(ACTION_COMPLETION_REQUIRED, false);
+    }
+
+    public int finalizationAttempts() { return state.value(FINALIZATION_ATTEMPTS, 0); }
+
+    public int actionCompletionRetryCount() {
+        return state.value(ACTION_COMPLETION_RETRY_COUNT, 0);
+    }
+
+    public boolean continueReasoning() {
+        return state.value(CONTINUE_REASONING, false);
     }
 
     // ===== 审批重放 =====
@@ -437,6 +459,10 @@ public final class MateClawStateAccessor {
             return put(FINAL_ANSWER_DRAFT, draft);
         }
 
+        public OutputBuilder longFormDraft(String draft) {
+            return put(LONG_FORM_DRAFT, draft);
+        }
+
         // ---- 终止 ----
         public OutputBuilder finalAnswer(String answer) {
             return put(FINAL_ANSWER, answer);
@@ -523,6 +549,24 @@ public final class MateClawStateAccessor {
             return put(SOURCE_EVIDENCE_LEDGER, ledger);
         }
 
+        public OutputBuilder actionExecutionLedger(ActionExecutionLedger ledger) {
+            return put(ACTION_EXECUTION_LEDGER, ledger);
+        }
+
+        public OutputBuilder actionCompletionRequired(boolean required) {
+            return put(ACTION_COMPLETION_REQUIRED, required);
+        }
+
+        public OutputBuilder finalizationAttempts(int count) { return put(FINALIZATION_ATTEMPTS, count); }
+
+        public OutputBuilder actionCompletionRetryCount(int count) {
+            return put(ACTION_COMPLETION_RETRY_COUNT, count);
+        }
+
+        public OutputBuilder continueReasoning(boolean shouldContinue) {
+            return put(CONTINUE_REASONING, shouldContinue);
+        }
+
         // ---- 审批重放 ----
         public OutputBuilder forcedToolCall(String json) {
             return put(FORCED_TOOL_CALL, json);
@@ -555,7 +599,7 @@ public final class MateClawStateAccessor {
         // ---- Token Usage ----
 
         /** 将本次 LLM 调用的 usage 累加到 state 已有值上 */
-        public OutputBuilder mergeUsage(OverAllState currentState,
+        public OutputBuilder mergeUsage(RunState currentState,
                                         NodeStreamingChatHelper.StreamResult result) {
             int existingPrompt = currentState.value(PROMPT_TOKENS, 0);
             int existingCompletion = currentState.value(COMPLETION_TOKENS, 0);

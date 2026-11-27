@@ -1,5 +1,7 @@
 package vip.mate.llm.service;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
@@ -12,6 +14,7 @@ import org.springframework.util.StringUtils;
 import org.springframework.web.client.RestClient;
 import vip.mate.exception.MateClawException;
 import vip.mate.llm.chatmodel.OpenAiModelsPath;
+import vip.mate.llm.chatmodel.ProviderGenerateKwargs;
 import vip.mate.llm.model.*;
 import vip.mate.llm.oauth.OpenAIOAuthService;
 
@@ -656,16 +659,10 @@ public class ModelDiscoveryService {
             throw new MateClawException("err.llm.base_url_missing", "Base URL 未配置");
         }
 
-        Map<String, Object> requestBody = Map.of(
-                "model", modelId,
-                "messages", List.of(Map.of("role", "user", "content", "请回复：连接正常")),
-                "max_tokens", 10,
-                "temperature", 0
-        );
-
         // 从 generateKwargs 读取 completionsPath（智谱等用 /chat/completions 而非 /v1/chat/completions）
         Map<String, Object> kwargs = modelProviderService.readProviderGenerateKwargs(provider);
         String completionsPath = resolveCompletionsPath(baseUrl, kwargs);
+        Map<String, Object> requestBody = buildTestPromptRequestBody(modelId, kwargs);
 
         RestClient.RequestHeadersSpec<?> spec = openAiCompatibleClientBuilder()
                 .baseUrl(baseUrl)
@@ -682,6 +679,42 @@ public class ModelDiscoveryService {
 
         String body = spec.retrieve().body(String.class);
         return extractOpenAiChatContent(body);
+    }
+
+    /**
+     * Build the smoke-test request body for the OpenAI-compatible test-prompt path.
+     * Probe limits follow the same ModelFamily constraints as runtime chat.
+     * Reasoning models need a completion budget that includes reasoning tokens;
+     * use 4096 for recognized reasoning families and 512 otherwise, since even
+     * an unrecognized family may spend tokens reasoning before producing text.
+     * These are upper bounds, not a guarantee that every model can finish. Any
+     * unrecognized top-level {@code generateKwargs} key (e.g. vLLM's
+     * {@code chat_template_kwargs} used to disable Qwen thinking mode) is forwarded
+     * verbatim, same as the runtime chat path in
+     * {@code OpenAiCompatibleChatModelBuilder#buildOpenAiOptions}. Passthrough is
+     * merged first so the fixed probe fields always win if a key ever collides.
+     * Package-private for unit tests.
+     */
+    static Map<String, Object> buildTestPromptRequestBody(String modelId, Map<String, Object> kwargs) {
+        Map<String, Object> requestBody = new LinkedHashMap<>(ProviderGenerateKwargs.collectPassthroughExtraBody(kwargs));
+        requestBody.put("model", modelId);
+        requestBody.put("messages", List.of(Map.of("role", "user", "content", "请回复：连接正常")));
+        ModelFamily family = ModelFamily.detect(modelId);
+        if (family.useMaxCompletionTokens()) {
+            requestBody.put("max_completion_tokens", 4096);
+            // Let OpenAI/Azure use model defaults: reasoning deployments may
+            // reject explicit sampling options even in a connectivity probe.
+        } else {
+            requestBody.put("max_tokens", family.isThinking() ? 4096 : 512);
+            Object probeTemperature;
+            if (family.fixedTemperatureOne()) {
+                probeTemperature = 1.0d;
+            } else {
+                probeTemperature = 0;
+            }
+            requestBody.put("temperature", probeTemperature);
+        }
+        return requestBody;
     }
 
     /**
@@ -871,13 +904,45 @@ public class ModelDiscoveryService {
         }
     }
 
+    /**
+     * A reachable endpoint is not proof that a chat probe completed. Require a
+     * final textual answer and the OpenAI-compatible completion marker. In
+     * particular, reasoning-only and token-limited responses must fail visibly.
+     * Never turn malformed JSON into canned success or expose the raw payload
+     * (which may contain provider-internal details) in a validation error.
+     */
     private String extractOpenAiChatContent(String body) {
-        try {
-            JsonNode root = objectMapper.readTree(body);
-            return root.path("choices").path(0).path("message").path("content").asText("连接正常");
-        } catch (Exception e) {
-            return "连接正常（响应解析异常）";
+        if (!StringUtils.hasText(body)) {
+            throw new IllegalStateException("模型探针返回空响应，未取得完整回复");
         }
+        JsonNode root;
+        try {
+            root = objectMapper.reader()
+                    .with(DeserializationFeature.FAIL_ON_TRAILING_TOKENS)
+                    .readTree(body);
+        } catch (JsonProcessingException e) {
+            throw new IllegalStateException("模型探针响应不是有效 JSON，未取得完整回复");
+        }
+        if (root == null || !root.isObject() || root.hasNonNull("error")) {
+            throw new IllegalStateException("模型探针返回错误或无效响应，未取得完整回复");
+        }
+        JsonNode choices = root.path("choices");
+        if (!choices.isArray() || choices.isEmpty()) {
+            throw new IllegalStateException("模型探针响应缺少 choices，未取得完整回复");
+        }
+        JsonNode choice = choices.get(0);
+        String finishReason = choice.path("finish_reason").asText("");
+        if ("length".equals(finishReason)) {
+            throw new IllegalStateException("模型探针达到输出令牌上限，未取得完整回复（不代表模型不可用）");
+        }
+        if (!"stop".equals(finishReason)) {
+            throw new IllegalStateException("模型探针未正常完成（finish_reason 必须为 stop），请检查供应商响应");
+        }
+        JsonNode content = choice.path("message").path("content");
+        if (!content.isTextual() || !StringUtils.hasText(content.textValue())) {
+            throw new IllegalStateException("模型探针未返回有效正文（仅推理内容不算完整回复）");
+        }
+        return content.textValue();
     }
 
     private String extractGeminiContent(String body) {
@@ -914,7 +979,7 @@ public class ModelDiscoveryService {
      */
     private String resolveCompletionsPath(String baseUrl, Map<String, Object> kwargs) {
         if (kwargs != null) {
-            Object raw = kwargs.get("completionsPath");
+            Object raw = ProviderGenerateKwargs.findOptionValue(kwargs, "completionsPath");
             if (raw instanceof String value && StringUtils.hasText(value)) {
                 String path = value.trim();
                 if (!path.startsWith("/")) {
@@ -965,7 +1030,7 @@ public class ModelDiscoveryService {
         if (kwargs == null) {
             return;
         }
-        Object customHeaders = kwargs.get("customHeaders");
+        Object customHeaders = ProviderGenerateKwargs.findOptionValue(kwargs, "customHeaders");
         if (customHeaders instanceof Map) {
             ((Map<String, Object>) customHeaders).forEach((key, value) -> {
                 if (value != null) {
