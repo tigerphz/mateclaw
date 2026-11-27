@@ -74,7 +74,7 @@ public class AgentGenerationService {
         }
 
         // Build the capability catalog the model is allowed to pick from.
-        List<AvailableToolDTO> tools = bindableTools();
+        List<AvailableToolDTO> tools = bindableTools(wsId);
         List<SkillEntity> skills = workspaceSkills(wsId);
         List<WikiKnowledgeBaseEntity> kbs = workspaceKbs(wsId);
 
@@ -106,10 +106,10 @@ public class AgentGenerationService {
 
     // ==================== Catalog ====================
 
-    private List<AvailableToolDTO> bindableTools() {
+    private List<AvailableToolDTO> bindableTools(Long workspaceId) {
         List<AvailableToolDTO> all;
         try {
-            all = availableToolService.listAvailable();
+            all = availableToolService.listAvailable(workspaceId);
         } catch (Exception e) {
             log.warn("[AgentGen] failed to list tools: {}", e.getMessage());
             return List.of();
@@ -295,6 +295,14 @@ public class AgentGenerationService {
     private JsonNode parseJson(String response) {
         if (response == null || response.isBlank()) return null;
         String cleaned = response.trim();
+        // Some reasoning models prepend thinking to content on non-streaming
+        // calls. Strip only leading blocks: tags inside JSON string values are
+        // legitimate persona text, and JSON examples in thinking are not drafts.
+        while (cleaned.startsWith("<think>")) {
+            int end = cleaned.indexOf("</think>", "<think>".length());
+            if (end < 0) return null; // Incomplete reasoning is not a final answer.
+            cleaned = cleaned.substring(end + "</think>".length()).trim();
+        }
         if (cleaned.startsWith("```json")) cleaned = cleaned.substring(7);
         else if (cleaned.startsWith("```")) cleaned = cleaned.substring(3);
         if (cleaned.endsWith("```")) cleaned = cleaned.substring(0, cleaned.length() - 3);

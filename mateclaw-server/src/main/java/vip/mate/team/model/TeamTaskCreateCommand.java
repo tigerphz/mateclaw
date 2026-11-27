@@ -18,9 +18,15 @@ public class TeamTaskCreateCommand {
 
     private Long teamId;
 
+    private Long runId;
+
     private String subject;
 
     private String description;
+
+    private String acceptanceCriteria;
+
+    private String constraints;
 
     /** Required: the member agent expected to execute this task. */
     private Long assigneeAgentId;

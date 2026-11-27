@@ -23,7 +23,7 @@ import java.util.Set;
  * The model calls this after spotting a tool in the {@code ## Extension Tools}
  * catalog. The tool only validates and returns a confirmation message — the
  * activation is recorded into graph state by the action node (tools cannot
- * mutate {@code OverAllState} directly), so the enabled tool's schema becomes
+ * mutate {@code RunState} directly), so the enabled tool's schema becomes
  * visible on the next reasoning turn of the same ReAct loop.
  */
 @Slf4j
@@ -32,6 +32,8 @@ import java.util.Set;
 public class EnableExtensionTool {
 
     private final ToolRegistry toolRegistry;
+    @org.springframework.beans.factory.annotation.Autowired
+    private vip.mate.tool.mcp.runtime.McpWorkspaceAccess mcpWorkspaceAccess;
     private final ToolDisclosureService toolDisclosureService;
     private final AgentBindingService agentBindingService;
 
@@ -59,6 +61,7 @@ public class EnableExtensionTool {
         // reported active yet never appear (the reasoning-node split only activates
         // tools in the agent's own set).
         AgentToolSet agentSet = toolRegistry.getEnabledToolSet();
+        if (mcpWorkspaceAccess != null) agentSet = mcpWorkspaceAccess.scope(agentSet, ChatOrigin.from(ctx).workspaceId());
         Long agentId = ChatOrigin.from(ctx).agentId();
         if (agentId != null) {
             Set<String> effective = agentBindingService.getEffectiveToolNames(agentId);

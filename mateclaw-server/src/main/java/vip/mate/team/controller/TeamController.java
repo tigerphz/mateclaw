@@ -5,12 +5,15 @@ import io.swagger.v3.oas.annotations.tags.Tag;
 import lombok.Data;
 import lombok.RequiredArgsConstructor;
 import org.springframework.web.bind.annotation.*;
+import org.springframework.web.context.request.RequestContextHolder;
+import org.springframework.web.context.request.ServletRequestAttributes;
 import vip.mate.agent.model.AgentEntity;
 import vip.mate.agent.repository.AgentMapper;
 import vip.mate.common.result.R;
 import vip.mate.team.model.AgentTeamEntity;
 import vip.mate.team.model.AgentTeamMemberEntity;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
+import vip.mate.channel.web.Utf8SseEmitter;
 import vip.mate.team.model.TeamTaskCommentEntity;
 import vip.mate.team.model.TeamTaskCreateCommand;
 import vip.mate.team.model.TeamTaskEntity;
@@ -19,12 +22,18 @@ import vip.mate.team.model.TeamTaskStatus;
 import vip.mate.team.service.TeamAnnounceService;
 import vip.mate.team.service.TeamDispatchService;
 import vip.mate.team.service.TeamEventChannel;
+import vip.mate.team.service.TeamManualTaskService;
 import vip.mate.team.service.TeamService;
 import vip.mate.team.service.TeamTaskService;
+import vip.mate.team.service.TeamWorkerInterventionService;
+import vip.mate.workspace.core.annotation.RequireWorkspaceRole;
 
 import java.security.Principal;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.stream.Collectors;
 import java.util.function.Supplier;
 
 /**
@@ -45,44 +54,43 @@ public class TeamController {
 
     private final TeamService teamService;
     private final TeamTaskService taskService;
+    private final TeamManualTaskService manualTaskService;
     private final TeamDispatchService dispatchService;
     private final TeamAnnounceService announceService;
     private final TeamEventChannel eventChannel;
+    private final TeamWorkerInterventionService workerInterventionService;
     private final AgentMapper agentMapper;
 
     // ==================== team CRUD ====================
 
     @Operation(summary = "团队列表")
     @GetMapping
+    @RequireWorkspaceRole("viewer")
     public R<List<TeamVO>> list() {
-        return R.ok(teamService.listTeams().stream().map(this::toVO).toList());
+        return R.ok(teamService.listTeams(currentWorkspaceId()).stream().map(this::toVO).toList());
     }
 
     @Operation(summary = "团队详情（含成员）")
     @GetMapping("/{id}")
+    @RequireWorkspaceRole("viewer")
     public R<TeamDetailVO> get(@PathVariable Long id) {
-        AgentTeamEntity team = teamService.getTeam(id);
+        AgentTeamEntity team = teamService.getTeam(id, currentWorkspaceId());
         if (team == null) {
             return R.fail("team not found");
         }
         List<MemberVO> members = teamService.listMembers(id).stream()
-                .map(m -> {
-                    AgentEntity agent = agentMapper.selectById(m.getAgentId());
-                    return new MemberVO(m.getAgentId(),
-                            agent != null && agent.getName() != null ? agent.getName()
-                                    : String.valueOf(m.getAgentId()),
-                            m.getRole(),
-                            agent != null ? agent.getIcon() : null);
-                })
+                .map(m -> toMemberVO(team, m))
+                .filter(java.util.Objects::nonNull)
                 .toList();
         return R.ok(new TeamDetailVO(toVO(team), members));
     }
 
     @Operation(summary = "创建团队")
     @PostMapping
+    @RequireWorkspaceRole("admin")
     public R<TeamVO> create(@RequestBody CreateTeamRequest req, Principal principal) {
         return guarded(() -> {
-            AgentTeamEntity team = teamService.createTeam(req.getName(), req.getDescription(),
+            AgentTeamEntity team = teamService.createTeam(currentWorkspaceId(), req.getName(), req.getDescription(),
                     req.getLeadAgentId(), req.getMemberAgentIds(),
                     principal != null ? principal.getName() : "admin");
             return R.ok(toVO(team));
@@ -91,16 +99,18 @@ public class TeamController {
 
     @Operation(summary = "更新团队")
     @PutMapping("/{id}")
+    @RequireWorkspaceRole("admin")
     public R<TeamVO> update(@PathVariable Long id, @RequestBody UpdateTeamRequest req) {
-        return guarded(() -> R.ok(toVO(teamService.updateTeam(id, req.getName(),
+        return guarded(() -> R.ok(toVO(teamService.updateTeam(id, currentWorkspaceId(), req.getName(),
                 req.getDescription(), req.getSettings()))));
     }
 
     @Operation(summary = "删除团队")
     @DeleteMapping("/{id}")
+    @RequireWorkspaceRole("admin")
     public R<Void> delete(@PathVariable Long id) {
         return guarded(() -> {
-            teamService.deleteTeam(id);
+            teamService.deleteTeam(id, currentWorkspaceId());
             return R.ok(null);
         });
     }
@@ -109,18 +119,20 @@ public class TeamController {
 
     @Operation(summary = "添加成员")
     @PostMapping("/{id}/members")
+    @RequireWorkspaceRole("admin")
     public R<Void> addMember(@PathVariable Long id, @RequestBody MemberRequest req) {
         return guarded(() -> {
-            teamService.addMember(id, req.getAgentId(), req.getRole());
+            teamService.addMember(id, currentWorkspaceId(), req.getAgentId(), req.getRole());
             return R.ok(null);
         });
     }
 
     @Operation(summary = "移除成员")
     @DeleteMapping("/{id}/members/{agentId}")
+    @RequireWorkspaceRole("admin")
     public R<Void> removeMember(@PathVariable Long id, @PathVariable Long agentId) {
         return guarded(() -> {
-            teamService.removeMember(id, agentId);
+            teamService.removeMember(id, currentWorkspaceId(), agentId);
             return R.ok(null);
         });
     }
@@ -129,18 +141,34 @@ public class TeamController {
 
     @Operation(summary = "任务板列表")
     @GetMapping("/{id}/tasks")
+    @RequireWorkspaceRole("viewer")
     public R<List<TaskVO>> listTasks(@PathVariable Long id,
                                      @RequestParam(required = false) List<String> status,
                                      @RequestParam(required = false) Integer limit,
-                                     @RequestParam(required = false) Integer offset) {
-        return R.ok(taskService.listTasks(id, status, limit, offset).stream()
-                .map(this::toTaskVO).toList());
+                                     @RequestParam(required = false) Integer offset,
+                                     @RequestParam(required = false) Long runId) {
+        return guarded(() -> {
+            requireTeam(id);
+            List<TeamTaskEntity> tasks = taskService.listTasks(id, status, limit, offset, runId);
+            Set<Long> agentIds = tasks.stream()
+                    .flatMap(task -> java.util.stream.Stream.of(
+                            task.getAssigneeAgentId(), task.getOwnerAgentId()))
+                    .filter(java.util.Objects::nonNull)
+                    .collect(Collectors.toCollection(LinkedHashSet::new));
+            Map<Long, AgentEntity> agents = agentIds.isEmpty()
+                    ? Map.of()
+                    : agentMapper.selectBatchIds(agentIds).stream()
+                            .collect(Collectors.toMap(AgentEntity::getId, agent -> agent));
+            return R.ok(tasks.stream().map(task -> toTaskVO(task, agents)).toList());
+        });
     }
 
     @Operation(summary = "任务详情（含评论）")
     @GetMapping("/{id}/tasks/{taskId}")
+    @RequireWorkspaceRole("viewer")
     public R<TaskDetailVO> getTask(@PathVariable Long id, @PathVariable Long taskId) {
         return guarded(() -> {
+            requireTeam(id);
             TeamTaskEntity task = requireTask(id, taskId);
             return R.ok(new TaskDetailVO(toTaskVO(task), taskService.listComments(taskId)));
         });
@@ -148,13 +176,18 @@ public class TeamController {
 
     @Operation(summary = "手动创建任务")
     @PostMapping("/{id}/tasks")
+    @RequireWorkspaceRole("admin")
     public R<TaskVO> createTask(@PathVariable Long id, @RequestBody CreateTaskRequest req,
                                 Principal principal) {
         return guarded(() -> {
-            TeamTaskEntity task = taskService.createTask(TeamTaskCreateCommand.builder()
+            AgentTeamEntity team = requireTeam(id);
+            TeamTaskEntity task = manualTaskService.createTask(team, TeamTaskCreateCommand.builder()
                     .teamId(id)
+                    .runId(req.getRunId())
                     .subject(req.getSubject())
                     .description(req.getDescription())
+                    .acceptanceCriteria(req.getAcceptanceCriteria())
+                    .constraints(req.getConstraints())
                     .assigneeAgentId(req.getAssigneeAgentId())
                     .priority(req.getPriority())
                     .blockedBy(req.getBlockedBy())
@@ -163,18 +196,17 @@ public class TeamController {
                     .channel("dashboard")
                     .build());
             eventChannel.publishTaskEvent(task, "team_task_created", Map.of());
-            if (TeamTaskStatus.PENDING.equals(task.getStatus())) {
-                dispatchService.requestDispatch(id);
-            }
             return R.ok(toTaskVO(task));
         });
     }
 
     @Operation(summary = "批准 in_review 任务")
     @PostMapping("/{id}/tasks/{taskId}/approve")
+    @RequireWorkspaceRole("admin")
     public R<TaskVO> approve(@PathVariable Long id, @PathVariable Long taskId,
                              Principal principal) {
         return guarded(() -> {
+            requireTeam(id);
             requireTask(id, taskId);
             List<Long> released = taskService.approveTask(taskId);
             recordUserEvent(id, taskId, TeamTaskEventEntity.APPROVED, principal, null);
@@ -186,12 +218,68 @@ public class TeamController {
         });
     }
 
+    @Operation(summary = "批准 worker 工具调用并在原会话恢复执行")
+    @PostMapping("/{id}/tasks/{taskId}/worker/approve")
+    @RequireWorkspaceRole("admin")
+    public R<TaskVO> approveWorkerTool(@PathVariable Long id, @PathVariable Long taskId,
+                                       @RequestBody WorkerApprovalRequest req,
+                                       Principal principal) {
+        return workerGuarded(() -> {
+            requireTeam(id);
+            requireTask(id, taskId);
+            if (req == null || req.getPendingId() == null || req.getPendingId().isBlank()) {
+                throw new IllegalArgumentException("pending approval id is required");
+            }
+            TeamTaskEntity task = workerInterventionService.approve(id, taskId,
+                    req.getPendingId().strip(), principalName(principal));
+            return R.ok(toTaskVO(task));
+        });
+    }
+
+    @Operation(summary = "拒绝 worker 工具调用")
+    @PostMapping("/{id}/tasks/{taskId}/worker/deny")
+    @RequireWorkspaceRole("admin")
+    public R<TaskVO> denyWorkerTool(@PathVariable Long id, @PathVariable Long taskId,
+                                    @RequestBody WorkerApprovalRequest req,
+                                    Principal principal) {
+        return workerGuarded(() -> {
+            requireTeam(id);
+            requireTask(id, taskId);
+            if (req == null || req.getPendingId() == null || req.getPendingId().isBlank()) {
+                throw new IllegalArgumentException("pending approval id is required");
+            }
+            TeamTaskEntity task = workerInterventionService.deny(id, taskId,
+                    req.getPendingId().strip(), principalName(principal));
+            return R.ok(toTaskVO(task));
+        });
+    }
+
+    @Operation(summary = "向 worker 原会话发送任务级补充指令")
+    @PostMapping("/{id}/tasks/{taskId}/worker/feedback")
+    @RequireWorkspaceRole("admin")
+    public R<TaskVO> feedbackWorker(@PathVariable Long id, @PathVariable Long taskId,
+                                     @RequestBody WorkerFeedbackRequest req,
+                                     Principal principal) {
+        return workerGuarded(() -> {
+            requireTeam(id);
+            requireTask(id, taskId);
+            if (req == null || req.getMessage() == null || req.getMessage().isBlank()) {
+                throw new IllegalArgumentException("feedback is required");
+            }
+            TeamTaskEntity task = workerInterventionService.feedback(id, taskId,
+                    req.getMessage(), principalName(principal));
+            return R.ok(toTaskVO(task));
+        });
+    }
+
     @Operation(summary = "驳回 in_review 任务")
     @PostMapping("/{id}/tasks/{taskId}/reject")
+    @RequireWorkspaceRole("admin")
     public R<TaskVO> reject(@PathVariable Long id, @PathVariable Long taskId,
                             @RequestBody(required = false) ReasonRequest req,
                             Principal principal) {
         return guarded(() -> {
+            requireTeam(id);
             requireTask(id, taskId);
             taskService.rejectTask(taskId, req == null ? null : req.getReason());
             recordUserEvent(id, taskId, TeamTaskEventEntity.REJECTED, principal,
@@ -207,9 +295,11 @@ public class TeamController {
 
     @Operation(summary = "重试 failed/stale 任务")
     @PostMapping("/{id}/tasks/{taskId}/retry")
+    @RequireWorkspaceRole("admin")
     public R<TaskVO> retry(@PathVariable Long id, @PathVariable Long taskId,
                            Principal principal) {
         return guarded(() -> {
+            requireTeam(id);
             requireTask(id, taskId);
             if (!taskService.retryTask(taskId)) {
                 return R.fail("only failed or stale tasks can be retried");
@@ -223,10 +313,12 @@ public class TeamController {
 
     @Operation(summary = "取消任务")
     @PostMapping("/{id}/tasks/{taskId}/cancel")
+    @RequireWorkspaceRole("admin")
     public R<TaskVO> cancel(@PathVariable Long id, @PathVariable Long taskId,
                             @RequestBody(required = false) ReasonRequest req,
                             Principal principal) {
         return guarded(() -> {
+            requireTeam(id);
             TeamTaskEntity task = requireTask(id, taskId);
             List<Long> released = taskService.cancelTask(taskId, req == null ? null : req.getReason());
             recordUserEvent(id, taskId, TeamTaskEventEntity.CANCELLED, principal,
@@ -243,8 +335,10 @@ public class TeamController {
 
     @Operation(summary = "任务时间线")
     @GetMapping("/{id}/tasks/{taskId}/events")
+    @RequireWorkspaceRole("viewer")
     public R<List<TeamTaskEventEntity>> taskEvents(@PathVariable Long id, @PathVariable Long taskId) {
         return guarded(() -> {
+            requireTeam(id);
             requireTask(id, taskId);
             return R.ok(taskService.listEvents(taskId));
         });
@@ -252,9 +346,11 @@ public class TeamController {
 
     @Operation(summary = "团队事件流（SSE）")
     @GetMapping("/{id}/events")
+    @RequireWorkspaceRole("viewer")
     public SseEmitter events(@PathVariable Long id,
                              @RequestHeader(value = "Last-Event-ID", required = false) Long lastEventId) {
-        SseEmitter emitter = new SseEmitter(0L);
+        requireTeam(id);
+        SseEmitter emitter = new Utf8SseEmitter(0L);
         // A fresh subscription is an activity ticker, not a transcript: skip
         // the ring-buffer replay (stale events would render as breaking news)
         // and deliver live events only. A reconnect carrying Last-Event-ID
@@ -273,11 +369,17 @@ public class TeamController {
         eventChannel.publishTaskEvent(taskService.getTask(taskId), event, Map.of());
     }
 
+    private String principalName(Principal principal) {
+        return principal != null && principal.getName() != null ? principal.getName() : "admin";
+    }
+
     @Operation(summary = "添加评论")
     @PostMapping("/{id}/tasks/{taskId}/comments")
+    @RequireWorkspaceRole("admin")
     public R<Void> comment(@PathVariable Long id, @PathVariable Long taskId,
                            @RequestBody CommentRequest req, Principal principal) {
         return guarded(() -> {
+            requireTeam(id);
             requireTask(id, taskId);
             taskService.addComment(taskId, TeamTaskService.AUTHOR_USER,
                     principal != null ? principal.getName() : "admin",
@@ -288,8 +390,13 @@ public class TeamController {
 
     @Operation(summary = "任务状态统计（看板列头）")
     @GetMapping("/{id}/tasks/stats")
-    public R<Map<String, Long>> taskStats(@PathVariable Long id) {
-        return R.ok(taskService.countByStatus(id));
+    @RequireWorkspaceRole("viewer")
+    public R<Map<String, Long>> taskStats(@PathVariable Long id,
+                                          @RequestParam(required = false) Long runId) {
+        return guarded(() -> {
+            requireTeam(id);
+            return R.ok(taskService.countByStatus(id, runId));
+        });
     }
 
     // ==================== helpers / DTOs ====================
@@ -308,6 +415,18 @@ public class TeamController {
         }
     }
 
+    /** Intervention endpoints expose recoverable client states instead of generic 500s. */
+    private <T> R<T> workerGuarded(Supplier<R<T>> action) {
+        try {
+            return action.get();
+        } catch (IllegalArgumentException error) {
+            int code = error.getMessage() != null && error.getMessage().contains("not found") ? 404 : 400;
+            return R.fail(code, error.getMessage());
+        } catch (IllegalStateException error) {
+            return R.fail(409, error.getMessage());
+        }
+    }
+
     private TeamTaskEntity requireTask(Long teamId, Long taskId) {
         TeamTaskEntity task = taskService.getTask(taskId);
         if (task == null || !task.getTeamId().equals(teamId)) {
@@ -316,8 +435,32 @@ public class TeamController {
         return task;
     }
 
+    private AgentTeamEntity requireTeam(Long teamId) {
+        AgentTeamEntity team = teamService.getTeam(teamId, currentWorkspaceId());
+        if (team == null) {
+            throw new IllegalArgumentException("team not found: " + teamId);
+        }
+        return team;
+    }
+
+    private long currentWorkspaceId() {
+        if (RequestContextHolder.getRequestAttributes() instanceof ServletRequestAttributes attrs) {
+            String header = attrs.getRequest().getHeader("X-Workspace-Id");
+            if (header != null && !header.isBlank()) {
+                try {
+                    return Long.parseLong(header.trim());
+                } catch (NumberFormatException ignored) {
+                    // Keep the same defaulting semantics as WorkspaceAccessInterceptor.
+                }
+            }
+        }
+        return 1L;
+    }
+
     private TeamVO toVO(AgentTeamEntity team) {
-        long memberCount = teamService.listMembers(team.getId()).size();
+        long memberCount = teamService.listMembers(team.getId()).stream()
+                .filter(member -> memberBelongsToWorkspace(team, member))
+                .count();
         AgentEntity lead = agentMapper.selectById(team.getLeadAgentId());
         return new TeamVO(team,
                 lead != null && lead.getName() != null ? lead.getName()
@@ -326,10 +469,41 @@ public class TeamController {
                 memberCount);
     }
 
+    private MemberVO toMemberVO(AgentTeamEntity team, AgentTeamMemberEntity member) {
+        AgentEntity agent = agentMapper.selectById(member.getAgentId());
+        if (agent == null || !team.getWorkspaceId().equals(agent.getWorkspaceId())) {
+            return null;
+        }
+        return new MemberVO(member.getAgentId(),
+                agent.getName() != null ? agent.getName() : String.valueOf(member.getAgentId()),
+                member.getRole(), agent.getIcon(), agent.getDescription(), agent.getEnabled());
+    }
+
+    private boolean memberBelongsToWorkspace(AgentTeamEntity team, AgentTeamMemberEntity member) {
+        AgentEntity agent = agentMapper.selectById(member.getAgentId());
+        return agent != null && team.getWorkspaceId().equals(agent.getWorkspaceId());
+    }
+
     private TaskVO toTaskVO(TeamTaskEntity task) {
         return new TaskVO(task,
                 agentName(task.getAssigneeAgentId()),
-                task.getOwnerAgentId() == null ? null : agentName(task.getOwnerAgentId()));
+                task.getOwnerAgentId() == null ? null : agentName(task.getOwnerAgentId()),
+                task.getRunId());
+    }
+
+    private TaskVO toTaskVO(TeamTaskEntity task, Map<Long, AgentEntity> agents) {
+        return new TaskVO(task,
+                agentName(task.getAssigneeAgentId(), agents),
+                agentName(task.getOwnerAgentId(), agents),
+                task.getRunId());
+    }
+
+    private String agentName(Long agentId, Map<Long, AgentEntity> agents) {
+        if (agentId == null) {
+            return null;
+        }
+        AgentEntity agent = agents.get(agentId);
+        return agent != null && agent.getName() != null ? agent.getName() : String.valueOf(agentId);
     }
 
     private String agentName(Long agentId) {
@@ -346,10 +520,10 @@ public class TeamController {
     public record TeamDetailVO(TeamVO team, List<MemberVO> members) {
     }
 
-    public record MemberVO(Long agentId, String name, String role, String icon) {
+    public record MemberVO(Long agentId, String name, String role, String icon, String description, Boolean enabled) {
     }
 
-    public record TaskVO(TeamTaskEntity task, String assigneeName, String ownerName) {
+    public record TaskVO(TeamTaskEntity task, String assigneeName, String ownerName, Long runId) {
     }
 
     public record TaskDetailVO(TaskVO task, List<TeamTaskCommentEntity> comments) {
@@ -378,8 +552,11 @@ public class TeamController {
 
     @Data
     public static class CreateTaskRequest {
+        private Long runId;
         private String subject;
         private String description;
+        private String acceptanceCriteria;
+        private String constraints;
         private Long assigneeAgentId;
         private Integer priority;
         private List<Long> blockedBy;
@@ -394,5 +571,15 @@ public class TeamController {
     @Data
     public static class CommentRequest {
         private String content;
+    }
+
+    @Data
+    public static class WorkerApprovalRequest {
+        private String pendingId;
+    }
+
+    @Data
+    public static class WorkerFeedbackRequest {
+        private String message;
     }
 }

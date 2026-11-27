@@ -14,8 +14,10 @@
 |---------|--------|----------|
 | `default` | H2 文件 `./data/mateclaw` | 不用做什么 |
 | `mysql` | MySQL 8.0+ | `spring.profiles.active=mysql` 或环境变量 |
+| `postgres` | PostgreSQL 16+ | `SPRING_PROFILES_ACTIVE=postgres` |
+| `kingbase` | KingbaseES | `SPRING_PROFILES_ACTIVE=kingbase`（需按需驱动） |
 
-Docker 部署自动激活 `mysql`。桌面版用 `default`。
+公开 Docker Compose 自动激活 `postgres`。桌面版使用 `default`；`mysql` profile 继续支持已有或自管部署。
 
 ---
 
@@ -44,7 +46,7 @@ spring:
       enabled: true              # /h2-console 可访问（生产环境关掉）
 ```
 
-### 数据库 —— MySQL（生产）
+### 数据库 —— MySQL（支持的自管部署）
 
 ```yaml
 spring:
@@ -53,7 +55,7 @@ spring:
   datasource:
     url: jdbc:mysql://localhost:3306/mateclaw?useSSL=false&serverTimezone=UTC
     username: root
-    password: ${MYSQL_ROOT_PASSWORD}
+    password: ${DB_PASSWORD}
     driver-class-name: com.mysql.cj.jdbc.Driver
 ```
 
@@ -63,7 +65,7 @@ spring:
 **模型配置 100% 通过 UI 管理。** 不要在 `application.yml` 里放 `spring.ai.*` 块——每个供应商、每个 key、每个模型配置都住在 `设置 → 模型` 里，底层存在 `mate_model_provider` 和 `mate_model_config` 表。
 :::
 
-**LLM API Key 不读取环境变量**——`DASHSCOPE_API_KEY` / `OPENAI_API_KEY` 等都不再起作用。新装的实例启动时数据库里没有供应商，登录后到「设置 → 模型 → 添加供应商」加你的第一个供应商即可。完整参考在 [模型配置](./models)。
+**模型供应商、Key 与模型记录以数据库配置为准。** 新装实例登录后到「设置 → 模型 → 添加供应商」添加第一个供应商。`DASHSCOPE_API_KEY` 仍可作为 DashScope 自动配置的兼容回退，但不替代管理界面的供应商配置；不要假设其他供应商会读取同名环境变量。完整参考在 [模型配置](./models)。
 
 ### 虚拟线程（JDK 21）
 
@@ -173,12 +175,12 @@ mateclaw:
 ```yaml
 mateclaw:
   jwt:
-    secret: ${JWT_SECRET:your-secret-key-at-least-32-characters-long}
+    secret: ${JWT_SECRET:}
     expiration: 86400000
 ```
 
 ::: warning
-生产环境必须改默认 JWT secret。至少 32 字符。用环境变量，**不要 commit**。
+所有环境启动时都必须配置 `JWT_SECRET`。使用唯一的随机值，至少 32 个 UTF-8 字节；可用 `openssl rand -base64 48` 生成。不要 commit。更换密钥会使现有 token 失效。
 :::
 
 ### 技能工作空间
@@ -215,40 +217,43 @@ mate:
 
 ## 环境变量
 
-::: warning LLM Key 不读环境变量
-DashScope / OpenAI / Anthropic / DeepSeek / Kimi 等供应商的 API Key **不通过环境变量配置**——容器零 Key 也能起来，登录后到「设置 → 模型 → 添加供应商」里加。
+::: warning LLM Key 以管理界面为准
+供应商、Key 和模型记录以「设置 → 模型」里的数据库配置为主。`DASHSCOPE_API_KEY` 仅保留为 DashScope 自动配置的兼容回退；不要假设其他供应商会读取同名环境变量。
 :::
 
 | 变量 | 必填 | 用途 |
 |------|------|------|
 | `SERPER_API_KEY` | — | Google Serper 搜索 key（搜索工具暂未迁到 UI） |
 | `TAVILY_API_KEY` | — | Tavily 搜索 key（同上） |
-| `JWT_SECRET` | — | JWT 签名密钥（生产推荐） |
+| `JWT_SECRET` | 是 | JWT 签名密钥 |
 | `MATECLAW_CORS_ALLOWED_ORIGINS` | — | CORS 白名单（生产推荐） |
-| `DB_PASSWORD` / `DB_ROOT_PASSWORD` | Docker | MySQL 业务库 / root 密码 |
-| `SPRING_PROFILES_ACTIVE` | — | 生产设为 `mysql` |
+| `DB_PASSWORD` / `DB_ADMIN_PASSWORD` | Docker | PostgreSQL 应用账号 / 引导管理员密码（必须不同） |
+| `DB_USERNAME` / `DB_ADMIN_USERNAME` | — | PostgreSQL 应用账号 / 引导管理员账号 |
+| `DB_HOST` / `DB_PORT` / `DB_NAME` | — | 数据库地址、端口与库名 |
+| `SPRING_PROFILES_ACTIVE` | — | Docker Compose 自动设为 `postgres`；自管部署也可用 `mysql` / `kingbase` |
 
 ### 怎么设
 
 **Linux / macOS：**
 
 ```bash
-export JWT_SECRET=your-production-secret-at-least-32-chars
+export JWT_SECRET="$(openssl rand -base64 48)"
 export SERPER_API_KEY=your-serper-key   # 可选
 ```
 
 **Windows（PowerShell）：**
 
 ```powershell
-$env:JWT_SECRET = "your-production-secret-at-least-32-chars"
+$env:JWT_SECRET = openssl rand -base64 48
 ```
 
 **Docker（`.env` 文件）：**
 
 ```properties
 DB_PASSWORD=secure-password-here
-DB_ROOT_PASSWORD=different-secure-password-here
-JWT_SECRET=your-production-secret-at-least-32-chars
+DB_ADMIN_PASSWORD=different-secure-password-here
+# 生成命令：openssl rand -base64 48
+JWT_SECRET=replace-with-generated-value
 ```
 
 启动后到 `http://localhost:18080`，`admin / admin123` 登录，「设置 → 模型 → 添加供应商」配第一家 LLM。
@@ -263,7 +268,18 @@ MateClaw 用 **Flyway** 管理 schema 迁移：
 2. `db/migration/mysql/V*__*.sql`——MySQL 方言的迁移脚本
 3. 迁移完成后加载种子数据（`db/data-*.sql`），幂等执行
 
-启动时 Flyway 根据 active profile 自动选择正确的方言路径。每次启动时先做一次 `repair`，再 `migrate`——checksum 变更和部分失败的迁移自动修复（对桌面端离线升级用户尤其重要）。
+Flyway 根据 active profile 选择迁移方言。启动时执行 `migrate`，所有内置 profile 默认开启 checksum 校验。已执行的迁移脚本不应修改；校验不匹配或迁移失败会阻止启动，不会自动改写历史记录。
+
+**桌面版升级兼容性：** 如果旧数据库记录的脚本与新版本不同，升级后可能无法启动。新数据库和迁移历史一致的数据库无需 repair。保留可用旧版应用打开的数据库备份，不要通过删除数据库来消除校验错误。
+
+校验失败时：
+
+1. 停止应用并备份数据库。保留准确的旧版、新版安装包，检查出错的迁移及 schema history。
+2. 对比新旧 SQL 与实际表结构、数据，优先恢复正确的迁移文件或使用维护者提供的向前迁移。`repair` 只修正迁移元数据，**不会**执行被修改的 DDL、撤销部分执行的 DDL/数据变更，也不能证明表结构正确。应先处理部分迁移造成的影响。
+3. 只有确认适合修复历史记录后，才为一次受控启动设置 `mateclaw.flyway.auto-repair=true`（环境变量 `MATECLAW_FLYWAY_AUTOREPAIR=true`）。repair 使用当前配置的迁移路径，随后正常迁移；保持校验开启。
+4. 立即移除该开关，正常重启，确认校验及业务功能通过后再允许写入。恢复失败时，使用匹配的旧版应用和数据库备份一起回退。
+
+该开关默认 `false`，桌面版也一样，不应作为无人值守升级策略。仍可通过外部配置覆盖 `spring.flyway.validate-on-migrate`，但设为 `false` 会绕过校验保护，不能代替修复。
 
 ### 表约定
 
@@ -290,7 +306,7 @@ CREATE DATABASE mateclaw CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 
 ```bash
 export SPRING_PROFILES_ACTIVE=mysql
-export MYSQL_ROOT_PASSWORD=your-password
+export DB_PASSWORD=your-password
 mvn spring-boot:run
 ```
 

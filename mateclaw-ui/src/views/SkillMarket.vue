@@ -481,12 +481,31 @@
                 v-if="canEditFiles && !creatingFile"
                 class="detail-edit-btn detail-edit-primary"
                 @click="startCreateFile"
+                :disabled="uploadingFiles"
               >
                 + {{ t('skills.detail.fileNew') }}
               </button>
             </div>
             <p class="detail-hint">{{ t('skills.detail.filesHint') }}</p>
             <p v-if="isBuiltinDetail" class="detail-hint">{{ t('skills.detail.builtinFilesReadonly') }}</p>
+
+            <fieldset v-if="canEditFiles" class="skill-file-upload" :disabled="uploadingFiles || savingFile || editingFile || creatingFile">
+              <label>{{ t('skills.detail.uploadDestination') }}
+                <select v-model="uploadBucket" :aria-label="t('skills.detail.uploadDestination')">
+                  <option value="references">references/</option>
+                  <option value="templates">templates/</option>
+                  <option value="scripts">scripts/</option>
+                </select>
+              </label>
+              <label>{{ t('skills.detail.uploadFiles') }}
+                <input type="file" multiple :aria-label="t('skills.detail.uploadFiles')" @change="uploadSkillFiles" />
+              </label>
+              <label>{{ t('skills.detail.uploadFolder') }}
+                <input type="file" multiple webkitdirectory :aria-label="t('skills.detail.uploadFolder')" @change="uploadSkillFiles" />
+              </label>
+              <p class="detail-hint">{{ t('skills.detail.uploadHint') }}</p>
+            </fieldset>
+            <p v-if="uploadingFiles" role="status">{{ uploadProgress || t('common.loading') }}</p>
 
             <!-- New-file form -->
             <div v-if="creatingFile" class="skill-file-create">
@@ -536,10 +555,11 @@
                 <h4 class="detail-block-title"><code>{{ activeFile.path }}</code></h4>
                 <div class="edit-actions">
                   <template v-if="!editingFile">
-                    <button v-if="canEditFiles" class="detail-edit-btn detail-edit-primary" @click="startEditFile">
+                    <button class="detail-edit-btn" @click="downloadActiveFile">{{ t('skills.detail.fileDownload') }}</button>
+                    <button v-if="canEditFiles && !activeFile.binary" :disabled="uploadingFiles" class="detail-edit-btn detail-edit-primary" @click="startEditFile">
                       {{ t('skills.detail.fileEdit') }}
                     </button>
-                    <button v-if="canEditFiles" class="detail-edit-btn detail-edit-cancel" @click="removeActiveFile" :disabled="savingFile">
+                    <button v-if="canEditFiles" class="detail-edit-btn detail-edit-cancel" @click="removeActiveFile" :disabled="savingFile || uploadingFiles">
                       {{ t('skills.detail.fileDelete') }}
                     </button>
                   </template>
@@ -554,6 +574,7 @@
                 </div>
               </div>
               <p v-if="fileContentLoading" class="detail-empty">{{ t('common.loading') }}</p>
+              <p v-else-if="activeFile.binary" class="detail-hint">{{ t('skills.detail.binaryFileHint') }}</p>
               <pre v-else-if="!editingFile" class="detail-pre">{{ activeFileContent }}</pre>
               <textarea
                 v-else
@@ -625,6 +646,7 @@
             </button>
           </div>
 
+          <SkillScanIncompleteNotice :findings="parsedFindings(detailSkill)" />
           <ul v-if="parsedFindings(detailSkill).length > 0" class="scan-findings-list">
             <li
               v-for="(f, idx) in parsedFindings(detailSkill)"
@@ -702,12 +724,13 @@
         <div v-if="detailTab === 'lessons'" class="detail-section">
           <div class="lessons-header">
             <p class="detail-hint">{{ t('skills.detail.lessonsHint') }}</p>
-            <button class="lessons-clear-btn" :disabled="!detailLessonsRaw" @click="clearLessons">
+            <button class="lessons-clear-btn" :disabled="!detailLessonsRaw || deletingLesson || detailLessonsLoading" @click="clearLessons">
               {{ t('skills.detail.clearLessons') }}
             </button>
           </div>
           <p v-if="detailLessonsLoading" class="detail-empty">{{ t('common.loading') }}</p>
-          <p v-else-if="!detailLessonsRaw" class="detail-empty">{{ t('skills.detail.noLessons') }}</p>
+          <p v-else-if="detailLessonsEntries?.length === 0 || !detailLessonsRaw" class="detail-empty">{{ t('skills.detail.noLessons') }}</p>
+          <SkillLessonsPanel v-else-if="detailLessonsEntries" :entries="detailLessonsEntries" :disabled="deletingLesson" @remove="withdrawLesson" />
           <pre v-else class="detail-pre">{{ detailLessonsRaw }}</pre>
         </div>
 
@@ -798,6 +821,12 @@
 </template>
 
 <script setup lang="ts">
+import SkillLessonsPanel from '@/components/skill/SkillLessonsPanel.vue'
+import { useSkillLessons } from '@/composables/useSkillLessons'
+import SkillScanIncompleteNotice from '@/components/skill/SkillScanIncompleteNotice.vue'
+import { hasIncompleteSkillScan } from '@/utils/skillScanState'
+import { applySkillSnapshot } from '@/utils/skillSnapshot'
+import { planSkillFileUploads, type SkillFileBucket } from '@/utils/skillFileUpload'
 import { ref, reactive, computed, onMounted, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { mcToast } from '@/composables/useMcToast'
@@ -860,8 +889,13 @@ const rescanning = ref<Record<string, boolean>>({})
 const detailDrawerVisible = ref(false)
 const detailSkill = ref<Skill | null>(null)
 const detailTab = ref<'overview' | 'body' | 'files' | 'manifest' | 'tools' | 'features' | 'security' | 'lessons' | 'secrets' | 'memory'>('overview')
-const detailLessonsRaw = ref<string>('')
-const detailLessonsLoading = ref(false)
+const deletingLesson = ref(false)
+const { raw: detailLessonsRaw, entries: detailLessonsEntries, loading: detailLessonsLoading,
+  load: loadLessons, reset: resetLessons, clearLocal: clearLessonState, owns: ownsLessonPanel } = useSkillLessons(
+  computed(() => detailDrawerVisible.value ? detailSkill.value?.id : undefined),
+  (error: any) => mcToast.error(typeof error === 'string' ? error : error?.message || t('skills.messages.loadFailed')),
+)
+
 const detailEmployees = ref<Array<{ id: number; name: string; icon?: string; binding?: 'explicit' | 'implicit' }>>([])
 const detailEmployeesLoading = ref(false)
 
@@ -911,9 +945,77 @@ const editBodyForm = ref<{ skillContent: string; sourceCode: string }>({
 
 interface SkillBundleFile {
   path: string
+  binary?: boolean
   size?: number
   sha256?: string
   updateTime?: string
+}
+
+const uploadBucket = ref<SkillFileBucket>('references')
+const uploadingFiles = ref(false)
+const uploadProgress = ref('')
+
+async function uploadSkillFiles(event: Event) {
+  const input = event.target as HTMLInputElement
+  const files = Array.from(input.files ?? [])
+  input.value = ''
+  if (!files.length || !detailSkill.value || uploadingFiles.value) return
+  const skillId = detailSkill.value.id
+  let plans
+  try {
+    plans = planSkillFileUploads(files, uploadBucket.value)
+  } catch (error) {
+    mcToast.error(t(`skills.detail.uploadErrors.${(error as Error).message}`))
+    return
+  }
+  uploadingFiles.value = true
+  let uploaded = 0
+  try {
+    const response: any = await skillApi.listFiles(skillId)
+    const existing = new Set<string>((response?.data ?? []).map((f: SkillBundleFile) => f.path))
+    const conflicts = plans.filter(item => existing.has(item.path))
+    if (conflicts.length && !await mcConfirm({
+      title: t('skills.detail.uploadFiles'),
+      message: t('skills.detail.uploadOverwrite', { paths: conflicts.map(item => item.path).join('、') }),
+      tone: 'danger',
+    })) return
+    for (const item of plans) {
+      uploadProgress.value = `${uploaded + 1}/${plans.length}: ${item.path}`
+      await skillApi.uploadFile(skillId, item.file, item.path, existing.has(item.path))
+      uploaded++
+    }
+    mcToast.success(t('skills.detail.uploadComplete', { count: uploaded }))
+  } catch (error: any) {
+    mcToast.error(t('skills.detail.uploadFailed', { count: uploaded, error: error?.message || String(error) }))
+  } finally {
+    uploadingFiles.value = false
+    uploadProgress.value = ''
+    if (detailSkill.value?.id === skillId) {
+      activeFile.value = null
+      editingFile.value = false
+      await loadDetailFiles()
+    }
+  }
+}
+
+async function downloadActiveFile() {
+  if (!detailSkill.value || !activeFile.value) return
+  const path = activeFile.value.path
+  try {
+    const blob = await skillApi.downloadFile(detailSkill.value.id, path)
+    if (blob.type.includes('application/json')) {
+      const error = JSON.parse(await blob.text())
+      throw new Error(error.msg || t('skills.detail.fileLoadFailed'))
+    }
+    const url = URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = path.split('/').pop() || 'download'
+    link.click()
+    setTimeout(() => URL.revokeObjectURL(url), 1000)
+  } catch (error: any) {
+    mcToast.error(error?.message || t('skills.detail.fileLoadFailed'))
+  }
 }
 
 const detailFiles = ref<SkillBundleFile[]>([])
@@ -961,6 +1063,7 @@ async function openFile(file: SkillBundleFile) {
   try {
     const res: any = await skillApi.getFileContent(detailSkill.value.id, file.path)
     activeFileContent.value = res?.data?.content ?? ''
+    file.binary = Boolean(res?.data?.binary)
   } catch (e: any) {
     activeFileContent.value = ''
     mcToast.error(typeof e === 'string' ? e : e?.message || t('skills.detail.fileLoadFailed'))
@@ -970,6 +1073,7 @@ async function openFile(file: SkillBundleFile) {
 }
 
 function startEditFile() {
+  if (activeFile.value?.binary) return
   fileEditContent.value = activeFileContent.value
   editingFile.value = true
 }
@@ -1121,7 +1225,7 @@ function openDetailDrawer(
 ) {
   detailSkill.value = skill
   detailTab.value = tab
-  detailLessonsRaw.value = ''
+  resetLessons()
   detailEmployees.value = []
   editingIdentity.value = false
   editingBody.value = false
@@ -1173,34 +1277,29 @@ async function loadDetailEmployees() {
   }
 }
 
-async function loadLessons() {
-  if (!detailSkill.value) return
-  detailLessonsLoading.value = true
+async function withdrawLesson(lessonId: string) {
+  if (!detailSkill.value || deletingLesson.value) return
+  const id = detailSkill.value.id
+  const ok = await mcConfirm({ title:t('skills.detail.withdrawLesson'), message:t('skills.detail.withdrawLessonConfirm'), tone:'danger' })
+  if (!ok || !ownsLessonPanel(id)) return
+  deletingLesson.value = true
   try {
-    const res: any = await skillApi.getLessons(detailSkill.value.id)
-    detailLessonsRaw.value = res?.data?.raw || ''
+    await skillApi.deleteLesson(id, lessonId)
+    if (ownsLessonPanel(id)) await loadLessons()
   } catch (e: any) {
-    detailLessonsRaw.value = ''
-    console.warn('[SkillMarket] failed to load lessons', e)
-  } finally {
-    detailLessonsLoading.value = false
-  }
+    if (ownsLessonPanel(id)) mcToast.error(typeof e === 'string' ? e : e?.message || t('skills.messages.deleteFailed'))
+  } finally { deletingLesson.value = false }
 }
 
 async function clearLessons() {
   if (!detailSkill.value) return
-  const ok = await mcConfirm({
-    title: t('skills.messages.deleteTitle'),
-    message: t('skills.detail.clearLessonsConfirm'),
-    tone: 'danger',
-  })
-  if (!ok) return
+  const id = detailSkill.value.id
+  const ok = await mcConfirm({ title:t('skills.messages.deleteTitle'), message:t('skills.detail.clearLessonsConfirm'), tone:'danger' })
+  if (!ok || !ownsLessonPanel(id)) return
   try {
-    await skillApi.clearLessons(detailSkill.value.id)
-    detailLessonsRaw.value = ''
-  } catch (e: any) {
-    mcToast.error(typeof e === 'string' ? e : e?.message || t('skills.messages.deleteFailed'))
-  }
+    await skillApi.clearLessons(id)
+    clearLessonState(id)
+  } catch (e: any) { if (ownsLessonPanel(id)) mcToast.error(typeof e === 'string' ? e : e?.message || t('skills.messages.deleteFailed')) }
 }
 
 watch(detailTab, (tab) => {
@@ -1569,13 +1668,7 @@ function findLoadedSkill(pred: (s: Skill) => boolean): Skill | undefined {
  *  doesn't need a full reload. (Enable-toggle, which moves a skill between
  *  sections, reloads both sections instead.) */
 function patchSkillInPlace(updated: Skill) {
-  for (const seg of [segments.enabled, segments.available]) {
-    const idx = seg.items.findIndex(s => s.id === updated.id)
-    if (idx >= 0) {
-      seg.items.splice(idx, 1, { ...seg.items[idx], ...updated })
-      return
-    }
-  }
+  applySkillSnapshot(updated, [segments.enabled, segments.available], detailSkill)
 }
 
 async function deleteSkill(idOrSkill: string | number | Skill) {
@@ -1733,11 +1826,10 @@ async function rescanSkill(skill: Skill) {
     if (updated) {
       // Patch the row in-place so the panel updates without a full page reload.
       patchSkillInPlace(updated)
-      mcToast.success(
-        updated.securityScanStatus === 'FAILED'
-          ? t('skills.security.rescanStillFailed')
-          : t('skills.security.rescanPassed')
-      )
+      if (updated.securityScanStatus === 'FAILED') {
+        mcToast.warning(t(hasIncompleteSkillScan(parsedFindings(updated))
+          ? 'skills.security.scanIncomplete' : 'skills.security.rescanStillFailed'))
+      } else mcToast.success(t('skills.security.rescanPassed'))
     }
     // Refresh runtime status too so the in-memory badges stay in sync.
     await loadRuntimeStatus()
@@ -1815,7 +1907,7 @@ function getScanPillCls(skill: Skill): string {
 }
 
 function getScanPillLabel(skill: Skill): string {
-  if (skill.securityScanStatus === 'FAILED') return t('skills.security.scanFailed')
+  if (skill.securityScanStatus === 'FAILED') return t(hasIncompleteSkillScan(parsedFindings(skill)) ? 'skills.security.scanIncomplete' : 'skills.security.scanFailed')
   if (skill.securityScanStatus === 'PASSED') return t('skills.security.scanned')
   return t('skills.security.notScanned')
 }
@@ -2012,6 +2104,11 @@ function getSkillTypeLabel(type: string) {
 </script>
 
 <style scoped>
+.skill-file-upload { display: flex; flex-wrap: wrap; gap: 12px; border: 1px solid var(--mc-border, #ddd); border-radius: 8px; padding: 12px; margin: 12px 0; }
+.skill-file-upload label { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.skill-file-upload input { max-width: 100%; }
+.skill-file-upload p { flex-basis: 100%; margin: 0; }
+
 .skills-page { gap: 18px; }
 .header-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 .btn-primary { display: flex; align-items: center; gap: 6px; padding: 10px 16px; background: linear-gradient(135deg, var(--mc-primary), var(--mc-primary-hover)); color: white; border: none; border-radius: 14px; font-size: 14px; font-weight: 600; cursor: pointer; transition: background 0.15s; box-shadow: var(--mc-shadow-soft); }

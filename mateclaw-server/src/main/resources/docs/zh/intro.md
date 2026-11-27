@@ -1,17 +1,25 @@
 ---
 title: MateClaw 项目介绍 — 自部署多智能体 AI 操作系统
-description: MateClaw 是基于 Spring AI Alibaba 的开源多智能体 AI 操作系统。ReAct + Plan-and-Execute 双引擎、LLM Wiki 知识库、四层记忆系统、MCP 工具协议、8 渠道统一接入。一个 JAR 包自部署，数据不出门。
+description: MateClaw 是基于 Spring AI + AgentScope 的开源多智能体 AI 操作系统。ReAct + Plan-and-Execute 双引擎、LLM Wiki 知识库、四层记忆系统、MCP 工具协议、8 渠道统一接入。一个 JAR 包自部署，数据与外发集成边界由你掌控。
 head:
   - - meta
     - name: keywords
-      content: MateClaw,多智能体,AI操作系统,自部署AI,Spring AI Alibaba,ReAct,Plan-and-Execute,MCP,LLM Wiki,记忆系统,Tool Guard,开源
+      content: MateClaw,多智能体,AI操作系统,自部署AI,Spring AI + AgentScope,ReAct,Plan-and-Execute,MCP,LLM Wiki,记忆系统,Tool Guard,开源
 ---
 
 # MateClaw — 自部署多智能体 AI 操作系统
 
+MateClaw **3.1.0** 汇总 3.0.0 之后的技能经验治理、精确记忆编辑、聊天引用与状态提示，以及模型、工具、知识库和渠道可靠性改进。
+
+版本：**3.1.0**；发布日期：**2026-11-19**。已发布版本的安装包请从 [GitHub Releases](https://github.com/mateaix/mateclaw/releases) 下载。
+
+[升级说明与 changelog](./changelog)
+
+**上一正式版 [3.0.0](./releases/3.0.0)（2026-10-26）** 引入 Java 21、Boot 4、Spring AI 2 与原生 AgentScope 执行架构。3.1.0 延续这套架构，新增内容见[本版说明](./releases/3.1.0)。
+
 **你的多智能体 AI，跑在你自己的机器上，按你自己的规则。**
 
-MateClaw 是一整套可以自部署的 AI 操作系统。一个 JAR 包，一套登录，数据不出门。
+MateClaw 是一整套可以自部署的 AI 操作系统。一个 JAR 包，一套登录，持久化数据和外发集成由你掌控。
 
 **它和别的 AI 不一样的三件事——**
 
@@ -55,23 +63,23 @@ MateClaw 换了一个打法：**所有东西放在一个屋檐下，跑在你自
 
 把 MateClaw 跑在你自己的机器上，不是合规打个勾那么简单。它改变的是这个产品**到底是什么**。
 
-**你的数据不再给别人付房租。** 对话、日志、文档、记忆——没有一条拿去训练别人的模型，没有一条在别人家的队列里排队，没有一条离开你的机器，除非是你自己把某个渠道接了出去。
+**你掌控数据与外发边界。** 对话、日志、文档和记忆持久化在自己的部署中；只有完成任务所需的内容会发送到你主动配置的云模型、IM 渠道、MCP 或其他工具服务。需要完全本地处理时，可以组合本地模型与本地工具，并关闭外部集成。
 
 **路线图是你的。** 记忆整合的规则你不喜欢？自己改。需要一个厂商不给你做的工具？自己加。Apache 2.0，不是 "source available"，不是 "open core"，不用等别人的季度产品评审。
 
 **账单是你自己算的。** 一开始上 DashScope，等本地 GPU 到了就切 Ollama，某个高价值 Agent 单独挂 OpenAI，其他的走便宜的。Agent 配置和工具图不关心底下的模型接口是什么。
 
-**部署面是实打实的。** 一个 JAR 包。一个 Spring Boot 进程。不用装 Python，不用装 Node。桌面端自己带环境，Docker Compose 一共 18 行。
+**部署面是实打实的。** 一个 JAR 包。一个 Spring Boot 进程。运行服务不要求额外安装 Python 或 Node。桌面端自带 JRE，Docker Compose 一条命令启动 PostgreSQL、SearXNG 与服务端。
 
 ---
 
 ## 底下是什么
 
-- **后端**——Spring Boot 3.5 + Spring AI Alibaba 1.1。Agent 运行时是一张 StateGraph，reasoning、action、observation、plan generation、step execution 都是图上的节点。MyBatis Plus 持久化。流式走 SSE（WebFlux 被明确拒之门外）。
+- **后端**——Java 21、Spring Boot 4.2.0、Spring AI 2.1.0 与 AgentScope Java 2.0.5。原生 ReAct 管理推理/行动循环，显式应用阶段管理 Plan-and-Execute。MyBatis Plus 持久化产品数据，流式输出使用 servlet MVC SSE。
 - **前端**——Vue 3 + TypeScript。Pinia 管状态，Element Plus + Tailwind 做 UI，支持深色模式。前端 build 的产物直接进后端 JAR 的 `static/`，一个进程服务两端。
 - **桌面端**——Electron 包 JRE 21 + 后端 JAR。双击启动，用户完全不需要知道底下跑的是 Java。
 - **渠道**——每个渠道是一个 `ChannelAdapter` SPI 实现。Web 走 SSE，IM 各自走平台的长连接或 webhook。
-- **存储**——开发用 H2 文件数据库，生产用 MySQL 8。Flyway 管理 schema 迁移，每种方言各有一套脚本。
+- **存储**——开发与桌面端默认使用 H2 文件数据库；公开 Docker 栈默认使用 PostgreSQL 16；MySQL 8 profile 继续支持，KingbaseES 驱动按需启用。Flyway 按数据库方言管理 schema 迁移。
 
 ---
 

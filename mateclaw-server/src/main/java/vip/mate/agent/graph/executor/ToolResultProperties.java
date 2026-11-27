@@ -11,7 +11,7 @@ import java.util.Set;
  * <p>Layer 1 — per-tool cap — is implemented inside each tool itself.
  * Layer 2 — per-result spill — when a single tool result exceeds {@link #perResultThresholdChars}
  * the full output is written to disk and only a {@link #previewHeadChars} preview
- * (plus a pointer line) is sent back to the LLM.
+ * and a bounded tail (plus a pointer line) are sent back to the LLM.
  * Layer 3 — per-turn aggregate budget — after all tools in a turn complete, if
  * the cumulative response size exceeds {@link #perTurnBudgetChars}, the largest
  * non-spilled responses are spilled in turn until the aggregate fits.</p>
@@ -71,6 +71,9 @@ public class ToolResultProperties {
     /** Number of leading characters kept inline as a preview after spilling. */
     private int previewHeadChars = 800;
 
+    /** Bounded trailing evidence, capped to the head allowance for small custom previews. */
+    private int previewTailChars = 400;
+
     /**
      * Retrieval-style tools are not spilled, but their inline content still must
      * fit the model context. When aggregate turn budget is exceeded and only
@@ -102,7 +105,7 @@ public class ToolResultProperties {
      * reads are already self-paginated to a bounded size.</p>
      */
     private List<String> excludedTools = List.of(
-            "read_file", "read_workspace_memory_file", "readSkillFile", "load_skill");
+            "get_progress", "read_file", "read_workspace_memory_file", "readSkillFile", "load_skill");
 
     /**
      * Days to retain spill files before the scheduled cleanup deletes them.
@@ -143,6 +146,9 @@ public class ToolResultProperties {
     public void setPreviewHeadChars(int previewHeadChars) {
         this.previewHeadChars = previewHeadChars;
     }
+
+    public int getPreviewTailChars() { return previewTailChars; }
+    public void setPreviewTailChars(int previewTailChars) { this.previewTailChars = previewTailChars; }
 
     public int getExcludedToolInlineChars() { return excludedToolInlineChars; }
     public void setExcludedToolInlineChars(int excludedToolInlineChars) {

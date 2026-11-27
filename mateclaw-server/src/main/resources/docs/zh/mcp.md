@@ -17,6 +17,16 @@ Model Context Protocol 是 Anthropic 提出的一个开放标准，用来把 AI 
 
 ---
 
+## 工作空间归属
+
+MCP 配置支持工作空间归属。新建配置默认属于当前工作空间；配置列表、员工工具/技能选择、员工自动生成和运行时调用只允许本空间配置及全局共享配置。切换空间会重新加载列表。
+
+升级前已有的 MCP 配置保留为**全局共享**，不会自动迁入 Default，也不会因此中断其他空间的现有员工。卡片会明确显示“全局共享”或“当前工作空间”。系统管理员可在编辑框将全局配置迁入当前空间，或将本空间配置改为全局共享；空间管理员只能管理本空间配置，不能修改或探测全局配置。迁移到当前空间前，请先切换到目标工作空间。
+
+迁移后，其他空间既不能新增该 MCP 的技能/工具绑定，也不能通过旧员工缓存继续调用。已有绑定不会自动删除；如移回可访问的归属，可重新使用。全局共享仍有意对所有空间可用。
+
+API 使用 `X-Workspace-Id` 标识当前空间，省略时默认 Default（ID 1）。`POST /api/v1/mcp/servers` 忽略请求体中的归属并默认使用当前空间。系统管理员可显式传查询参数 `global=true` 创建/设为共享，或在更新时传 `global=false` 迁入当前空间；更新省略此参数保留原归属。不得用请求体 `workspaceId` 绕过当前空间校验。
+
 ## MCP 到底是什么
 
 ```
@@ -540,3 +550,81 @@ user = claims["sub"]            # 验签通过才相信
 - [工具系统](./tools)——MCP 工具和内置工具的关系
 - [技能系统](./skills)——MCP 支撑的技能
 - [配置说明](./config)——完整配置参考
+
+## 工具结果直接展示图表、表格与商品卡片
+
+Web 控制台支持直接渲染 MCP 工具成功返回的 `structuredContent`，无需模型重新包装为 Markdown。展示数据绑定到对应工具调用；本轮回复结束后，图表、表格和商品卡片统一显示在回复正文下方，不占用思考及工具执行过程。中止或失败的回复仍展示已经成功取得的结果；失败或未完成工具的结果不展示。重新打开会话可恢复，原有文本回复继续兼容。
+
+MCP 的 `tools/call` 返回值可同时提供文字摘要和下面的界面数据：
+
+```json
+{
+  "content": [{ "type": "text", "text": "季度销量：第一季度 120，第二季度 180。" }],
+  "structuredContent": {
+    "mateclawUi": {
+      "version": 1,
+      "blocks": [
+        {
+          "type": "echarts",
+          "title": "季度销量",
+          "data": {
+            "xAxis": { "type": "category", "data": ["第一季度", "第二季度"] },
+            "yAxis": { "type": "value" },
+            "series": [{ "type": "bar", "data": [120, 180] }]
+          }
+        },
+        {
+          "type": "table",
+          "data": {
+            "columns": [{ "key": "quarter", "label": "季度" }, { "key": "sales", "label": "销量" }],
+            "rows": [{ "quarter": "第一季度", "sales": 120 }, { "quarter": "第二季度", "sales": 180 }]
+          }
+        },
+        {
+          "type": "product-cards",
+          "data": [{ "name": "示例商品", "price": 99, "imageUrl": "https://example.com/product.png", "url": "https://example.com/product" }]
+        }
+      ]
+    }
+  },
+  "isError": false
+}
+```
+
+`structuredContent` 是 MCP 标准字段；**`mateclawUi` 是 MateClaw 的版本化渲染约定**，并非 AG-UI 事件格式或 MCP Apps 界面资源。本实现参考 [工具组件注册机制](https://github.com/CopilotKit/CopilotKit) 与 [MCP Apps 的结构化结果设计](https://github.com/modelcontextprotocol/ext-apps)，沿用现有 SSE 通道，暂不加载第三方 HTML 或 MCP Apps iframe。
+
+支持的组件：
+
+| 类型 | `data` 格式 | 约束 |
+| --- | --- | --- |
+| `echarts` | 包含 `series` 对象或非空数组的 ECharts option 对象 | 仅支持声明式配置；移除 formatter、可执行代码、HTML 提示框、跳转和图片钩子 |
+| `table` | `columns: [{key, label}]`、`rows: object[]` | 1–32 列、最多 200 行，内容按文本转义 |
+| `product-cards` | 商品数组，必填 `name`；可选 `price`、`originalPrice`、`lowestPrice`、`url`、`imageUrl`、`platformLabel`、`shopName`、`purchaseAdvice` | 最多 24 个商品；链接和图片仅允许有效 HTTP(S) URL |
+
+一次最多 8 个组件；完整 `structuredContent` 的 UTF-8 JSON 不得超过 100 KiB。超限时不发送结构化展示数据，请在 `content` 中保留有用的文字摘要。未知版本、未知类型或不合法数据回退为转义后的 JSON。`isError: true` 会将工具标为失败，并禁止富内容展示。结果顶层 `_meta` 不发送至 UI。
+
+后端在原有 `tool_call_completed` 事件的 `toolCallId`、`toolName`、`result`、`success` 之外增加 `structuredContent`，同时保存在消息元数据的工具片段中。模型文本截断不影响这份独立数据。“直接返回用户”的工具继续将结果隔离于后续模型上下文。建议通过 `content` 提供简洁摘要；只有结构化结果时，序列化的 JSON 会作为文字回退。
+
+### 自定义前端渲染器
+
+可信前端代码可在应用初始化时注册 Vue 组件：
+
+```ts
+import InventoryCard from './InventoryCard.vue'
+import { registerToolResultRenderer } from '@/components/chat/tool-results/registry'
+
+registerToolResultRenderer('inventory', {
+  component: InventoryCard,
+  validate: (data: unknown) => {
+    if (!data || typeof data !== 'object' || Array.isArray(data)) return false
+    const value = data as Record<string, unknown>
+    return typeof value.name === 'string' && typeof value.quantity === 'number'
+  },
+})
+```
+
+组件通过 `data` prop 接收数据。工具随后可以在 `blocks` 中返回 `{ "type": "inventory", "data": { "name": "示例", "quantity": 10 } }`。注册新组件需要重新构建前端；工具返回值只能选择已注册类型，不能导入组件或执行脚本。自定义组件需校验自身数据结构，并安全处理不可信内容。
+
+## 3.0.0：协议与展示边界
+
+SDK 升级至 0.18.3。调用 ID、结构化内容和协议错误保留；普通工具结果在最终回答下方独立展示。传输失败且副作用不确定时不自动重复执行。

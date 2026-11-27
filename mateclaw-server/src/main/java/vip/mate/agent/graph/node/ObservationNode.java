@@ -1,7 +1,7 @@
 package vip.mate.agent.graph.node;
 
-import com.alibaba.cloud.ai.graph.OverAllState;
-import com.alibaba.cloud.ai.graph.action.NodeAction;
+import vip.mate.agent.runtime.state.RunState;
+import vip.mate.agent.runtime.state.NodeAction;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.chat.messages.AssistantMessage;
 import org.springframework.ai.chat.messages.ToolResponseMessage;
@@ -41,7 +41,7 @@ public class ObservationNode implements NodeAction {
      * set in {@code DefaultToolDisclosureService.ALWAYS_CORE}.
      */
     private static final java.util.Set<String> DISCLOSURE_TOOLS =
-            java.util.Set.of("load_skill", "enable_tool");
+            java.util.Set.of("load_skill", "enable_tool", "tool_search", "tool_describe");
 
     /** Per-run cap on iteration refunds — keeps a load-skill-only model from looping forever. */
     private static final int MAX_ITERATION_REFUNDS_PER_RUN = 3;
@@ -54,7 +54,7 @@ public class ObservationNode implements NodeAction {
      * determined statically, and a false reminder is worse than none.
      */
     private static final java.util.Set<String> FILE_MUTATION_TOOLS =
-            java.util.Set.of("write_file", "edit_file");
+            java.util.Set.of("write_file", "append_file", "edit_file");
 
     private static final String VERIFICATION_REMINDER =
             "\n\n[✅ 验证提醒] 本轮修改了文件。在给出最终回答前，请先验证改动是否生效" +
@@ -73,7 +73,7 @@ public class ObservationNode implements NodeAction {
 
     @Override
     @SuppressWarnings("unchecked")
-    public Map<String, Object> apply(OverAllState state) throws Exception {
+    public Map<String, Object> apply(RunState state) throws Exception {
         MateClawStateAccessor accessor = new MateClawStateAccessor(state);
 
         // 检查停止标志

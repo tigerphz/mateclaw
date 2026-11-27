@@ -11,6 +11,7 @@ import vip.mate.llm.service.ModelProviderService;
 import vip.mate.system.model.SystemSettingsDTO;
 import vip.mate.tts.TtsProvider;
 import vip.mate.tts.TtsRequest;
+import vip.mate.tts.TtsResponseDiagnostics;
 import vip.mate.tts.TtsResult;
 
 import java.util.List;
@@ -85,7 +86,8 @@ public class OpenAiTtsProvider implements TtsProvider {
             String model = request.getModel() != null && !request.getModel().isBlank()
                     ? request.getModel() : DEFAULT_MODEL;
             String voice = request.getVoice() != null && !request.getVoice().isBlank()
-                    ? request.getVoice() : DEFAULT_VOICE;
+                    ? request.getVoice() : (availableVoices().contains(config.getTtsDefaultVoice() == null
+                    ? "" : config.getTtsDefaultVoice()) ? config.getTtsDefaultVoice() : DEFAULT_VOICE);
 
             ObjectNode body = objectMapper.createObjectNode();
             body.put("model", model);
@@ -112,7 +114,8 @@ public class OpenAiTtsProvider implements TtsProvider {
             } else {
                 String errBody = response.body();
                 log.warn("[OpenAI TTS] Failed: HTTP {} - {}", response.getStatus(), errBody);
-                return TtsResult.failure("OpenAI TTS 失败: HTTP " + response.getStatus());
+                return TtsResult.failure(TtsResponseDiagnostics.failureMessage(
+                        "OpenAI TTS", url, response.getStatus(), errBody));
             }
         } catch (Exception e) {
             log.error("[OpenAI TTS] Error: {}", e.getMessage(), e);

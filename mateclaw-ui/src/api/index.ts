@@ -63,9 +63,9 @@ http.interceptors.response.use(
       // 403 = authorization failure (e.g. workspace permission denied) → keep session, surface error to caller
       if (data.code === 401) {
         handleAuthFailure()
-        return Promise.reject(new Error(data.msg || 'Unauthorized'))
+        return Promise.reject(Object.assign(new Error(data.msg || 'Unauthorized'), { code: data.code }))
       }
-      return Promise.reject(new Error(data.msg || 'Request failed'))
+      return Promise.reject(Object.assign(new Error(data.msg || 'Request failed'), { code: data.code }))
     }
     return data
   },
@@ -96,6 +96,8 @@ export async function fetchAuthenticatedBlob(fileUrl: string): Promise<Blob> {
   const token = localStorage.getItem('token')
   const headers: Record<string, string> = {}
   if (token) headers.Authorization = `Bearer ${token}`
+  const workspaceId = localStorage.getItem('mc-workspace-id')
+  if (workspaceId) headers['X-Workspace-Id'] = workspaceId
   const response = await fetch(fileUrl, { headers })
   if (!response.ok) throw new Error(`Fetch failed: ${response.status}`)
   return response.blob()
@@ -152,6 +154,32 @@ export const templateApi = {
   apply: (id: string) => http.post(`/templates/${id}/apply`),
 }
 
+export interface WorkspaceEmployeeTemplate {
+  id: string
+  name: string
+  description: string | null
+  icon: string | null
+  agentType: string
+  creatorUserId: string
+  createTime: string | null
+  schemaVersion: number
+  canDelete: boolean
+}
+
+export interface SaveEmployeeTemplateRequest {
+  sourceAgentId: string
+  name: string
+  description?: string
+  workspaceFileNames: string[]
+}
+
+export const customTemplateApi = {
+  list: () => http.get<WorkspaceEmployeeTemplate[]>('/templates/custom'),
+  save: (data: SaveEmployeeTemplateRequest) => http.post<WorkspaceEmployeeTemplate>('/templates/custom', data),
+  apply: (id: string, data: { name: string }) => http.post(`/templates/custom/${encId(id)}/apply`, data),
+  delete: (id: string) => http.delete(`/templates/custom/${encId(id)}`),
+}
+
 // ==================== Chat ====================
 export const chatApi = {
   uploadFile: async (conversationId: string, file: File) => {
@@ -204,10 +232,12 @@ export const conversationApi = {
    */
   page: (params: { page?: number; size?: number; keyword?: string }) =>
     http.get('/conversations/page', { params }),
-  listMessages: (conversationId: string, params?: { beforeId?: number; limit?: number }) =>
+  listMessages: (conversationId: string, params?: { beforeId?: number; limit?: number; runId?: string; taskId?: string }) =>
     http.get(`/conversations/${encId(conversationId)}/messages`, { params }),
   getStatus: (conversationId: string) =>
     http.get(`/conversations/${encId(conversationId)}/status`),
+  getTeamWorkerContext: (conversationId: string, params?: { runId?: string; taskId?: string }) =>
+    http.get(`/conversations/${encId(conversationId)}/team-worker-context`, { params }),
   delete: (conversationId: string) =>
     http.delete(`/conversations/${encId(conversationId)}`),
   clearMessages: (conversationId: string) =>
@@ -232,6 +262,11 @@ export const conversationApi = {
 }
 
 // ==================== Skill ====================
+export interface SkillSnapshotPreviewEntry { skillId: string; name: string; action: 'restore'|'unchanged'|'missing'|'archive'; changedFields: string[] }
+export interface SkillSnapshotPreviewData { snapshotId: string; restoreCount: number; unchangedCount: number; missingCount: number; archiveCount: number; entries: SkillSnapshotPreviewEntry[] }
+
+export interface SkillLessonEntry { id: string; heading: string; content: string; deletable: boolean }
+
 export const skillApi = {
   /** Paginated skill listing with search, source, status, and sort filters. */
   page: (params: {
@@ -271,6 +306,15 @@ export const skillApi = {
    * re-resolve the skill.
    */
   listFiles: (id: string | number) => http.get(`/skills/${id}/files`),
+  uploadFile: (id: string | number, file: File, path: string, overwrite = false) => {
+    const form = new FormData()
+    form.append('file', file)
+    form.append('path', path)
+    form.append('overwrite', String(overwrite))
+    return http.post(`/skills/${id}/files/upload`, form, { timeout: 120000 })
+  },
+  downloadFile: (id: string | number, path: string): Promise<Blob> =>
+    http.get(`/skills/${id}/files/download`, { params: { path }, responseType: 'blob' }) as unknown as Promise<Blob>,
   getFileContent: (id: string | number, path: string) =>
     http.get(`/skills/${id}/files/content`, { params: { path } }),
   saveFileContent: (id: string | number, path: string, content: string) =>
@@ -280,6 +324,7 @@ export const skillApi = {
   // RFC-090 §7 + §11.4 — pre-flight requirements + LESSONS.md + reverse lookup
   requirements: (id: string | number) => http.get(`/skills/${id}/requirements`),
   getLessons: (id: string | number) => http.get(`/skills/${id}/lessons`),
+  deleteLesson: (id: string | number, lessonId: string) => http.delete(`/skills/${id}/lessons/${encodeURIComponent(lessonId)}`),
   clearLessons: (id: string | number) => http.post(`/skills/${id}/lessons/clear`),
   employees: (id: string | number) => http.get(`/skills/${id}/employees`),
   /**
@@ -324,6 +369,44 @@ export const skillApi = {
   curatorReports: () => http.get('/skills/curator/reports'),
   /** Read one curator run report (parsed run.json). */
   curatorReport: (runId: string) => http.get(`/skills/curator/reports/${runId}`),
+
+  // ---- Curator restore points ----
+  /** List recent skill-library restore points (newest first). */
+  /** Skills currently under autonomous curation — the set that can be released. */
+  curatorManaged: () => http.get('/skills/curator/managed'),
+  /** Skills outside autonomous curation, with the reason each one is out. */
+  curatorUnmanaged: () => http.get('/skills/curator/unmanaged'),
+  /**
+   * Hand skills over to autonomous curation. Ids stay strings — 19-digit
+   * snowflake ids lose precision through the JS Number type.
+   */
+  curatorAdopt: (skillIds: string[]) => http.post('/skills/curator/adopt', skillIds),
+  /** Take skills back from autonomous curation. */
+  curatorRelease: (skillIds: string[]) => http.post('/skills/curator/release', skillIds),
+  curatorSnapshotPreview: (id: string) => http.get(`/skills/curator/snapshots/${encodeURIComponent(id)}/preview`),
+  curatorSnapshots: () => http.get('/skills/curator/snapshots'),
+  /** Capture a restore point on demand. */
+  curatorSnapshotCapture: (reason?: string) =>
+    http.post('/skills/curator/snapshots', null, { params: reason ? { reason } : {} }),
+  /**
+   * Roll the skill library back to a restore point. The id stays a string —
+   * 19-digit snowflake ids lose precision as a JS number.
+   */
+  curatorSnapshotRestore: (snapshotId: string) =>
+    http.post(`/skills/curator/snapshots/${snapshotId}/restore`),
+
+  // ---- Routine mining ----
+  /** Mined recurring-request candidates plus the promotion thresholds. */
+  routines: (status?: string) =>
+    http.get('/skills/routines', { params: status ? { status } : {} }),
+  /** Run a mining sweep now instead of waiting for the nightly job. */
+  routineMine: () => http.post('/skills/routines/mine'),
+  /** Reject a candidate so later sweeps stop re-detecting it. */
+  routineDismiss: (id: string) => http.post(`/skills/routines/${id}/dismiss`),
+  /** Put a dismissed candidate back under observation. */
+  routineReopen: (id: string) => http.post(`/skills/routines/${id}/reopen`),
+  /** Synthesize the skill now, bypassing the recurrence thresholds. */
+  routinePromote: (id: string) => http.post(`/skills/routines/${id}/promote`),
 }
 
 /** Shape returned by GET /skills/{id}/secrets. */
@@ -400,6 +483,7 @@ export interface LiveSnapshot {
 
 export const liveApi = {
   snapshot: () => http.get<{ data: LiveSnapshot }>('/admin/agent-runtime/snapshot'),
+  dshDiagnostics: () => http.get<{ data: Record<string, any> }>('/admin/agent-runtime/dsh/diagnostics'),
   stop: (conversationId: string) =>
     http.post(`/admin/agent-runtime/runs/${encodeURIComponent(conversationId)}/stop`),
   recycle: (conversationId: string) =>
@@ -482,8 +566,8 @@ export const toolApi = {
   list: () => http.get('/tools'),
   listEnabled: () => http.get('/tools/enabled'),
   /**
-   * Unified picker source for the agent edit tool tab — returns built-in
-   * tools plus every MCP-discovered tool grouped by server. The `name`
+   * Unified picker source for the agent edit tool tab — returns built-in,
+   * channel, plugin, and MCP-discovered tools. The `name`
    * field is what gets saved into mate_agent_tool.tool_name.
    */
   listAvailable: () => http.get('/tools/available'),
@@ -517,6 +601,12 @@ export const channelApi = {
   /** Batch health for all channels in current workspace. */
   healthAll: () => http.get('/channels/health'),
   /**
+   * List a channel's known conversations (proactive-push targets). Used by
+   * the cron delivery-target picker; a conversation appears here once the
+   * bot has received at least one inbound message in it.
+   */
+  listSessions: (id: string | number) => http.get(`/channels/${id}/sessions`),
+  /**
    * Wizard Step 2 — validate a draft config without persisting.
    * Returns a VerificationResult: { ok, skipped, durationMs, headline,
    * identity, invalidField, hint }.
@@ -548,8 +638,8 @@ export const channelApi = {
 export const mcpApi = {
   list: () => http.get('/mcp/servers'),
   get: (id: string | number) => http.get(`/mcp/servers/${id}`),
-  create: (data: any) => http.post('/mcp/servers', data),
-  update: (id: string | number, data: any) => http.put(`/mcp/servers/${id}`, data),
+  create: (data: any, global?: boolean) => http.post('/mcp/servers', data, { params: { global } }),
+  update: (id: string | number, data: any, global?: boolean) => http.put(`/mcp/servers/${id}`, data, { params: { global } }),
   delete: (id: string | number) => http.delete(`/mcp/servers/${id}`),
   toggle: (id: string | number, enabled: boolean) =>
     http.put(`/mcp/servers/${id}/toggle?enabled=${enabled}`),
@@ -708,6 +798,21 @@ export const settingsApi = {
   getSearchProviders: () => http.get('/settings/search-providers'),
 }
 
+// ==================== DeepSeek Harness runtime ====================
+export const dshApi = {
+  status: () => http.get('/admin/dsh/status'),
+  saveConfig: (data: Record<string, string>) => http.put('/admin/dsh/config', data),
+  install: () => http.post('/admin/dsh/install'),
+  verify: () => http.post('/admin/dsh/verify'),
+  testConnection: () => http.post('/admin/dsh/test-connection', undefined, { timeout: 45000 }),
+  testTask: () => http.post('/admin/dsh/test-task', undefined, { timeout: 100000 }),
+  upgrade: (data: { targetVersion: string; expectedRevision: string; idempotencyKey: string }) => http.post('/admin/dsh/upgrades', data),
+  upgradeStatus: (id: string) => http.get(`/admin/dsh/upgrades/${encodeURIComponent(id)}`),
+  rollback: (id: string, data: { expectedRevision: string; idempotencyKey: string }) => http.post(`/admin/dsh/upgrades/${encodeURIComponent(id)}/rollback`, data),
+  enable: () => http.post('/admin/dsh/enable'),
+  disable: () => http.post('/admin/dsh/disable'),
+}
+
 // ==================== Global outbound proxy ====================
 export const proxyApi = {
   get: () => http.get('/settings/proxy'),
@@ -843,6 +948,8 @@ export interface TeamVO {
 export interface TeamMemberVO {
   agentId: string
   name: string
+  description?: string | null
+  enabled?: boolean | null
   role: 'lead' | 'member' | 'reviewer'
   icon?: string | null
 }
@@ -850,6 +957,7 @@ export interface TeamMemberVO {
 export interface TeamTask {
   id: string
   teamId: string
+  runId?: string | null
   taskNumber: number
   subject: string
   description: string | null
@@ -881,6 +989,7 @@ export interface TeamTaskVO {
   task: TeamTask
   assigneeName: string | null
   ownerName: string | null
+  runId?: string | null
 }
 
 export interface TeamTaskComment {
@@ -904,6 +1013,8 @@ export interface TeamTaskEvent {
   createTime?: string
 }
 
+const TEAM_TASK_READ_TIMEOUT_MS = 15_000
+
 export const teamApi = {
   list: () => http.get('/teams'),
   get: (id: string) => http.get(`/teams/${id}`),
@@ -919,21 +1030,31 @@ export const teamApi = {
   addMember: (id: string, agentId: string, role: string) =>
     http.post(`/teams/${id}/members`, { agentId, role }),
   removeMember: (id: string, agentId: string) => http.delete(`/teams/${id}/members/${agentId}`),
-  listTasks: (id: string, status?: string[], opts?: { limit?: number; offset?: number }) =>
+  listTasks: (id: string, status?: string[], opts?: { limit?: number; offset?: number; runId?: string }) =>
     http.get(`/teams/${id}/tasks`, {
+      timeout: TEAM_TASK_READ_TIMEOUT_MS,
       params: {
         ...(status?.length ? { status: status.join(',') } : {}),
         ...(opts?.limit != null ? { limit: opts.limit } : {}),
         ...(opts?.offset != null ? { offset: opts.offset } : {}),
+        ...(opts?.runId ? { runId: opts.runId } : {}),
       },
     }),
-  taskStats: (id: string) => http.get(`/teams/${id}/tasks/stats`),
-  getTask: (id: string, taskId: string) => http.get(`/teams/${id}/tasks/${taskId}`),
+  taskStats: (id: string, runId?: string) => http.get(`/teams/${id}/tasks/stats`, {
+    timeout: TEAM_TASK_READ_TIMEOUT_MS,
+    params: runId ? { runId } : {},
+  }),
+  getTask: (id: string, taskId: string) => http.get(`/teams/${id}/tasks/${taskId}`, {
+    timeout: TEAM_TASK_READ_TIMEOUT_MS,
+  }),
   createTask: (
     id: string,
     data: {
       subject: string
       description?: string
+      acceptanceCriteria?: string
+      constraints?: string
+      runId?: string
       assigneeAgentId: string
       priority?: number
       blockedBy?: string[]
@@ -942,6 +1063,12 @@ export const teamApi = {
   ) => http.post(`/teams/${id}/tasks`, data),
   listTaskEvents: (id: string, taskId: string) => http.get(`/teams/${id}/tasks/${taskId}/events`),
   approveTask: (id: string, taskId: string) => http.post(`/teams/${id}/tasks/${taskId}/approve`),
+  approveWorkerTool: (id: string, taskId: string, pendingId: string) =>
+    http.post(`/teams/${id}/tasks/${taskId}/worker/approve`, { pendingId }),
+  denyWorkerTool: (id: string, taskId: string, pendingId: string) =>
+    http.post(`/teams/${id}/tasks/${taskId}/worker/deny`, { pendingId }),
+  feedbackWorker: (id: string, taskId: string, message: string) =>
+    http.post(`/teams/${id}/tasks/${taskId}/worker/feedback`, { message }),
   rejectTask: (id: string, taskId: string, reason?: string) =>
     http.post(`/teams/${id}/tasks/${taskId}/reject`, { reason }),
   retryTask: (id: string, taskId: string) => http.post(`/teams/${id}/tasks/${taskId}/retry`),
@@ -949,6 +1076,130 @@ export const teamApi = {
     http.post(`/teams/${id}/tasks/${taskId}/cancel`, { reason }),
   commentTask: (id: string, taskId: string, content: string) =>
     http.post(`/teams/${id}/tasks/${taskId}/comments`, { content }),
+}
+
+export type TeamRunStatus =
+  | 'planning'
+  | 'running'
+  | 'awaiting_review'
+  | 'finalizing'
+  | 'completed'
+  | 'partial'
+  | 'failed'
+  | 'cancelled'
+
+export interface TeamRunProgress {
+  total: number
+  done: number
+  failed: number
+  inReview: number
+  percent: number
+}
+
+export interface TeamRunTask {
+  id: string
+  teamId: string
+  runId: string
+  taskNumber: number
+  subject: string
+  description: string | null
+  status: string
+  priority: number
+  taskType: string
+  assigneeAgentId: string
+  ownerAgentId: string | null
+  blockedBy: string | null
+  requireApproval: boolean | null
+  progressPercent: number | null
+  progressStep: string | null
+  result: string | null
+  reason: string | null
+  conversationId: string | null
+  metadata: string | null
+  createTime: string | null
+  updateTime: string | null
+}
+
+export type TeamRunOutcomeQuality = 'synthesized' | 'fallback' | 'partial' | 'pending'
+export type TeamRunLivenessState = 'live' | 'quiet' | 'stalled' | 'terminal'
+export interface TeamRunDeliverable { id: string; name: string; url: string; type: string; sourceTaskIds: string[]; sourceAgentIds: string[]; createdAt: string | null; verificationStatus: string }
+export interface TeamRunContribution { taskId: string; agentId: string; subject: string; status: string; durationSeconds: number | null; lastActivityAt: string | null; resultSummary: string | null; conversationId: string | null }
+export interface TeamRunAttentionItem { id: string; type: string; severity: string; priority: number; taskId: string | null; message: string; createdAt: string | null }
+export interface TeamRunLiveness { state: TeamRunLivenessState; lastActivityAt: string | null }
+export interface TeamRunMetrics { durationSeconds: number | null; totalTasks: number; completedTasks: number; failedTasks: number; deliverableCount: number }
+export interface TeamRunPage { items: TeamRun[]; nextCursor: string | null }
+
+export interface TeamRun {
+  id: string
+  teamId: string
+  workspaceId: string
+  leadAgentId: string
+  leadConversationId: string
+  originMessageId: string | null
+  title: string
+  objective: string
+  status: TeamRunStatus
+  finalSummary: string | null
+  stopReason: string | null
+  metadata: string | null
+  startedAt: string | null
+  completedAt: string | null
+  createTime: string | null
+  updateTime: string | null
+  projectionCompleteness?: 'full' | 'summary' | string
+  outcomeQuality?: TeamRunOutcomeQuality | null
+  deliverables?: TeamRunDeliverable[]
+  contributions?: TeamRunContribution[]
+  attentionItems?: TeamRunAttentionItem[]
+  liveness?: TeamRunLiveness | null
+  metrics?: TeamRunMetrics | null
+  progress: TeamRunProgress
+  tasks: TeamRunTask[]
+}
+
+const TEAM_RUN_READ_TIMEOUT_MS = 15_000
+
+export const teamRunApi = {
+  get: (runId: string) => http.get(`/team-runs/${runId}`, { timeout: TEAM_RUN_READ_TIMEOUT_MS }),
+  listByTeamPage: (
+    teamId: string,
+    options: { activeOnly?: boolean; cursor?: string; limit?: number } = {},
+  ) => {
+    const params: { activeOnly?: boolean; cursor?: string; limit: number } = {
+      limit: options.limit ?? 20,
+    }
+    if (options.activeOnly) params.activeOnly = true
+    if (options.cursor) params.cursor = options.cursor
+    return http.get(`/teams/${teamId}/runs/page`, { params, timeout: TEAM_RUN_READ_TIMEOUT_MS })
+  },
+  listByConversationPage: (
+    conversationId: string,
+    options: { cursor?: string; limit?: number } = {},
+  ) => {
+    const params: { cursor?: string; limit: number } = { limit: options.limit ?? 20 }
+    if (options.cursor) params.cursor = options.cursor
+    return http.get(`/conversations/${encId(conversationId)}/team-runs/page`, {
+      params,
+      timeout: TEAM_RUN_READ_TIMEOUT_MS,
+    })
+  },
+  listByTeam: (teamId: string, activeOnly = false, cursor?: string, limit = 30) => {
+    const query = new URLSearchParams()
+    if (activeOnly) query.set('activeOnly', 'true')
+    if (cursor) query.set('cursor', cursor)
+    if (limit !== 30) query.set('limit', String(limit))
+    const suffix = query.size ? `?${query}` : ''
+    return http.get(`/teams/${teamId}/runs${suffix}`)
+  },
+  listByConversation: (conversationId: string, cursor?: string, limit = 30) => {
+    const query = new URLSearchParams()
+    if (cursor) query.set('cursor', cursor)
+    if (limit !== 30) query.set('limit', String(limit))
+    const suffix = query.size ? `?${query}` : ''
+    return http.get(`/conversations/${encId(conversationId)}/team-runs${suffix}`)
+  },
+  cancel: (runId: string, reason?: string) =>
+    http.post(`/team-runs/${runId}/cancel`, { reason }),
 }
 
 // ==================== Wiki Knowledge Base ====================
@@ -1025,6 +1276,8 @@ export const wikiApi = {
   downloadRaw: (kbId: number, rawId: number) =>
     http.get<Blob>(`/wiki/knowledge-bases/${kbId}/raw/${rawId}/download`, {
       responseType: 'blob',
+      // Large originals may take longer than the global 30-second API budget.
+      timeout: 0,
     }),
 
   // Wiki Pages
@@ -1090,6 +1343,9 @@ export const wikiApi = {
     http.get(`/wiki/kb/${kbId}/entities/${entityId}/graph`, { params: { limit } }),
   extractEntities: (kbId: number | string, force = false) =>
     http.post(`/wiki/kb/${kbId}/entities/extract`, null, { params: { force } }),
+  // Entity extraction for a single processed document.
+  extractRawEntities: (kbId: number | string, rawId: number | string, force = false) =>
+    http.post(`/wiki/kb/${kbId}/raw/${rawId}/entities/extract`, null, { params: { force } }),
 
   // RFC-030: Jobs
   getWikiJobs: (kbId: number, rawId: number) =>
@@ -1585,6 +1841,7 @@ export interface GoalCriterion {
 }
 
 export interface Goal {
+  jsonAcceptanceRequired?: boolean
   id: string
   conversationId: string
   agentId: string
@@ -1594,6 +1851,8 @@ export interface Goal {
   description: string
   exitCriteria?: string | null
   status: 'active' | 'paused' | 'completed' | 'abandoned' | 'exhausted'
+  /** Durable continuation; zero budgets are unlimited only in this mode. */
+  persistentExecution?: boolean
   turnBudget: number
   turnsUsed: number
   llmCallBudget: number
@@ -1629,6 +1888,7 @@ export const goalApi = {
     title: string
     description?: string
     exitCriteria?: string
+    persistentExecution?: boolean
     turnBudget?: number
     llmCallBudget?: number
     autoFollowupEnabled?: boolean
@@ -1638,6 +1898,9 @@ export const goalApi = {
 
   findActive: (conversationId: string) =>
     http.get<Goal | null>(`/goals/by-conversation/${encId(conversationId)}`),
+
+  history: (conversationId: string, beforeId?: string) =>
+    http.get<Goal[]>(`/goals/by-conversation/${encId(conversationId)}/history`, { params: { beforeId, limit: 20 } }),
 
   get: (id: string) => http.get<Goal>(`/goals/${id}`),
 

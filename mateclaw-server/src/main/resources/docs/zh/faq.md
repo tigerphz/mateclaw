@@ -250,6 +250,28 @@ UI 里用 `工具 → MCP 服务`。三种传输模式：stdio、streamable_http
 
 ---
 
+## 员工模板与团队
+
+本节说明当前 `dev / 3.2.0-SNAPSHOT` 的新增行为，已发布的 3.1.0 包不包含这些功能。
+
+### 保存模板后，源员工的修改会同步过去吗？
+
+不会。工作区模板是独立配置快照，后续修改需另存。删除模板不会删除已招聘的员工，删除源员工也不会改写模板。快照不是技能包或知识库备份；全局默认与资源引用仍依赖当前工作区环境。[模板内容与边界](./agents)
+
+### 为什么自定义模板招聘提示依赖缺失？
+
+自定义快照会严格检查保存的技能、工具、知识库及模型/供应商引用，包括停用或越出工作区范围的依赖。先恢复依赖，再招聘；不会跳过它们后悄悄给员工更宽的能力。新员工名称也必须在工作区内未被使用。DSH 员工当前不支持保存为这种模板，不能通过复制运行配置绕过限制。
+
+### 为什么不能移除成员或删除员工、团队？
+
+先在任务板完成或取消相关未完成任务，包括等待审批与租约过期的 `stale` 任务。负责人即使空闲，也需先删除其团队；权限不足时联系管理员。一个员工只能属于一个团队，暂停不释放归属；已移除执行人的失败任务不能直接重试派工。[编制保护规则](./teams)
+
+### 协调员模式为什么无法开启、切换或运行？
+
+开关位于团队的 **成员** 页，仅工作区管理员及以上可操作，只支持原生负责人。负责人当前正在执行时须等该轮结束；非法历史设置 JSON 需先修复。仅搜索型模型或超出支持范围的供应商参数会明确失败，不能依靠模型原生搜索绕过职责限制。模式默认关闭，关闭后从下一轮恢复原有配置下的能力；成员配置不变。
+
+---
+
 ## 渠道
 
 ### 钉钉 / 飞书 webhook 收不到消息
@@ -288,7 +310,7 @@ UI 里用 `工具 → MCP 服务`。三种传输模式：stdio、streamable_http
 cp ./data/mateclaw.mv.db ./backup/mateclaw-$(date +%Y%m%d).mv.db
 ```
 
-**MySQL（生产）：**
+**MySQL（受支持的自管部署）：**
 
 ```bash
 mysqldump -u root -p mateclaw > mateclaw-backup-$(date +%Y%m%d).sql
@@ -297,7 +319,7 @@ mysqldump -u root -p mateclaw > mateclaw-backup-$(date +%Y%m%d).sql
 **Docker：**
 
 ```bash
-docker exec mateclaw-mysql mysqldump -u root -p${MYSQL_ROOT_PASSWORD} mateclaw > backup.sql
+docker compose exec -T postgres sh -c 'pg_dump -U "$POSTGRES_USER" "$POSTGRES_DB"' > backup.sql
 ```
 
 **桌面端**数据在每个用户目录下：
@@ -332,19 +354,19 @@ docker exec mateclaw-mysql mysqldump -u root -p${MYSQL_ROOT_PASSWORD} mateclaw >
 
 ```bash
 docker compose logs mateclaw-server
-docker compose logs mateclaw-mysql
+docker compose logs postgres
 ```
 
 常见：
 
-- MySQL 还没就绪
-- 端口冲突（18080、3306）
-- 缺 `.env`——从 `.env.example` 拷一份
+- PostgreSQL 还没就绪
+- 对外端口 18080 冲突
+- 缺 `.env` 或未填写必需的 `DB_PASSWORD` / `DB_ADMIN_PASSWORD`
 
 ### 怎么在 Docker 里访问数据库？
 
 ```bash
-docker exec -it mateclaw-mysql mysql -u root -p mateclaw
+docker compose exec postgres sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB"'
 ```
 
 ---
@@ -397,7 +419,7 @@ curl -N -X POST 'http://localhost:18088/api/v1/chat/stream' \
 
 ```bash
 cd mateclaw-ui
-pnpm build
+npm run build
 ls ../mateclaw-server/src/main/resources/static/
 # 应该包含 index.html 和资源文件
 ```

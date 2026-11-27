@@ -1,6 +1,6 @@
 package vip.mate.agent.graph.plan.node;
 
-import com.alibaba.cloud.ai.graph.OverAllState;
+import vip.mate.agent.runtime.state.RunState;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 import vip.mate.agent.context.ChatOrigin;
@@ -48,7 +48,20 @@ class PlanGenerationAutoGoalTest {
         Map<String, Object> vals = new HashMap<>();
         vals.put(MateClawStateKeys.CHAT_ORIGIN, origin);
         vals.put(PlanStateKeys.GOAL, goalText);
-        return new PlanStateAccessor(new OverAllState(vals));
+        return new PlanStateAccessor(new RunState(vals));
+    }
+
+    @Test
+    void enabledGoalUsesOriginalDeliveryInsteadOfRelaxedPlanSteps() {
+        when(goalService.create(any(), any())).thenReturn(new GoalEntity());
+        var adapter = mock(vip.mate.goal.service.GoalDecisionAdapter.class);
+        when(adapter.enabled()).thenReturn(true);
+        var node = node(); node.setGoalDecisionAdapter(adapter);
+        node.maybeAutoCreateGoal(accessor(true, "计算实际良率，不得猜分母"),
+                List.of("说明缺分母无法计算也算完成", "输出缺输入说明"));
+        var cap = ArgumentCaptor.forClass(GoalCreateRequest.class);
+        verify(goalService).create(cap.capture(), any());
+        assertEquals(List.of("计算实际良率，不得猜分母"), cap.getValue().getCriteria().stream().map(c -> c.text()).toList());
     }
 
     @Test

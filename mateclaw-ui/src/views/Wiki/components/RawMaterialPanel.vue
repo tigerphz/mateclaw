@@ -291,6 +291,14 @@
               </svg>
             </button>
             <button
+              v-if="entityExtractionEnabled && raw.processingStatus === 'completed'"
+              class="btn-icon" :title="t('wiki.extractEntities')"
+              :disabled="extractingIds.has(String(raw.id))"
+              @click.stop="extractRawEntities(raw)"
+            >
+              <el-icon :size="14"><Connection /></el-icon>
+            </button>
+            <button
               v-if="raw.processingStatus !== 'uploading'"
               class="btn-icon" :title="t('wiki.download')"
               @click="downloadRaw(raw)"
@@ -307,7 +315,7 @@
         </div>
         <!-- RFC-033: Job stage bar — show when job has progressed past 'queued' or reached terminal -->
         <JobStageBar
-          v-if="rawJobs[raw.id] && (rawJobs[raw.id].stage !== 'queued' || rawJobs[raw.id].status !== 'queued')"
+          v-if="isCurrentRawJob(raw.processingStatus, rawJobs[raw.id]) && (rawJobs[raw.id].stage !== 'queued' || rawJobs[raw.id].status !== 'queued')"
           :stage="rawJobs[raw.id].stage"
           :status="rawJobs[raw.id].status"
           :current-model="rawJobs[raw.id].currentModelName ?? (rawJobs[raw.id].currentModelId ? `Model #${rawJobs[raw.id].currentModelId}` : undefined)"
@@ -317,6 +325,7 @@
           :done="rawJobs[raw.id].done ?? raw.progressDone"
           :total="rawJobs[raw.id].total ?? raw.progressTotal"
           :started-at="rawJobs[raw.id].startedAt ?? undefined"
+          :finished-at="rawJobs[raw.id].finishedAt ?? undefined"
           @reprocess="reprocess(raw.id)"
           @repair="handleLocalRepair(raw.id)"
         />
@@ -378,12 +387,13 @@ import { useI18n } from 'vue-i18n'
 import { mcToast } from '@/composables/useMcToast'
 import { mcConfirm } from '@/components/common/useConfirm'
 import { useFileDrop } from '@/composables/useFileDrop'
-import { Download } from '@element-plus/icons-vue'
+import { Connection, Download } from '@element-plus/icons-vue'
 import { useWikiStore } from '@/stores/useWikiStore'
 import { useWorkspaceStore } from '@/stores/useWorkspaceStore'
 import { wikiApi } from '@/api/index'
 import { processWithConcurrency } from '@/utils/wikiUpload'
 import JobStageBar from './JobStageBar.vue'
+import { isCurrentRawJob } from '../utils/wikiJob'
 import type { WikiProcessingJob } from '@/composables/useWikiJobPoller'
 
 const { t } = useI18n()
@@ -905,6 +915,39 @@ async function handleAddText() {
   showAddText.value = false
   textTitle.value = ''
   textContent.value = ''
+}
+
+// Per-document entity extraction is offered only once the KB has entity
+// extraction switched on in its processing config.
+const entityExtractionEnabled = computed(() => {
+  const content = store.currentKB?.configContent
+  if (!content) return false
+  try {
+    return JSON.parse(content)?.entityExtractionEnabled === true
+  } catch {
+    return false
+  }
+})
+// Keyed by String(id): raw ids are Snowflake values and must stay strings.
+const extractingIds = ref<Set<string>>(new Set())
+
+async function extractRawEntities(raw: { id: number | string; title: string }) {
+  if (!store.currentKB) return
+  const key = String(raw.id)
+  if (extractingIds.value.has(key)) return
+  extractingIds.value = new Set(extractingIds.value).add(key)
+  try {
+    // force=true re-extracts this document only, so the latest entity-type
+    // config also applies to documents extracted before it changed.
+    await wikiApi.extractRawEntities(store.currentKB.id, raw.id, true)
+    mcToast.success(t('wiki.extractEntitiesStarted', { title: raw.title }))
+  } catch (e) {
+    mcToast.error(e instanceof Error ? e.message : String(e))
+  } finally {
+    const next = new Set(extractingIds.value)
+    next.delete(key)
+    extractingIds.value = next
+  }
 }
 
 async function reprocess(rawId: number) {

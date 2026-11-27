@@ -146,19 +146,25 @@ public class SkillFileSyncer {
         SkillBundleSource source = new ClasspathBundleSource(resolver,
                 bundledPath + "/" + skill.getName());
 
-        Map<String, String> ingested;
+        Map<String, byte[]> ingested;
         try {
-            ingested = SkillBundleFiles.readDbEligible(source);
+            ingested = SkillBundleFiles.readDbEligibleBytes(source);
         } catch (IOException e) {
             log.warn("Failed to backfill builtin skill '{}' from classpath: {}", skill.getName(), e.getMessage());
             return 0;
         }
         if (ingested.isEmpty()) return 0;
 
-        skillFileService.applyBundleFiles(skill.getId(), ingested, false);
+        skillFileService.applyBundleBytes(skill.getId(), ingested, false);
         log.info("Backfilled {} bundle file(s) from classpath into mate_skill_file for builtin skill '{}' (id={})",
                 ingested.size(), skill.getName(), skill.getId());
         return ingested.size();
+    }
+
+    /** Materialize only the uploaded row; folder uploads must not re-read the full bundle per file. */
+    public boolean syncFile(SkillEntity skill, SkillFileEntity row) {
+        Path workspace = workspaceManager.resolveConventionPath(skill.getName(), skill.getWorkspaceId());
+        return materializeOne(workspace, row) != MaterializeOutcome.SKIPPED;
     }
 
     private enum MaterializeOutcome { WROTE, CURRENT, SKIPPED }
@@ -183,17 +189,21 @@ public class SkillFileSyncer {
         }
 
         try {
-            String content = row.getContent() == null ? "" : row.getContent();
+            // Do not follow links created by a skill script outside its workspace.
+            for (Path part = target; part != null && part.startsWith(workspaceDir); part = part.getParent()) {
+                if (Files.isSymbolicLink(part)) return MaterializeOutcome.SKIPPED;
+            }
+            byte[] content = row.contentBytes();
             if (Files.exists(target)) {
-                String onDisk = Files.readString(target, StandardCharsets.UTF_8);
+                byte[] onDisk = Files.readAllBytes(target);
                 if (SkillFileService.sha256Hex(onDisk).equals(row.getSha256())) {
                     return MaterializeOutcome.CURRENT;
                 }
             }
             Files.createDirectories(target.getParent());
-            Files.writeString(target, content, StandardCharsets.UTF_8);
+            Files.write(target, content);
             return MaterializeOutcome.WROTE;
-        } catch (IOException e) {
+        } catch (IOException | IllegalArgumentException e) {
             log.warn("Failed to materialize skill_file {} → {}: {}", row.getId(), target, e.getMessage());
             return MaterializeOutcome.SKIPPED;
         }
@@ -215,7 +225,7 @@ public class SkillFileSyncer {
         }
         if (roots.isEmpty()) return 0;
 
-        Map<String, String> ingested = new LinkedHashMap<>();
+        Map<String, byte[]> ingested = new LinkedHashMap<>();
         Set<String> seen = new HashSet<>();
         for (Path root : roots) {
             String prefix = workspaceDir.relativize(root).toString().replace('\\', '/') + "/";
@@ -226,7 +236,7 @@ public class SkillFileSyncer {
                     if (!relative.startsWith(prefix)) continue;
                     if (!seen.add(relative)) continue;
                     try {
-                        String content = Files.readString(f, StandardCharsets.UTF_8);
+                        byte[] content = Files.readAllBytes(f);
                         ingested.put(relative, content);
                     } catch (IOException e) {
                         log.warn("Backfill skipped {} (read failed: {})", f, e.getMessage());
@@ -238,7 +248,7 @@ public class SkillFileSyncer {
         }
 
         if (ingested.isEmpty()) return 0;
-        skillFileService.applyBundleFiles(skill.getId(), ingested, false);
+        skillFileService.applyBundleBytes(skill.getId(), ingested, false);
         log.info("Backfilled {} bundle file(s) into mate_skill_file for skill '{}' (id={})",
                 ingested.size(), skill.getName(), skill.getId());
 

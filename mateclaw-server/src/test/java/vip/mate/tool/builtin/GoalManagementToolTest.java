@@ -59,6 +59,7 @@ class GoalManagementToolTest {
         g.setConversationId("conv-1");
         g.setAgentId(10L);
         g.setWorkspaceId(1L);
+        g.setCreatedBy("alice");
         g.setTitle("ship the blog");
         g.setStatus(status);
         g.setTurnBudget(20);
@@ -86,6 +87,32 @@ class GoalManagementToolTest {
         String result = tool.setGoal("  ", null, null, null, null, null,
                 ctxWith("conv-1", 10L, "alice"));
         assertTrue(result.contains("title is required"));
+    }
+
+    @Test
+    void offRetainsExplicitChecklistAlongsideExitText() {
+        var settings = new vip.mate.decision.config.DecisionProperties();
+        settings.setMode(vip.mate.decision.api.DecisionMode.OFF); tool.setDecisionProperties(settings);
+        when(goalService.create(any(), eq("alice"))).thenReturn(goal(GoalStatus.ACTIVE));
+        tool.setGoal("summary", null, "deliver summary", 2, true, java.util.List.of("original item"),
+                ctxWith("conv-1", 10L, "alice"));
+        var request = org.mockito.ArgumentCaptor.forClass(GoalCreateRequest.class);
+        verify(goalService).create(request.capture(), eq("alice"));
+        org.junit.jupiter.api.Assertions.assertEquals("original item", request.getValue().getCriteria().getFirst().text());
+    }
+
+    @Test
+    void explicitExitCriteriaWinsOverGeneratedSetupChecklist() {
+        tool.setDecisionProperties(new vip.mate.decision.config.DecisionProperties());
+        when(goalService.create(any(), eq("alice"))).thenReturn(goal(GoalStatus.ACTIVE));
+        tool.setGoal("summary", "wait for line then deliver summary", "Output a summary containing the supplied line",
+                2, true, java.util.List.of("Create goal", "Wait for input", "Output summary"),
+                ctxWith("conv-1", 10L, "alice"));
+        var request = org.mockito.ArgumentCaptor.forClass(GoalCreateRequest.class);
+        verify(goalService).create(request.capture(), eq("alice"));
+        org.junit.jupiter.api.Assertions.assertEquals(1, request.getValue().getCriteria().size());
+        org.junit.jupiter.api.Assertions.assertEquals("Output a summary containing the supplied line",
+                request.getValue().getCriteria().getFirst().text());
     }
 
     @Test
@@ -142,14 +169,14 @@ class GoalManagementToolTest {
         when(goalService.findActiveByConversation("conv-1")).thenReturn(null);
         String result = tool.completeGoal(ctxWith("conv-1", 10L, "alice"));
         assertTrue(result.contains("No active goal"));
-        verify(goalService, never()).markCompleted(any(), any(GoalEvaluationResult.class));
+        verify(goalService, never()).markRuntimeCompleted(any(), any(GoalEvaluationResult.class), any());
     }
 
     @Test
     void completeGoal_happyPath_callsMarkCompleted() {
         when(goalService.findActiveByConversation("conv-1")).thenReturn(goal(GoalStatus.ACTIVE));
         GoalEntity completed = goal(GoalStatus.COMPLETED);
-        when(goalService.markCompleted(eq(123L), any(GoalEvaluationResult.class)))
+        when(goalService.markRuntimeCompleted(eq(123L), any(GoalEvaluationResult.class), any()))
                 .thenReturn(completed);
         when(goalService.toResponse(any())).thenReturn(new vip.mate.goal.model.GoalResponse());
         String result = tool.completeGoal(ctxWith("conv-1", 10L, "alice"));
@@ -166,16 +193,157 @@ class GoalManagementToolTest {
     }
 
     @Test
+    void getGoalStatus_completedLatestExplainsTerminalState() {
+        when(goalService.findActiveByConversation("conv-1")).thenReturn(null);
+        GoalEntity completed = goal(GoalStatus.COMPLETED);
+        when(goalService.findLatestByConversation("conv-1")).thenReturn(completed);
+
+        String result = tool.getGoalStatus(ctxWith("conv-1", 10L, "alice"));
+
+        assertTrue(result.contains("\"active\":false"));
+        assertTrue(result.contains("\"status\":\"completed\""));
+        assertTrue(result.contains("\"recoverable\":false"));
+        assertTrue(result.contains("latest_goal_completed"));
+    }
+
+    @Test
+    void getGoalStatus_pausedLatestIsResumable() {
+        when(goalService.findActiveByConversation("conv-1")).thenReturn(null);
+        GoalEntity paused = goal(GoalStatus.PAUSED);
+        when(goalService.findLatestByConversation("conv-1")).thenReturn(paused);
+
+        String result = tool.getGoalStatus(ctxWith("conv-1", 10L, "alice"));
+
+        assertTrue(result.contains("\"status\":\"paused\""));
+        assertTrue(result.contains("\"recoverable\":true"));
+        assertTrue(result.contains("latest_goal_paused"));
+    }
+
+    @Test
     void getGoalStatus_active_carriesProgressSummary() {
         GoalEntity g = goal(GoalStatus.ACTIVE);
+        g.setJsonAcceptanceRequired(true);
         g.setProgressSummary("missing DNS");
         g.setCompletionScore(0.62);
         when(goalService.findActiveByConversation("conv-1")).thenReturn(g);
         String result = tool.getGoalStatus(ctxWith("conv-1", 10L, "alice"));
+        assertTrue(result.contains("\"jsonAcceptanceRequired\":true"));
         assertTrue(result.contains("\"goalId\":\"123\""));
         assertTrue(result.contains("\"completionScore\":0.62"));
         assertTrue(result.contains("missing DNS"));
         // total = agent(12) + eval(2)
         assertTrue(result.contains("\"totalLlmCallsUsed\":14"));
     }
+    @Test
+    void waitForGoalInputRequiresReasonAndBoundContext() {
+        ToolContext ctx = ctxWith("conv-1", 10L, "alice");
+        assertTrue(tool.waitForGoalInput("  ", ctx).contains("reason"));
+        assertTrue(tool.waitForGoalInput("Need hostname", null).contains("bound conversation"));
+        verify(goalService, never()).findActiveByConversation(anyString());
+        verify(goalService, never()).waitForInput(any(), anyString(), anyString());
+    }
+
+    @Test
+    void waitForGoalInputRequiresEnabledPersistentActiveGoal() {
+        ToolContext ctx = ctxWith("conv-1", 10L, "alice");
+        properties.setEnabled(false);
+        assertTrue(tool.waitForGoalInput("Need hostname", ctx).contains("disabled"));
+        verify(goalService, never()).findActiveByConversation(anyString());
+        properties.setEnabled(true);
+        GoalEntity goal = goal(GoalStatus.ACTIVE);
+        when(goalService.findActiveByConversation("conv-1")).thenReturn(goal);
+        assertTrue(tool.waitForGoalInput("Need hostname", ctx).contains("persistent"));
+        goal.setPersistentExecution(true);
+        goal.setStatus(GoalStatus.PAUSED);
+        assertTrue(tool.waitForGoalInput("Need hostname", ctx).contains("active goal"));
+        verify(goalService, never()).waitForInput(any(), anyString(), anyString());
+    }
+
+    @Test
+    void waitForGoalInputPausesBoundGoal_andBroadcastsUpdatedState() {
+        GoalEntity active = goal(GoalStatus.ACTIVE);
+        active.setPersistentExecution(true);
+        GoalEntity paused = goal(GoalStatus.PAUSED);
+        paused.setPersistentExecution(true);
+        paused.setProgressSummary("Waiting for input: Need the deployment hostname");
+        when(goalService.findActiveByConversation("conv-1")).thenReturn(active);
+        when(goalService.waitForInput(123L, "Need the deployment hostname", "alice")).thenReturn(paused);
+        when(goalService.toResponse(paused)).thenReturn(new vip.mate.goal.model.GoalResponse());
+        String result = tool.waitForGoalInput("  Need the deployment hostname  ", ctxWith("conv-1", 10L, "alice"));
+        assertTrue(result.contains("\"status\":\"paused\""));
+        assertTrue(result.contains("Need the deployment hostname"));
+        verify(streamTracker).broadcastObject(eq("conv-1"), eq("goal_updated"), any());
+        verify(goalService, never()).markRuntimeCompleted(any(), any(), any());
+    }
+
+    @Test
+    void waitForGoalInputReturnsErrorIfStateChangedBeforePause() {
+        GoalEntity active = goal(GoalStatus.ACTIVE);
+        active.setPersistentExecution(true);
+        when(goalService.findActiveByConversation("conv-1")).thenReturn(active);
+        when(goalService.waitForInput(123L, "Need hostname", "alice"))
+                .thenThrow(new MateClawException("err.goal.bad_transition", 409, "Goal no longer active"));
+        assertTrue(tool.waitForGoalInput("Need hostname", ctxWith("conv-1", 10L, "alice")).contains("Goal no longer active"));
+        verify(streamTracker, never()).broadcastObject(anyString(), anyString(), any());
+    }
+
+    @Test
+    void resumeToolIsDiscoverableAndChildrenCannotUseIt() throws Exception {
+        var method = GoalManagementTool.class.getMethod("resumeGoal", ToolContext.class);
+        assertNotNull(method.getAnnotation(org.springframework.ai.tool.annotation.Tool.class));
+        assertNotNull(method.getAnnotation(vip.mate.tool.ConcurrencyUnsafe.class));
+        assertTrue(DelegateAgentTool.DEFAULT_CHILD_DENIED_TOOLS.contains("resumeGoal"));
+    }
+
+    @Test
+    void resumesOnlyBoundPausedGoalAndReturnsActualState() throws Exception {
+        when(goalService.findLatestByConversation("conv-1")).thenReturn(goal(GoalStatus.PAUSED));
+        when(goalService.resume(123L, "alice")).thenReturn(goal(GoalStatus.ACTIVE));
+        when(goalService.toResponse(any())).thenReturn(new vip.mate.goal.model.GoalResponse());
+        String result = invokeResume(ctxWith("conv-1", 10L, "alice"));
+        assertTrue(result.contains("\"status\":\"active\""));
+        verify(goalService).resume(123L, "alice");
+        verify(streamTracker).broadcastObject(eq("conv-1"), eq("goal_updated"), any());
+        verify(goalService, never()).markRuntimeCompleted(any(), any(), any());
+    }
+
+    @Test
+    void resumeRejectsForeignAgentOrMissingIdentity() throws Exception {
+        assertTrue(invokeResume(null).contains("error"));
+        assertTrue(invokeResume(ctxWith("conv-1", 10L, null)).contains("error"));
+        when(goalService.findLatestByConversation("conv-1")).thenReturn(goal(GoalStatus.PAUSED));
+        assertTrue(invokeResume(ctxWith("conv-1", 99L, "alice")).contains("error"));
+        verify(goalService, never()).resume(any(), anyString());
+    }
+
+    @Test
+    void resumeDoesNotReportSuccessOnBudgetOrConcurrentStateFailure() throws Exception {
+        when(goalService.findLatestByConversation("conv-1")).thenReturn(goal(GoalStatus.PAUSED));
+        when(goalService.resume(123L, "alice")).thenThrow(new MateClawException("budget exhausted"));
+        assertTrue(invokeResume(ctxWith("conv-1", 10L, "alice")).contains("error"));
+        verify(streamTracker, never()).broadcastObject(anyString(), anyString(), any());
+    }
+
+    private String invokeResume(ToolContext ctx) throws Exception {
+        return tool.resumeGoal(ctx);
+    }
+
+    @Test
+    void resumeRejectsDisabledTerminalOrForeignWorkspaceAndOwner() {
+        var ctx = ctxWith("conv-1", 10L, "alice");
+        properties.setEnabled(false);
+        assertTrue(tool.resumeGoal(ctx).contains("disabled"));
+        properties.setEnabled(true);
+        var g = goal(GoalStatus.COMPLETED);
+        when(goalService.findLatestByConversation("conv-1")).thenReturn(g);
+        assertTrue(tool.resumeGoal(ctx).contains("error"));
+        g.setStatus(GoalStatus.PAUSED);
+        g.setWorkspaceId(2L);
+        assertTrue(tool.resumeGoal(ctx).contains("error"));
+        g.setWorkspaceId(1L);
+        g.setCreatedBy("bob");
+        assertTrue(tool.resumeGoal(ctx).contains("error"));
+        verify(goalService, never()).resume(any(), anyString());
+    }
+
 }

@@ -1,5 +1,6 @@
 package vip.mate.agent.context;
 
+import vip.mate.llm.chatmodel.ChatModelDefaults;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.chat.messages.AssistantMessage;
@@ -13,7 +14,6 @@ import org.springframework.ai.chat.model.ChatResponse;
 import org.springframework.ai.chat.prompt.ChatOptions;
 import org.springframework.ai.chat.prompt.Prompt;
 import org.springframework.ai.tool.ToolCallback;
-import com.alibaba.cloud.ai.dashscope.chat.DashScopeChatOptions;
 import org.springframework.stereotype.Component;
 import vip.mate.agent.graph.executor.ToolResultStorage;
 import vip.mate.agent.prompt.PromptLoader;
@@ -1403,13 +1403,25 @@ public class ConversationWindowManager {
             promptMessages.add(new SystemMessage(systemPrompt));
             promptMessages.add(new UserMessage(userPrompt));
 
-            ChatOptions options = DashScopeChatOptions.builder()
-                    .withMaxToken(properties.getSummaryMaxTokens())
+            ChatOptions defaults = ChatModelDefaults.optionsFor(chatModel);
+            ChatOptions options = (defaults != null ? defaults.mutate() : ChatOptions.builder())
+                    .maxTokens(properties.getSummaryMaxTokens())
                     .build();
 
             ChatResponse response = chatModel.call(new Prompt(promptMessages, options));
             if (response != null && response.getResult() != null
                     && response.getResult().getOutput() != null) {
+                String finishReason = response.getResult().getMetadata() != null
+                        ? response.getResult().getMetadata().getFinishReason() : null;
+                if ("length".equalsIgnoreCase(finishReason)) {
+                    // A non-empty response can still be structurally incomplete
+                    // when the provider exhausts max tokens. Persisting it would
+                    // poison every later iterative summary.
+                    log.warn("[ConversationWindow] LLM 摘要因 token 上限被截断，丢弃结果, conv={}",
+                            conversationId);
+                    setSummaryCooldown(conversationId);
+                    return null;
+                }
                 String summary = response.getResult().getOutput().getText();
                 if (summary != null && !summary.isBlank()) {
                     // 成功：保存摘要供下次迭代更新，清除冷却

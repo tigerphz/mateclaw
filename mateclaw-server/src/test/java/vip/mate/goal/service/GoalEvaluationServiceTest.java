@@ -5,6 +5,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.Mock;
+import org.mockito.ArgumentCaptor;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.ai.chat.messages.AssistantMessage;
 import org.springframework.ai.chat.messages.UserMessage;
@@ -28,6 +29,7 @@ import java.util.List;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
@@ -93,7 +95,128 @@ class GoalEvaluationServiceTest {
         when(chatModel.call(any(Prompt.class))).thenReturn(response);
     }
 
+    @Test
+    void filteredOrTruncatedVerdictIsNotAcceptedButStillCharged() {
+        when(modelConfigService.getDefaultModel()).thenReturn(model("qwen-turbo"));
+        when(chatModelFactory.buildFor(any(ModelConfigEntity.class), any(RetryTemplate.class)))
+                .thenReturn(chatModel);
+        for (var category : List.of(org.springframework.ai.chat.metadata.FinishReasonCategory.FILTERED,
+                org.springframework.ai.chat.metadata.FinishReasonCategory.TRUNCATED)) {
+            var metadata = org.springframework.ai.chat.metadata.ChatGenerationMetadata.builder()
+                    .finishReason("stop").finishReasonCategory(category).build();
+            var response = new ChatResponse(List.of(new Generation(new AssistantMessage(
+                    "{\"criterionVerdicts\":[{\"id\":\"C1\",\"passed\":true,\"evidence\":\"done\"}],\"summary\":\"done\"}"), metadata)));
+            when(chatModel.call(any(Prompt.class))).thenReturn(response);
+            var result = svc.evaluate(goalWithCriteria(), List.of(), "answer");
+            assertEquals("fallback", result.decision());
+            assertTrue(result.gap().contains("incomplete_response"));
+            assertEquals(1, result.llmCallsConsumed());
+        }
+    }
+
+    @Test
+    void enabledOrdinaryGoalHasBoundedReasoningHeadroomWhileOffAndManagedKeepLegacyLimit() {
+        stubChatResponse("{\"criterionVerdicts\":[],\"summary\":\"pending\"}");
+        var decisions = new vip.mate.decision.config.DecisionProperties(); svc.setDecisionProperties(decisions);
+        svc.evaluate(goalWithCriteria(), List.of(), "answer");
+        decisions.setMode(vip.mate.decision.api.DecisionMode.OFF);
+        svc.evaluate(goalWithCriteria(), List.of(), "answer");
+        decisions.setMode(vip.mate.decision.api.DecisionMode.SHADOW);
+        var managed = goalWithCriteria(); managed.setJsonAcceptanceRequired(true);
+        svc.evaluate(managed, List.of(), "answer");
+        var prompts = org.mockito.ArgumentCaptor.forClass(Prompt.class);
+        verify(chatModel, org.mockito.Mockito.times(3)).call(prompts.capture());
+        assertEquals(4096, prompts.getAllValues().get(0).getOptions().getMaxTokens());
+        assertEquals(2000, prompts.getAllValues().get(1).getOptions().getMaxTokens());
+        assertEquals(2000, prompts.getAllValues().get(2).getOptions().getMaxTokens());
+    }
+
+    @Test
+    void blankEvidenceVerdictCannotCompleteOrInflateProgress() {
+        stubChatResponse("""
+                {"criterionVerdicts":[
+                  {"id":"C1","passed":true,"evidence":""},
+                  {"id":"C2","passed":true,"evidence":null}],"summary":"done"}
+                """);
+        var result = svc.evaluate(goalWithCriteria(), List.of(), "All done");
+        assertFalse(result.completed());
+        assertEquals(0.0, result.score());
+        assertTrue(result.gap().contains("DNS configured"));
+        assertTrue(result.gap().contains("TLS enabled"));
+    }
+
+    @Test
+    void stampsRevisionCapturedBeforeTheModelCall() {
+        GoalEntity goal = goalWithCriteria(); goal.setEvaluationRevision(7L);
+        when(modelConfigService.getDefaultModel()).thenReturn(model("fixture"));
+        when(chatModelFactory.buildFor(any(ModelConfigEntity.class), any(RetryTemplate.class))).thenReturn(chatModel);
+        when(chatModel.call(any(Prompt.class))).thenAnswer(call -> {
+            goal.setEvaluationRevision(8L);
+            return new ChatResponse(List.of(new Generation(new AssistantMessage(
+                    "{\"criterionVerdicts\":[],\"summary\":\"unchanged\"}"))));
+        });
+        assertEquals(7L, svc.evaluate(goal, List.of(), "answer").evaluationRevision());
+    }
+
+    @Test
+    void customSuccessGuidanceReachesBootstrapAndVerdictPrompts() {
+        stubChatResponse("{\"criteria\":[{\"id\":\"C1\",\"text\":\"appendix\",\"passed\":false,\"evidence\":\"\"}]}");
+        GoalEntity bootstrap = goal(); bootstrap.setSuccessCheckPrompt("Require an appendix with sources.");
+        svc.evaluate(bootstrap, List.of(), "answer");
+        stubChatResponse("{\"criterionVerdicts\":[],\"summary\":\"pending\"}");
+        GoalEntity verdict = goalWithCriteria(); verdict.setSuccessCheckPrompt("Require an appendix with sources.");
+        svc.evaluate(verdict, List.of(), "answer");
+        ArgumentCaptor<Prompt> prompts = ArgumentCaptor.forClass(Prompt.class);
+        org.mockito.Mockito.verify(chatModel, org.mockito.Mockito.times(2)).call(prompts.capture());
+        for (Prompt prompt : prompts.getAllValues()) {
+            assertTrue(prompt.getContents().contains("Require an appendix with sources."));
+            assertTrue(prompt.getInstructions().getFirst() instanceof org.springframework.ai.chat.messages.SystemMessage);
+            assertFalse(prompt.getInstructions().getFirst().getText().contains("Require an appendix with sources."));
+        }
+    }
+
+    @Test
+    void customSuccessGuidanceIsBoundedAndTruncationIsVisible() {
+        stubChatResponse("{\"criterionVerdicts\":[],\"summary\":\"pending\"}");
+        GoalEntity goal = goalWithCriteria(); goal.setSuccessCheckPrompt("x".repeat(4000) + "omitted-tail-marker");
+        svc.evaluate(goal, List.of(), "answer");
+        ArgumentCaptor<Prompt> prompt = ArgumentCaptor.forClass(Prompt.class);
+        verify(chatModel).call(prompt.capture());
+        assertTrue(prompt.getValue().getContents().contains("x".repeat(4000)));
+        assertFalse(prompt.getValue().getContents().contains("omitted-tail-marker"));
+        assertTrue(prompt.getValue().getContents().contains("[success-check guidance truncated]"));
+    }
+
+    @Test
+    void blankSuccessGuidanceDoesNotAddAnEmptyPromptSection() {
+        stubChatResponse("{\"criterionVerdicts\":[],\"summary\":\"pending\"}");
+        GoalEntity goal = goalWithCriteria(); goal.setSuccessCheckPrompt(" \n\t ");
+        svc.evaluate(goal, List.of(), "answer");
+        ArgumentCaptor<Prompt> prompt = ArgumentCaptor.forClass(Prompt.class);
+        verify(chatModel).call(prompt.capture());
+        assertFalse(prompt.getValue().getContents().contains("Goal-specific success-check guidance"));
+    }
+
     // ==================== Pre-flight guards ====================
+
+    @Test
+    void persistentVerdictReceivesPriorVerifiedEvidenceOutsideConversationWindow() {
+        GoalEntity g = goalWithCriteria();
+        g.setPersistentExecution(true);
+        g.setCriteria("[{\"id\":\"C1\",\"text\":\"DNS configured\",\"passed\":true,\"evidence\":\"verified DNS checkpoint\"},"
+                + "{\"id\":\"C2\",\"text\":\"TLS enabled\",\"passed\":false,\"evidence\":\"\"}]");
+        stubChatResponse("{\"criterionVerdicts\":[{\"id\":\"C2\",\"passed\":true,\"evidence\":\"TLS handshake verified\"}],\"summary\":\"done\"}");
+
+        GoalEvaluationResult result = svc.evaluate(g,List.of(),"TLS handshake verified");
+
+        ArgumentCaptor<Prompt> request = ArgumentCaptor.forClass(Prompt.class);
+        verify(chatModel).call(request.capture());
+        String prompt = request.getValue().getContents();
+        assertTrue(prompt.contains("verified DNS checkpoint"), "persistent evaluation must retain prior evidence after history truncation");
+        assertTrue(prompt.contains("passed=true"));
+        assertTrue(prompt.contains("contradicts"));
+        assertTrue(result.completed(), "a new verified step can complete previously verified work without repeating it");
+    }
 
     @Test
     void nullGoal_returnsFallback_withoutTouchingProviders() {
@@ -181,6 +304,56 @@ class GoalEvaluationServiceTest {
         assertEquals(GoalEvaluationResult.DECISION_COMPLETED, r.decision());
         assertTrue(r.completed());
         assertEquals(1.0, r.score(), 1e-9);
+    }
+
+    @Test
+    void contradictoryDuplicateVerdictsCannotProduceCompletion() {
+        stubChatResponse("{\"criterionVerdicts\":["
+                + "{\"id\":\"C1\",\"passed\":false,\"evidence\":\"DNS missing\"},"
+                + "{\"id\":\"C1\",\"passed\":true,\"evidence\":\"DNS claimed ready\"},"
+                + "{\"id\":\"C2\",\"passed\":true,\"evidence\":\"TLS ready\"}],\"summary\":\"done\"}");
+        GoalEvaluationResult result = svc.evaluate(goalWithCriteria(), List.of(), "finished");
+        assertFalse(result.completed());
+        assertEquals(GoalEvaluationResult.DECISION_FALLBACK, result.decision());
+        assertEquals(1, result.llmCallsConsumed());
+        assertTrue(result.criterionVerdicts().isEmpty());
+    }
+
+    @Test
+    void duplicateJsonFieldsAreRejectedInVerdictAndBootstrap() {
+        for (boolean bootstrap : List.of(false, true)) {
+            stubChatResponse(bootstrap
+                    ? "{\"criteria\":[{\"text\":\"original requirement\",\"text\":\"replacement\"}]}"
+                    : "{\"criterionVerdicts\":[{\"id\":\"C1\",\"passed\":false,\"passed\":true,\"evidence\":\"claim\"},"
+                            + "{\"id\":\"C2\",\"passed\":true,\"evidence\":\"claim\"}]}");
+            GoalEvaluationResult result = svc.evaluate(bootstrap ? goal() : goalWithCriteria(), List.of(), "finished");
+            assertEquals(GoalEvaluationResult.DECISION_FALLBACK, result.decision());
+            assertFalse(result.completed());
+            assertEquals(1, result.llmCallsConsumed());
+            assertTrue(result.criterionVerdicts().isEmpty());
+            assertNull(result.bootstrapCriteria());
+        }
+    }
+
+    @Test
+    void aSecondStructuredResultCannotBeIgnoredAfterACompletionVerdict() {
+        stubChatResponse("{\"criterionVerdicts\":[{\"id\":\"C1\",\"passed\":true,\"evidence\":\"ready\"},"
+                + "{\"id\":\"C2\",\"passed\":true,\"evidence\":\"ready\"}]} "
+                + "{\"criterionVerdicts\":[{\"id\":\"C1\",\"passed\":false,\"evidence\":\"not ready\"}]}");
+        var result = svc.evaluate(goalWithCriteria(), List.of(), "finished");
+        assertEquals(GoalEvaluationResult.DECISION_FALLBACK, result.decision());
+        assertFalse(result.completed());
+        assertEquals(1, result.llmCallsConsumed());
+        assertTrue(result.criterionVerdicts().isEmpty());
+    }
+
+    @Test
+    void bootstrapCannotIgnoreTrailingContradictoryContent() {
+        stubChatResponse("{\"criteria\":[{\"text\":\"deliver report\"}]} {\"criteria\":[]}");
+        var result = svc.evaluate(goal(), List.of(), "finished");
+        assertEquals(GoalEvaluationResult.DECISION_FALLBACK, result.decision());
+        assertEquals(1, result.llmCallsConsumed());
+        assertNull(result.bootstrapCriteria());
     }
 
     // ==================== Parser tolerance ====================

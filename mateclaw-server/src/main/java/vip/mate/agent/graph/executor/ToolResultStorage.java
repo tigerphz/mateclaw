@@ -1,5 +1,6 @@
 package vip.mate.agent.graph.executor;
 
+import vip.mate.workspace.core.service.MemberFileIsolation;
 import jakarta.annotation.PostConstruct;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.chat.messages.ToolResponseMessage;
@@ -165,8 +166,7 @@ public class ToolResultStorage {
             return result;
         }
         try {
-            Files.createDirectories(file.getParent());
-            Files.writeString(file, result, StandardCharsets.UTF_8);
+            writeSpill(file, result, workspaceBasePath);
         } catch (IOException ioe) {
             log.warn("[ToolResultStorage] spill write failed for tool={} convId={} ({}); keeping original",
                     toolName, conversationId, ioe.getMessage());
@@ -231,8 +231,7 @@ public class ToolResultStorage {
                 break;
             }
             try {
-                Files.createDirectories(file.getParent());
-                Files.writeString(file, target.responseData(), StandardCharsets.UTF_8);
+                writeSpill(file, target.responseData(), workspaceBasePath);
             } catch (IOException ioe) {
                 log.warn("[ToolResultStorage] spill write failed during turn budget enforcement: {}",
                         ioe.getMessage());
@@ -294,24 +293,34 @@ public class ToolResultStorage {
     }
 
     private String buildPreview(String fullResult, String toolName, Path spillFile) {
-        // Snap the preview to a complete JSON element so the model never sees a value
-        // severed mid-token (which invites it to fabricate the omitted fields).
-        String head = StructuredTruncator.headSlice(fullResult, props.getPreviewHeadChars());
+        int headBudget=Math.max(0,Math.min(props.getPreviewHeadChars(),fullResult.length()/3));
+        int tailBudget=Math.max(0,Math.min(props.getPreviewTailChars(),headBudget));
+        String marker="\n…[middle omitted — preview is INCOMPLETE]…\n";
+        String preview=StructuredTruncator.truncate(fullResult,headBudget,tailBudget,marker);
         return SPILL_MARKER_PREFIX
                 + " tool=" + toolName
                 + " full_chars=" + fullResult.length()
                 + " path=" + spillFile.toAbsolutePath()
-                + "\n[Preview — first " + head.length() + " of " + fullResult.length()
-                + " chars. The preview is INCOMPLETE: use read_file with the path above to "
-                + "retrieve the full result. Do NOT infer or fabricate the omitted content.]\n"
-                + head
-                + "\n…[truncated]";
+                + "\n[INCOMPLETE head/tail preview, up to " + headBudget + "/" + tailBudget
+                + " chars. Use read_file with the path above for missing evidence. "
+                + "Do NOT infer or fabricate omitted content.]\n"
+                + preview;
+
     }
 
     /**
      * Resolve the spill file path for a given (conversationId, toolUseId).
      * Returns {@code null} if no usable directory can be determined.
      */
+    private void writeSpill(Path file, String text, String workspaceBasePath) throws IOException {
+        if (MemberFileIsolation.isEnabled()) {
+            vip.mate.workspace.core.service.MemberFileAccess.write(Path.of(workspaceBasePath), file, text.getBytes(StandardCharsets.UTF_8), false);
+        } else {
+            Files.createDirectories(file.getParent());
+            Files.writeString(file, text, StandardCharsets.UTF_8);
+        }
+    }
+
     private Path spillFor(String conversationId, String toolUseId, String workspaceBasePath) {
         String safeConv = sanitize(conversationId);
         String safeId = sanitize(toolUseId);
@@ -326,7 +335,11 @@ public class ToolResultStorage {
     private Path resolveBaseDir(String workspaceBasePath) {
         Path base;
         boolean outsideWorkspace;
-        if (!props.getStorageBaseDir().isEmpty()) {
+        if (MemberFileIsolation.isEnabled()) {
+            if (workspaceBasePath == null || workspaceBasePath.isBlank()) return null;
+            base = Paths.get(workspaceBasePath, ".mateclaw", "tool-results");
+            outsideWorkspace = false;
+        } else if (!props.getStorageBaseDir().isEmpty()) {
             base = Paths.get(props.getStorageBaseDir());
             outsideWorkspace = true;
         } else if (workspaceBasePath != null && !workspaceBasePath.isBlank()) {
@@ -374,6 +387,8 @@ public class ToolResultStorage {
      * pointed at the historical workspace.
      */
     public int cleanupExpired() {
+        // Legacy traversal cannot safely follow directories writable by confined code.
+        if (MemberFileIsolation.isEnabled()) return 0;
         if (props.getRetentionDays() <= 0) {
             return 0;
         }
@@ -452,6 +467,7 @@ public class ToolResultStorage {
      * is simply left alone. Returns the number of files deleted.
      */
     public int purgeConversation(String conversationId) {
+        if (MemberFileIsolation.isEnabled()) return 0;
         if (conversationId == null || conversationId.isEmpty()) {
             return 0;
         }

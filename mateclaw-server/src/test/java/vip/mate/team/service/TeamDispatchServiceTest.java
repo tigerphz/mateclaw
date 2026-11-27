@@ -1,13 +1,22 @@
 package vip.mate.team.service;
 
+import vip.mate.decision.api.*;
+
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import vip.mate.agent.AgentService;
+import vip.mate.approval.ApprovalWorkflowService;
+import vip.mate.approval.PendingApproval;
 import vip.mate.channel.web.ChatStreamTracker;
+import vip.mate.team.model.AgentTeamEntity;
 import vip.mate.team.model.TeamTaskEntity;
+import vip.mate.team.model.TeamTaskCommentEntity;
 import vip.mate.team.model.TeamTaskStatus;
 import vip.mate.workspace.conversation.ConversationService;
+import vip.mate.workspace.conversation.model.MessageEntity;
 
 import java.util.List;
 
@@ -17,6 +26,7 @@ import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.ArgumentMatchers.startsWith;
+import static org.mockito.ArgumentCaptor.forClass;
 import static org.mockito.Mockito.*;
 
 /**
@@ -28,6 +38,7 @@ import static org.mockito.Mockito.*;
 class TeamDispatchServiceTest {
 
     private static final Long TEAM_ID = 10L;
+    private static final Long WORKSPACE_ID = 77L;
     private static final Long MEMBER_A = 2L;
     private static final Long MEMBER_B = 3L;
 
@@ -38,6 +49,7 @@ class TeamDispatchServiceTest {
     private ChatStreamTracker streamTracker;
     private TeamAnnounceService announceService;
     private TeamEventChannel eventChannel;
+    private ApprovalWorkflowService approvalService;
     private TeamDispatchService service;
 
     @BeforeEach
@@ -49,8 +61,9 @@ class TeamDispatchServiceTest {
         streamTracker = mock(ChatStreamTracker.class);
         announceService = mock(TeamAnnounceService.class);
         eventChannel = mock(TeamEventChannel.class);
+        approvalService = mock(ApprovalWorkflowService.class);
         service = new TeamDispatchService(teamService, taskService, agentService,
-                conversationService, streamTracker, announceService, eventChannel);
+                conversationService, streamTracker, announceService, eventChannel, approvalService);
     }
 
     private TeamTaskEntity task(Long id, Long assignee) {
@@ -63,6 +76,36 @@ class TeamDispatchServiceTest {
         t.setAssigneeAgentId(assignee);
         t.setLeadConversationId("lead-conv");
         return t;
+    }
+
+    @Test
+    void structuredBlockedResultFailsWithoutRetryOrReleasingDependents() {
+        TeamTaskEntity running = task(71L, MEMBER_A);
+        running.setStatus(TeamTaskStatus.IN_PROGRESS);
+        running.setRequireApproval(true);
+        when(taskService.getTask(71L)).thenReturn(running);
+        var adapter = mock(WorkerDecisionAdapter.class);
+        when(adapter.enabled()).thenReturn(true);
+        var ticket = new DecisionTicket("blocked", DecisionMode.SHADOW, new DecisionValue.BooleanValue(false));
+        when(adapter.judge(any(), anyString(), anyString()))
+                .thenReturn(new WorkerDecisionAdapter.Judgment(ticket, false));
+        service.setDecisionAdapter(adapter);
+        String reply = "{\"status\":\"BLOCKED\",\"result\":\"\",\"evidence\":\"Missing total count\"}";
+        service.settleOutcome(running, reply);
+        verify(taskService).failTask(eq(71L), startsWith("BLOCKED:"), eq(ticket), any());
+        verify(taskService, never()).completeTask(any(), any(), anyString(), any(), any());
+        verify(taskService, never()).requeueUnusableResult(any(), anyString());
+        verify(adapter).judge(running, "BLOCKED", reply);
+    }
+
+    @Test
+    void enabledWorkerEnvelopeRequiresStructuredCompletionEvenWithoutTools() {
+        var adapter = mock(WorkerDecisionAdapter.class);
+        when(adapter.enabled()).thenReturn(true);
+        service.setDecisionAdapter(adapter);
+        String prompt = service.buildDispatchContent(task(72L, MEMBER_A));
+        assertTrue(prompt.contains("COMPLETED|BLOCKED|FAILED"));
+        assertTrue(prompt.contains("evidence"));
     }
 
     // ==================== sweep arbitration ====================
@@ -131,7 +174,123 @@ class TeamDispatchServiceTest {
         verifyNoInteractions(agentService);
     }
 
+    @Test
+    void activeSemanticRejectionFailsWithoutAnotherAttempt() {
+        var adapter = mock(WorkerDecisionAdapter.class); service.setDecisionAdapter(adapter); when(adapter.enabled()).thenReturn(true);
+        when(adapter.active()).thenReturn(true);
+        var running = WorkerDecisionAdapterTest.task();
+        var snapshot = WorkerDecisionAdapter.Snapshot.capture(running);
+        var ticket = new DecisionTicket("worker", DecisionMode.ACTIVE, new DecisionValue.BooleanValue(false));
+        when(taskService.getTask(1L)).thenReturn(running);
+        when(adapter.judge(running, "VALID", "analysis finished"))
+                .thenReturn(new WorkerDecisionAdapter.Judgment(ticket, false));
+        service.settleOutcome(running, "{\"status\":\"COMPLETED\",\"result\":\"analysis finished\",\"evidence\":\"measured\"}");
+        verify(taskService).failTask(1L, "worker result did not satisfy task requirements", ticket, snapshot);
+        verify(taskService, never()).requeueUnusableResult(any(), anyString(), any(), any());
+        verify(taskService, never()).completeTask(any(), any(), anyString(), any(), any());
+    }
+
+    @Test
+    void staleActiveReplyDoesNotAttachArtifactOrCompleteNewAttempt() {
+        var adapter = mock(WorkerDecisionAdapter.class); service.setDecisionAdapter(adapter); when(adapter.enabled()).thenReturn(true);
+        when(adapter.active()).thenReturn(true);
+        var original = WorkerDecisionAdapterTest.task();
+        var replacement = WorkerDecisionAdapterTest.task(); replacement.setDispatchCount(2);
+        when(taskService.getTask(1L)).thenReturn(replacement);
+        var ticket = new DecisionTicket("worker", DecisionMode.ACTIVE, new DecisionValue.BooleanValue(false));
+        when(adapter.judge(eq(original), eq("STALE_ATTEMPT"), isNull()))
+                .thenReturn(new WorkerDecisionAdapter.Judgment(ticket, false));
+        service.settleOutcome(original, "[file](/api/v1/files/generated/abc)");
+        verify(adapter).outcome(ticket, false, "STALE_ATTEMPT");
+        verify(taskService, never()).addDeliverable(any(), any(), anyString(), anyString());
+        verify(taskService, never()).addWorkerDeliverable(any(), any(), anyString(), anyString());
+        verify(taskService, never()).completeTask(any(), any(), anyString(), any(), any());
+    }
+
     // ==================== outcome settling ====================
+
+    @ParameterizedTest
+    @ValueSource(strings = {"cancelled", "stale", "pending", "blocked", "awaiting_approval"})
+    void normalWorkerReturnDoesNotAnnounceUnsettledOrCancelledTask(String status) {
+        TeamTaskEntity current = task(1L, MEMBER_A);
+        current.setStatus(status);
+        when(taskService.getTask(1L)).thenReturn(current);
+
+        service.settleOutcome(current, "late worker reply");
+
+        verifyNoInteractions(eventChannel, announceService);
+        verify(taskService, never()).completeTask(any(), any(), anyString());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"incomplete", "error_fallback", "max_iterations_reached", "stopped", "evidence_insufficient", "action_unverified", "action_failed"})
+    void incompleteRuntimeIsNotMisreportedAsInvalidWorkerJson(String finishReason) {
+        var adapter = mock(WorkerDecisionAdapter.class);
+        when(adapter.enabled()).thenReturn(true);
+        var ticket = new DecisionTicket(null, DecisionMode.SHADOW, new DecisionValue.BooleanValue(false));
+        when(adapter.judge(any(), anyString(), anyString())).thenReturn(new WorkerDecisionAdapter.Judgment(ticket, false));
+        service.setDecisionAdapter(adapter);
+        TeamTaskEntity assigned = task(1L, MEMBER_A); assigned.setStatus(TeamTaskStatus.IN_PROGRESS);
+        when(taskService.getTask(1L)).thenReturn(assigned);
+        when(agentService.chatWithUsage(eq(MEMBER_A), anyString(), anyString())).thenReturn(
+            new AgentService.ChatResult("任务尚未完成：文字修正已达上限", 10, 5, "model", "provider", finishReason));
+        service.runTask(TEAM_ID, assigned);
+        verify(adapter).judge(eq(assigned), eq("WORKER_RUNTIME_NOT_COMPLETED"), anyString());
+        verify(taskService).failTask(eq(1L), startsWith("WORKER_RUNTIME_NOT_COMPLETED:"), eq(ticket), any());
+        verify(taskService, never()).completeTask(any(), any(), anyString(), any(), any());
+        verify(adapter, never()).judge(any(), eq("INVALID_RESULT_CONTRACT"), anyString());
+    }
+
+    @Test
+    void validJsonCannotOverrideAnIncompleteRuntimeEvenWhenDecisionEnvelopeIsDisabled() {
+        TeamTaskEntity assigned = task(1L, MEMBER_A); assigned.setStatus(TeamTaskStatus.IN_PROGRESS);
+        when(taskService.getTask(1L)).thenReturn(assigned);
+        when(agentService.chatWithUsage(eq(MEMBER_A), anyString(), anyString())).thenReturn(
+            new AgentService.ChatResult("{\"status\":\"COMPLETED\",\"result\":\"done\",\"evidence\":\"checked\"}",
+                10, 5, "model", "provider", "incomplete"));
+        service.runTask(TEAM_ID, assigned);
+        verify(taskService).failTask(eq(1L), startsWith("WORKER_RUNTIME_NOT_COMPLETED:"));
+        verify(taskService, never()).completeTask(any(), any(), anyString());
+    }
+
+    @Test
+    void childStreamClosesBeforeLeadReceivesSuccessfulResult() {
+        TeamTaskEntity assigned = task(1L, MEMBER_A);
+        assigned.setStatus(TeamTaskStatus.IN_PROGRESS);
+        TeamTaskEntity done = task(1L, MEMBER_A);
+        done.setStatus(TeamTaskStatus.COMPLETED);
+        when(taskService.getTask(1L)).thenReturn(assigned, done, done);
+        when(taskService.completeTask(eq(1L), isNull(), anyString())).thenReturn(List.of());
+        when(agentService.chatWithUsage(eq(MEMBER_A), anyString(), anyString()))
+                .thenReturn(AgentService.ChatResult.contentOnly("all done"));
+
+        service.runTask(TEAM_ID, assigned);
+
+        var order = inOrder(conversationService, streamTracker, eventChannel, announceService);
+        order.verify(conversationService).saveMessage(anyString(), eq("assistant"), eq("all done"));
+        order.verify(streamTracker).complete(startsWith("team-task-"));
+        order.verify(eventChannel).publishTaskEvent(any(), eq("team_task_completed"), any());
+        order.verify(announceService).announceTaskSettled(done);
+    }
+
+    @Test
+    void childStreamClosesBeforeLeadReceivesFailedResult() {
+        TeamTaskEntity assigned = task(1L, MEMBER_A);
+        assigned.setStatus(TeamTaskStatus.IN_PROGRESS);
+        TeamTaskEntity failed = task(1L, MEMBER_A);
+        failed.setStatus(TeamTaskStatus.FAILED);
+        when(agentService.chatWithUsage(eq(MEMBER_A), anyString(), anyString()))
+                .thenThrow(new IllegalStateException("model unavailable"));
+        when(taskService.failTask(eq(1L), anyString())).thenReturn(true);
+        when(taskService.getTask(1L)).thenReturn(failed);
+
+        service.runTask(TEAM_ID, assigned);
+
+        var order = inOrder(streamTracker, eventChannel, announceService);
+        order.verify(streamTracker).complete(startsWith("team-task-"));
+        order.verify(eventChannel).publishTaskEvent(any(), eq("team_task_failed"), any());
+        order.verify(announceService).announceTaskSettled(failed);
+    }
 
     @Test
     @DisplayName("an in_progress task is auto-completed with the member's final reply")
@@ -149,6 +308,204 @@ class TeamDispatchServiceTest {
         verify(taskService).completeTask(1L, null, "analysis finished");
         verify(eventChannel).publishTaskEvent(any(), eq("team_task_completed"), any());
         verify(announceService).announceTaskSettled(done);
+    }
+
+    @Test
+    @DisplayName("a fallback final answer is requeued instead of being reported as completed")
+    void settleFallbackRequeues() {
+        TeamTaskEntity running = task(1L, MEMBER_A);
+        running.setStatus(TeamTaskStatus.IN_PROGRESS);
+        running.setDispatchCount(1);
+        when(taskService.getTask(1L)).thenReturn(running);
+        when(taskService.requeueUnusableResult(1L, "member response generation failed"))
+                .thenReturn(true);
+
+        service.settleOutcome(running,
+                "I inspected the task. Failed to generate a response, please retry.");
+
+        verify(taskService).requeueUnusableResult(1L, "member response generation failed");
+        verify(taskService, never()).completeTask(any(), any(), anyString());
+        verify(announceService, never()).announceTaskSettled(any());
+        verify(eventChannel).publishTaskEvent(any(), eq("team_task_retrying"), any());
+    }
+
+    @Test
+    @DisplayName("a clarifying question is requeued instead of being reported as completed")
+    void settleClarifyingQuestionRequeues() {
+        TeamTaskEntity running = task(1L, MEMBER_A);
+        running.setStatus(TeamTaskStatus.IN_PROGRESS);
+        running.setDispatchCount(1);
+        when(taskService.getTask(1L)).thenReturn(running);
+        when(taskService.requeueUnusableResult(1L,
+                "member asked for clarification instead of producing a result"))
+                .thenReturn(true);
+
+        service.settleOutcome(running, "您希望我如何处理？");
+
+        verify(taskService).requeueUnusableResult(1L,
+                "member asked for clarification instead of producing a result");
+        verify(taskService, never()).completeTask(any(), any(), anyString());
+        verify(announceService, never()).announceTaskSettled(any());
+        verify(eventChannel).publishTaskEvent(any(), eq("team_task_retrying"), any());
+    }
+
+    @Test
+    @DisplayName("an unusable third result fails instead of bypassing the circuit breaker")
+    void settleFallbackFailsAfterDispatchBudget() {
+        TeamTaskEntity running = task(1L, MEMBER_A);
+        running.setStatus(TeamTaskStatus.IN_PROGRESS);
+        running.setDispatchCount(TeamTaskService.MAX_DISPATCHES);
+        TeamTaskEntity failed = task(1L, MEMBER_A);
+        failed.setStatus(TeamTaskStatus.FAILED);
+        failed.setReason("member response generation failed");
+        when(taskService.getTask(1L)).thenReturn(running, failed);
+        when(taskService.failTask(1L, "member response generation failed")).thenReturn(true);
+
+        service.settleOutcome(running, "Failed to generate a response, please retry.");
+
+        verify(taskService, never()).requeueUnusableResult(any(), anyString());
+        verify(taskService).failTask(1L, "member response generation failed");
+        verify(eventChannel).publishTaskEvent(any(), eq("team_task_failed"), any());
+        verify(announceService).announceTaskSettled(failed);
+    }
+
+    @Test
+    @DisplayName("a second empty member result fails without starting a third long run")
+    void settleEmptyResultFailsAfterSingleRecoveryAttempt() {
+        TeamTaskEntity running = task(1L, MEMBER_A);
+        running.setStatus(TeamTaskStatus.IN_PROGRESS);
+        running.setDispatchCount(TeamDispatchService.MAX_RESPONSE_FAILURE_DISPATCHES);
+        TeamTaskEntity failed = task(1L, MEMBER_A);
+        failed.setStatus(TeamTaskStatus.FAILED);
+        failed.setReason("member produced no result");
+        when(taskService.getTask(1L)).thenReturn(running, failed);
+        when(taskService.failTask(1L, "member produced no result")).thenReturn(true);
+
+        service.settleOutcome(running, "");
+
+        verify(taskService, never()).requeueUnusableResult(any(), anyString());
+        verify(taskService).failTask(1L, "member produced no result");
+        verify(eventChannel).publishTaskEvent(any(), eq("team_task_failed"), any());
+        verify(announceService).announceTaskSettled(failed);
+    }
+
+    @Test
+    void dispatchUsesImmutableBriefingAcrossRetries() {
+        var assigned = task(1L, MEMBER_A);
+        assigned.setDescription("Changed live description");
+        assigned.setMetadata("{\"briefing\":{\"schemaVersion\":1,\"objective\":\"Original objective\",\"description\":\"Original instructions\",\"acceptanceCriteria\":\"Pass checks\",\"constraints\":\"No network\"}}");
+        String initial = service.buildDispatchContent(assigned);
+        assertTrue(initial.contains("[Run objective]\nOriginal objective"));
+        assertTrue(initial.contains("Original instructions"));
+        assertTrue(initial.contains("[Acceptance criteria]\nPass checks"));
+        assertTrue(initial.contains("[Constraints]\nNo network"));
+        assertFalse(initial.contains("Changed live description"));
+        assigned.setDispatchCount(2);
+        assigned.setReason("Try again");
+        String retry = service.buildDispatchContent(assigned);
+        assertTrue(retry.contains("Original instructions"));
+        assertTrue(retry.contains("[Retry feedback]"));
+    }
+
+    @Test
+    void legacyAndMalformedBriefingUseLiveDescription() {
+        var assigned = task(1L, MEMBER_A);
+        assigned.setDescription("Legacy instructions");
+        for (String metadata : new String[] {null, "junk", "{}", "{\"briefing\":{\"schemaVersion\":99}}", "{\"briefing\":{\"schemaVersion\":1,\"description\":[]}}"}) {
+            assigned.setMetadata(metadata);
+            assertTrue(service.buildDispatchContent(assigned).contains("Legacy instructions"));
+        }
+    }
+
+    @Test
+    @DisplayName("automatic retry tells the worker why its previous attempt was rejected")
+    void retryDispatchContentIncludesPreviousFailure() {
+        TeamTaskEntity retry = task(1L, MEMBER_A);
+        retry.setDispatchCount(2);
+        retry.setReason("member produced no result");
+
+        String content = service.buildDispatchContent(retry);
+
+        assertTrue(content.contains("[Retry feedback]"));
+        assertTrue(content.contains("member produced no result"));
+        assertTrue(content.contains("do not repeat the same empty or fallback response"));
+    }
+
+    @Test
+    @DisplayName("a declared deliverable task without an attachment is requeued")
+    void settleMissingDeliverableRequeues() {
+        TeamTaskEntity running = task(1L, MEMBER_A);
+        running.setStatus(TeamTaskStatus.IN_PROGRESS);
+        running.setDispatchCount(1);
+        running.setMetadata("{\"deliverableRequired\":true}");
+        when(taskService.getTask(1L)).thenReturn(running);
+        when(taskService.listDeliverables(running)).thenReturn(List.of());
+        when(taskService.requeueUnusableResult(1L, "required deliverable was not attached"))
+                .thenReturn(true);
+
+        service.settleOutcome(running, "handbook completed");
+
+        verify(taskService).requeueUnusableResult(1L, "required deliverable was not attached");
+        verify(taskService, never()).completeTask(any(), any(), anyString());
+    }
+
+    @Test
+    @DisplayName("a returnDirect generated-file link satisfies a declared deliverable task")
+    void settleGeneratedFileLinkAttachesDeliverable() {
+        TeamTaskEntity running = task(1L, MEMBER_A);
+        running.setStatus(TeamTaskStatus.IN_PROGRESS);
+        running.setMetadata("{\"deliverableRequired\":true}");
+        TeamTaskEntity completed = task(1L, MEMBER_A);
+        completed.setStatus(TeamTaskStatus.COMPLETED);
+        when(taskService.getTask(1L)).thenReturn(running, completed);
+        when(taskService.listDeliverables(running)).thenReturn(List.of());
+        when(taskService.completeTask(eq(1L), isNull(), anyString())).thenReturn(List.of());
+
+        String reply = "文档已生成：[report.docx](/api/v1/files/generated/file-123)（链接 7 天内有效）。";
+        service.settleOutcome(running, reply);
+
+        verify(taskService).addDeliverable(1L, MEMBER_A, "report.docx",
+                "/api/v1/files/generated/file-123");
+        verify(taskService, never()).requeueUnusableResult(any(), anyString());
+        verify(taskService).completeTask(1L, null, reply);
+        verify(announceService).announceTaskSettled(completed);
+    }
+
+    @Test
+    @DisplayName("a long-running checkpoint tracker stays active until its terminal round")
+    void settleParksCheckpointTracker() {
+        TeamTaskEntity running = task(1L, MEMBER_A);
+        running.setStatus(TeamTaskStatus.IN_PROGRESS);
+        running.setProgressPercent(1);
+        when(taskService.getTask(1L)).thenReturn(running);
+        when(taskService.checkpointTerminalTag(running)).thenReturn("R300");
+
+        service.settleOutcome(running, "R001 tracker initialized");
+
+        verify(taskService).updateProgress(1L, null, 1,
+                "waiting for R300 checkpoint");
+        verify(taskService, never()).completeTask(any(), any(), anyString());
+        verify(announceService, never()).announceTaskSettled(any());
+    }
+
+    @Test
+    @DisplayName("a tracker initialized after its terminal checkpoint completes immediately")
+    void settleCompletesTrackerWhenTerminalEvidenceAlreadyExists() {
+        TeamTaskEntity running = task(1L, MEMBER_A);
+        running.setStatus(TeamTaskStatus.IN_PROGRESS);
+        TeamTaskEntity completed = task(1L, MEMBER_A);
+        completed.setStatus(TeamTaskStatus.COMPLETED);
+        TeamTaskCommentEntity evidence = new TeamTaskCommentEntity();
+        evidence.setContent("运行台账终点: [checkpoint:R300] acknowledged");
+        when(taskService.getTask(1L)).thenReturn(running, completed);
+        when(taskService.checkpointTerminalTag(running)).thenReturn("R300");
+        when(taskService.listComments(1L)).thenReturn(List.of(evidence));
+        when(taskService.completeTask(1L, null, "tracker initialized")).thenReturn(List.of());
+
+        service.settleOutcome(running, "tracker initialized");
+
+        verify(taskService).completeTask(1L, null, "tracker initialized");
+        verify(announceService).announceTaskSettled(completed);
     }
 
     @Test
@@ -188,6 +545,85 @@ class TeamDispatchServiceTest {
         // Both sides of the run persist, so the task card's transcript view has content.
         verify(conversationService).saveMessage(startsWith("team-task-"), eq("user"), anyString());
         verify(conversationService).saveMessage(startsWith("team-task-"), eq("assistant"), eq("all done"));
+    }
+
+    @Test
+    @DisplayName("a worker tool approval parks the task instead of completing or retrying it")
+    void runTaskParksPendingToolApproval() {
+        TeamTaskEntity assigned = task(1L, MEMBER_A);
+        assigned.setStatus(TeamTaskStatus.IN_PROGRESS);
+        PendingApproval pending = new PendingApproval("pending-42", "worker", "system",
+                "execute_shell_command", "{}", "shell command requires approval");
+        pending.setSummary("shell command requires approval");
+        when(agentService.chatWithUsage(eq(MEMBER_A), anyString(), anyString()))
+                .thenReturn(AgentService.ChatResult.contentOnly("I need permission first."));
+        when(approvalService.findPendingByConversation(startsWith("team-task-"))).thenReturn(pending);
+        when(taskService.parkForToolApproval(1L, "pending-42", "shell command requires approval"))
+                .thenReturn(true);
+
+        service.runTask(TEAM_ID, assigned);
+
+        verify(taskService).parkForToolApproval(1L, "pending-42", "shell command requires approval");
+        verify(taskService, never()).completeTask(any(), any(), anyString());
+        verify(taskService, never()).requeueUnusableResult(any(), anyString());
+        verify(eventChannel).publishTaskEvent(any(), eq("team_task_awaiting_approval"), any());
+    }
+
+    @Test
+    @DisplayName("member child conversation inherits the team's workspace")
+    void runTaskCreatesChildConversationInTeamWorkspace() {
+        AgentTeamEntity team = new AgentTeamEntity();
+        team.setId(TEAM_ID);
+        team.setWorkspaceId(WORKSPACE_ID);
+        when(teamService.getTeam(TEAM_ID)).thenReturn(team);
+
+        TeamTaskEntity assigned = task(1L, MEMBER_A);
+        assigned.setStatus(TeamTaskStatus.IN_PROGRESS);
+        TeamTaskEntity done = task(1L, MEMBER_A);
+        done.setStatus(TeamTaskStatus.COMPLETED);
+        when(taskService.getTask(1L)).thenReturn(assigned, done, done);
+        when(taskService.completeTask(eq(1L), isNull(), anyString())).thenReturn(List.of());
+        when(agentService.chatWithUsage(eq(MEMBER_A), anyString(), anyString()))
+                .thenReturn(AgentService.ChatResult.contentOnly("all done"));
+
+        service.runTask(TEAM_ID, assigned);
+
+        verify(conversationService).createChildConversation(
+                startsWith("team-task-"),
+                eq(MEMBER_A),
+                eq("system"),
+                eq(WORKSPACE_ID),
+                eq("lead-conv"),
+                eq("team_worker"));
+    }
+
+    @Test
+    @DisplayName("member dispatch envelope carries lead conversation upload paths")
+    void runTaskCarriesLeadConversationUploadPaths() {
+        TeamTaskEntity assigned = task(1L, MEMBER_A);
+        assigned.setDescription("请根据刚上传的需求.docx拆解任务");
+        assigned.setStatus(TeamTaskStatus.IN_PROGRESS);
+        TeamTaskEntity done = task(1L, MEMBER_A);
+        done.setStatus(TeamTaskStatus.COMPLETED);
+        MessageEntity uploadTurn = new MessageEntity();
+        uploadTurn.setRole("user");
+        uploadTurn.setContentParts("[{\"type\":\"file\"}]");
+        when(conversationService.listRecentMessages("lead-conv", TeamDispatchService.LEAD_ATTACHMENT_CONTEXT_MESSAGES))
+                .thenReturn(List.of(uploadTurn));
+        when(conversationService.renderMessageContent(uploadTurn, true))
+                .thenReturn("请看附件\n[附件] 需求.docx（路径: /workspace/uploads/lead-conv/需求.docx）");
+        when(taskService.getTask(1L)).thenReturn(assigned, done, done);
+        when(taskService.completeTask(eq(1L), isNull(), anyString())).thenReturn(List.of());
+        when(agentService.chatWithUsage(eq(MEMBER_A), anyString(), anyString()))
+                .thenReturn(AgentService.ChatResult.contentOnly("all done"));
+
+        service.runTask(TEAM_ID, assigned);
+
+        var prompt = forClass(String.class);
+        verify(agentService).chatWithUsage(eq(MEMBER_A), prompt.capture(), startsWith("team-task-"));
+        assertTrue(prompt.getValue().contains("[Lead conversation attachments]"));
+        assertTrue(prompt.getValue().contains("需求.docx"));
+        assertTrue(prompt.getValue().contains("/workspace/uploads/lead-conv/需求.docx"));
     }
 
     @Test
@@ -265,7 +701,13 @@ class TeamDispatchServiceTest {
         assertTrue(section.contains("[Prerequisite results]"));
         assertTrue(section.contains("pricing collected: 3 competitors"));
         assertTrue(section.contains("prices.xlsx → /api/v1/files/generated/x"));
+        assertTrue(section.contains("Inspect locally: ../generated-files/x"));
+        assertTrue(section.contains("do not guess an HTTP port"));
         assertFalse(section.contains("#2"), "vanished blockers leave no trace");
+
+        assertNull(TeamDispatchService.generatedFileInspectionPath("https://example.com/file"));
+        assertNull(TeamDispatchService.generatedFileInspectionPath(
+                "/api/v1/files/generated/../../secret"));
 
         // No blockers → no section at all.
         StringBuilder plain = new StringBuilder();
@@ -274,17 +716,105 @@ class TeamDispatchServiceTest {
     }
 
     @Test
-    @DisplayName("an oversized member reply is truncated before persisting")
-    void settleTruncatesLongReply() {
+    @DisplayName("a bounded task summary preserves the final outcome and a complete-output reference")
+    void settleSummarizesLongReplyWithoutLosingFinalOutcome() {
         TeamTaskEntity running = task(1L, MEMBER_A);
         running.setStatus(TeamTaskStatus.IN_PROGRESS);
         when(taskService.getTask(1L)).thenReturn(running, running);
         when(taskService.completeTask(eq(1L), isNull(), anyString())).thenReturn(List.of());
 
-        service.settleOutcome(running, "x".repeat(TeamDispatchService.MAX_RESULT_CHARS + 500));
+        service.settleOutcome(running, "Opening findings\n"
+                + "x".repeat(TeamDispatchService.MAX_RESULT_CHARS + 500) + "\nFinal verification passed");
 
         verify(taskService).completeTask(eq(1L), isNull(), argThat(r ->
-                r.length() <= TeamDispatchService.MAX_RESULT_CHARS + 20
-                        && r.endsWith("...(truncated)")));
+                r.length() <= TeamDispatchService.MAX_RESULT_CHARS
+                        && r.startsWith("Opening findings")
+                        && r.endsWith("Final verification passed")
+                        && r.contains("team_tasks(action=\"output\", taskId=\"1\")")));
     }
+
+    @Test
+    void completeWorkerReplyIsSavedBeforeTaskSummaryIsDerived() {
+        TeamTaskEntity assigned = task(1L, MEMBER_A);
+        assigned.setStatus(TeamTaskStatus.IN_PROGRESS);
+        TeamTaskEntity done = task(1L, MEMBER_A);
+        done.setStatus(TeamTaskStatus.COMPLETED);
+        when(taskService.getTask(1L)).thenReturn(assigned, done, done);
+        when(taskService.completeTask(eq(1L), isNull(), anyString())).thenReturn(List.of());
+        String full = "Opening\n" + "x".repeat(10000) + "\nFinal verification";
+        when(agentService.chatWithUsage(eq(MEMBER_A), anyString(), anyString()))
+                .thenReturn(AgentService.ChatResult.contentOnly(full));
+
+        service.runTask(TEAM_ID, assigned);
+
+        var order = inOrder(conversationService, taskService);
+        order.verify(conversationService).saveMessage(anyString(), eq("assistant"), eq(full));
+        order.verify(taskService).completeTask(eq(1L), isNull(), argThat(result ->
+                result.length() <= TeamDispatchService.MAX_RESULT_CHARS
+                        && result.endsWith("Final verification")
+                        && result.contains("action=\"output\"")));
+    }
+
+    @Test
+    void prerequisiteContextKeepsFinalVerificationAndEveryIncludedTaskReference() {
+        TeamTaskEntity dependent = task(20L, MEMBER_B);
+        dependent.setBlockedBy("[1,2,3,4,5,6]");
+        for (long id = 1; id <= 6; id++) {
+            TeamTaskEntity prerequisite = task(id, MEMBER_A);
+            prerequisite.setStatus(TeamTaskStatus.COMPLETED);
+            prerequisite.setResult("opening " + id + "\n" + "analysis\n".repeat(2000)
+                    + "\nverification " + id + " passed");
+            when(taskService.getTask(id)).thenReturn(prerequisite);
+        }
+
+        StringBuilder context = new StringBuilder();
+        service.appendPrerequisiteResults(context, dependent);
+        String result = context.toString();
+
+        assertTrue(result.length() <= TeamDispatchService.MAX_PREREQ_SECTION_CHARS);
+        for (long id = 1; id <= 6; id++) {
+            assertTrue(result.contains("taskId=\"" + id + "\""), "Missing task " + id);
+            assertTrue(result.contains("verification " + id + " passed"), "Lost tail for " + id);
+        }
+    }
+
+    @Test
+    void manyPrerequisitesAndDeliverablesHaveExplicitRetrievalPathsInsideTotalBudget() {
+        TeamTaskEntity dependent = task(50L, MEMBER_B);
+        dependent.setBlockedBy("[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20]");
+        for (long id = 1; id <= 20; id++) {
+            TeamTaskEntity prerequisite = task(id, MEMBER_A);
+            prerequisite.setStatus(TeamTaskStatus.COMPLETED);
+            prerequisite.setSubject("Long subject ".repeat(50));
+            prerequisite.setResult("Opening\n" + "evidence\n".repeat(2000) + "Final verified");
+            when(taskService.getTask(id)).thenReturn(prerequisite);
+            when(taskService.listDeliverables(prerequisite)).thenReturn(java.util.stream.IntStream.range(0, 10)
+                    .mapToObj(index -> new TeamTaskService.Deliverable("report-" + index + ".docx",
+                            "/api/v1/files/generated/complete-generated-id-" + index, null)).toList());
+        }
+
+        StringBuilder context = new StringBuilder();
+        service.appendPrerequisiteResults(context, dependent);
+        String result = context.toString();
+
+        assertTrue(result.length() <= TeamDispatchService.MAX_PREREQ_SECTION_CHARS, result);
+        assertTrue(result.contains("12 additional prerequisite(s) omitted"));
+        assertTrue(result.contains("taskId=\"50\""));
+        assertTrue(result.contains("deliverable(s) omitted"));
+        for (long id = 1; id <= 8; id++) {
+            assertTrue(result.contains("taskId=\"" + id + "\""));
+            assertTrue(result.contains("Final verified"));
+        }
+    }
+    @Test
+    @SuppressWarnings("unchecked")
+    void duplicateMemberRunnerRequeuesWithoutResettingDispatchBudget() {
+        var busy=(java.util.Set<Long>)org.springframework.test.util.ReflectionTestUtils.getField(service,"runningMembers");
+        busy.add(MEMBER_A);
+        service.runTask(TEAM_ID,task(5L,MEMBER_A));
+        verify(taskService).requeueUnusableResult(eq(5L),contains("already executing"));
+        verify(taskService,never()).retryTask(anyLong());
+        verifyNoInteractions(agentService);
+    }
+
 }

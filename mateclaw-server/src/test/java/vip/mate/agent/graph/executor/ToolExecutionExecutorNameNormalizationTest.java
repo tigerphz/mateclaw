@@ -3,13 +3,17 @@ package vip.mate.agent.graph.executor;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.ai.chat.messages.AssistantMessage;
+import org.springframework.ai.chat.model.ToolContext;
 import org.springframework.ai.tool.ToolCallback;
 import org.springframework.ai.tool.definition.ToolDefinition;
 import vip.mate.agent.AgentToolSet;
+import vip.mate.agent.graph.state.ActionExecutionLedger;
 import vip.mate.tool.guard.ToolGuard;
 import vip.mate.tool.guard.ToolGuardResult;
+import vip.mate.tool.builtin.ProgressiveToolBridgeTool;
 
 import java.util.List;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.*;
@@ -124,6 +128,8 @@ class ToolExecutionExecutorNameNormalizationTest {
                 "conv", "agent", false, "user", null);
 
         assertEquals(1, result.responses().size());
+        assertEquals("WebSearch", result.responses().get(0).name(),
+                "provider-facing response name must match the model-emitted function name");
         assertEquals("ok:web_search", result.responses().get(0).responseData(),
                 "Mangled name should resolve and dispatch to the registered tool");
     }
@@ -138,5 +144,90 @@ class ToolExecutionExecutorNameNormalizationTest {
                 "conv", "agent", false, "user", null);
 
         assertEquals("ok:read_file", result.responses().get(0).responseData());
+    }
+
+    @Test
+    @DisplayName("invalid streamed arguments return a stable rejection without executing the tool")
+    void invalidArgumentsRejectedWithoutExecution() {
+        ToolCallback callback = callbackNamed("write_file");
+        ToolExecutionExecutor executor = newExecutor(callback);
+
+        var result = executor.execute(
+                List.of(new AssistantMessage.ToolCall(
+                        "call_invalid", "function", "write_file", "{\"filePath\":\"notes.md\"")),
+                "conv", "agent", false, "user", null);
+
+        assertEquals(1, result.responses().size());
+        assertTrue(result.responses().get(0).responseData().contains("TOOL_ARGUMENTS_INCOMPLETE"));
+        assertTrue(result.responses().get(0).responseData().contains("append_file"));
+        var ledger = ActionExecutionLedger.fromEvents(result.events());
+        assertEquals(ActionExecutionLedger.Status.FAILED, ledger.receipts().get("call_invalid").status());
+        assertTrue(ledger.renderAnswerFacts().contains("TOOL_ARGUMENTS_INCOMPLETE"));
+        verify(callback, never()).call(anyString(), any());
+        verify(callback, never()).call(anyString());
+    }
+
+    @Test
+    @DisplayName("tool_call unwraps and executes the real tool in the same action round")
+    void progressiveBridge_executesTargetSameRound() {
+        ToolCallback target = callbackNamed("web_search");
+        AtomicReference<String> guardedName = new AtomicReference<>();
+        ToolGuard guard = (name, args) -> {
+            guardedName.set(name);
+            return ToolGuardResult.allow();
+        };
+        ToolExecutionExecutor executor = new ToolExecutionExecutor(
+                AgentToolSet.fromCallbacks(List.of(), List.of(target)), guard, null, null);
+
+        var result = executor.execute(List.of(new AssistantMessage.ToolCall(
+                        "bridge_1", "function", "tool_call",
+                        "{\"toolName\":\"web_search\",\"arguments\":{\"query\":\"MateClaw\"}}")),
+                "conv", "agent", false, "user", null);
+
+        assertEquals("web_search", guardedName.get(),
+                "guard must see the real target, never the proxy name");
+        assertEquals("tool_call", result.responses().get(0).name(),
+                "provider-facing response must stay paired with the bridge function name");
+        assertEquals("ok:web_search", result.responses().get(0).responseData());
+        var contextCaptor = org.mockito.ArgumentCaptor.forClass(ToolContext.class);
+        verify(target).call(eq("{\"query\":\"MateClaw\"}"), contextCaptor.capture());
+        Object scoped = contextCaptor.getValue().getContext()
+                .get(ProgressiveToolBridgeTool.SCOPED_TOOL_CALLBACKS_CONTEXT_KEY);
+        assertInstanceOf(java.util.Map.class, scoped);
+        assertSame(target, ((java.util.Map<?, ?>) scoped).get("web_search"));
+    }
+
+    @Test
+    @DisplayName("tool_call cannot invoke a target outside the agent-scoped callback map")
+    void progressiveBridge_rejectsOutOfScopeTarget() {
+        ToolExecutionExecutor executor = newExecutor(callbackNamed("web_search"));
+
+        var result = executor.execute(List.of(new AssistantMessage.ToolCall(
+                        "bridge_2", "function", "tool_call",
+                        "{\"toolName\":\"admin_delete_all\",\"arguments\":{}}")),
+                "conv", "agent", false, "user", null);
+
+        assertTrue(result.responses().get(0).responseData().contains("not available to this agent"));
+    }
+
+    @Test
+    @DisplayName("tool_call probes required arguments and returns the schema without execution")
+    void progressiveBridge_probesRequiredArguments() {
+        ToolCallback target = callbackNamed("web_search");
+        when(target.getToolDefinition().inputSchema()).thenReturn(
+                "{\"type\":\"object\",\"required\":[\"query\"],\"properties\":{\"query\":{\"type\":\"string\"}}}");
+        ToolExecutionExecutor executor = newExecutor(target);
+
+        var result = executor.execute(List.of(new AssistantMessage.ToolCall(
+                        "bridge_3", "function", "tool_call",
+                        "{\"toolName\":\"web_search\",\"arguments\":{}}")),
+                "conv", "agent", false, "user", null);
+
+        assertTrue(result.responses().get(0).responseData().contains("Missing required arguments"));
+        assertTrue(result.responses().get(0).responseData().contains("query"));
+        var ledger = ActionExecutionLedger.fromEvents(result.events());
+        assertEquals(ActionExecutionLedger.Status.FAILED, ledger.receipts().get("bridge_3").status());
+        assertTrue(ledger.renderAnswerFacts().contains("Missing required arguments"));
+        verify(target, never()).call(anyString(), any());
     }
 }

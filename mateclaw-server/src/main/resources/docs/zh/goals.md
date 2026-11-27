@@ -9,6 +9,92 @@ head:
 
 # 持久化目标
 
+## 2.3.0：托管 JSON 验收
+
+在聊天目标面板展开 JSON 验收，由有权限的用户填写要求键、产物槽位和必需字段（每行一个）。活跃或暂停的目标可以配置；终态目标只读。配置入口属于用户，模型工具不能替用户修改验收标准。
+
+1. 为要求指定一个产物槽位，例如 `report`，填写 `summary`、`items` 等顶层字段。要求键和槽位须以小写字母开头，只含小写字母、数字、下划线或连字符，最长 64 字符。
+2. 员工先调用 `getManagedGoalJsonSlots`，再用 `publishManagedGoalJson` 向已选择的槽位发布严格 JSON 对象。内容保存在托管版本中，工作空间文件路径不能代替发布内容。
+3. 调用 `checkManagedGoalJson`，提供当前要求修订、产物 ID 和槽位代次。服务端从存储字节计算结果，不接受模型自行声明的 PASS。
+4. 所有当前要求均有匹配的有效绑定，且目标原有完成条件也满足后，才可完成目标。修改要求或发布新代次后需要重新检查；发生版本冲突时先刷新。
+
+**检查范围与限制：**当前 recipe 只检查 1–16 个不同的顶层字段是否存在且非 null；每个字段名 1–128 字符。这不是完整 JSON Schema、字段类型或业务内容正确性校验。每个版本最多 1 MiB UTF-8，每个目标最多 32 个版本，版本有效期 24 小时；过期版本不能用于有效完成绑定。达到版本上限时应先查看并复用仍有效的当前版本，不要盲目反复发布。
+
+### 观察证据与验收绑定的区别
+
+执行证据默认使用 `mateclaw.execution-evidence.mode=observe`，记录执行尝试及产物信息；`off` 可关闭记录，当前 `enforce` 配置会被拒绝。普通产物的版本检查及 JSON 必需字段诊断是按需检查，结果 `acceptanceEligible=false`，不能代替上述托管 JSON 绑定。普通清单仍要求全部通过并提供非空证据。
+
+审批或忙碌期间接收的输入会保留所选目标与请求者身份；恢复时重新检查目标状态、账户和运行所有权。终态目标不能靠排队输入自动复活。
+
+
+## 持续执行模式（第一版）
+
+新建目标默认 `persistentExecution=true`，省略预算时 `turnBudget=0`、`llmCallBudget=0` 表示不设累计上限。显式正预算仍生效；已有目标保留旧模式，不会在升级后自动启动。
+
+持续目标由数据库队列和后台 supervisor 跨图片段调度；单次图执行的次数上限只结束当前片段，不结束目标。队列、冷却、重试和过期租约可在服务重启后恢复。仅当清单全部通过且有非空证据时才能完成，Stop、缺少必要输入、审批拒绝和预算耗尽会暂停，需明确 resume。
+
+`GET /api/v1/goals/{id}/execution` 返回独立的调度状态、原因和到期时间；它是最近的调度记录，目标当前状态以 goal API 为准。流中通过 `goal_continuation` 广播调度变化。第一版支持单后端实例的原生 runtime，不保证外部工具副作用恰好一次；恢复先检查已有产物与异步句柄。预算在片段边界检查，不是逐请求的硬费用限制。
+
+## 持久执行契约
+
+持续执行把长目标和任何一次 HTTP 请求或图执行解耦。数据库保存进程退出后仍必须存在的工作状态：
+
+| 持久状态 | 重启后的作用 |
+|---|---|
+| 目标与验收清单 | 完成标准不会改变 |
+| Continuation 记录 | Supervisor 知道任务正在排队、冷却、重试、暂停还是阻塞 |
+| Attempt 与 lease | 新片段认领前可以先判断上一次中断的位置与安全性 |
+| 已接收输入队列 | 员工忙碌期间收到的消息稍后消费，不会被丢弃 |
+| 进度账本与工作区产物 | 下一片段可以根据证据继续，而不是靠模型猜测 |
+
+每个片段会认领目标，最多消费一条排队输入，执行一次有界图运行，保存结果，然后进入终态或排队下一片段。后端重启后，会先释放孤立的输入认领并核对过期 attempt，再恢复普通调度。
+
+恢复策略偏保守：安全调用可以重试；已经保存的 assistant 消息会进入核对；工具完成证据会被重新读取；可能产生了不确定外部副作用的工具则会阻塞并等待复核。这样不会把“进程重启”悄悄变成“再付一次款、再发布一次或再删除一次”。
+
+### 执行期间接收的新输入
+
+持续目标正在运行时，新用户输入会先写入 `mate_conversation_input_queue`，再交给后续 attempt。输入项依次处于 queued、claimed、consumed 状态。如果进程在认领后、消费前退出，启动恢复会释放孤立认领，使同一条输入仍可继续处理。
+
+队列保证已经接收的输入不会丢失，但不会自动消除相互冲突的指令。用户仍可暂停或放弃目标；如果新输入改变验收标准，应明确更新目标，而不是依赖一句含义不清的跟进消息。
+
+## 让任务稳定运行数小时
+
+运行时可以保存调度状态，但任务本身仍需设计成可恢复的检查点。对于长篇写作、代码生成、研究资料汇总或数据导出：
+
+1. 批量执行前先建立具体标准。字数、文件路径、必备章节、测试和最终校验，比“产出高质量结果”更可验证。
+2. 在工作区保存简短计划与进度账本，记录最后完成单元、累计数量、未解决事项以及下一步动作。
+3. 使用有界写入。写作任务每次追加一章或 2,000–4,000 个汉字，比一次工具调用塞入整卷更易重试和检查。
+4. 恢复后先重读检查点与目标文件尾部，根据已有证据续写，不依赖被中断回合里的模型记忆。
+5. 优先使用可安全重试的变更。`append_file` 发现文件尾部已经存在完全相同的内容时，会返回 `alreadyApplied=true` 而不重复写入；`expectedTail` 可在文件已被其他写入改变时拒绝追加。
+6. 控制模型请求节奏。根据模型配额设置最小 continuation 间隔和 provider 全局退避；重试风暴不等于任务进度。
+7. 完成前重新验收：重算内容数量、枚举完成单元、读取结尾、重跑测试；所有标准都有非空证据后才能调用 `completeGoal`。
+
+### 示例：50 万字小说稳定性测试
+
+一个有代表性的稳定性用例，是让通用助手为十卷、约 180 章的玄幻小说创建持续目标，保存设定圣经、全书大纲和进度账本，然后逐章追加，直至正文不少于 500,000 个中文汉字。每次恢复都必须先检查已有章节标题和文件尾部，再写下一章。
+
+在 2026-08-30 的单实例验证中，后端在生成章节时被停止。恢复检查点已有 12 章、15,342 个中文汉字。重启后，supervisor 恢复原始目标和会话上下文，读取大纲、进度账本和卷尾，从第 13 章继续；观察窗口内写到第 17 章、24,628 个中文汉字，重复章节标题为 0。期间发生的 provider 限流和一次短暂连接错误进入退避后继续运行。这些数字只记录该次测试，不代表吞吐量承诺。
+
+复测时可在重启前后记录以下值：
+
+```bash
+FILE=data/workspace/novel-ash-sea/volumes/volume-01.md
+rg -c '^## 第.*章' "$FILE"
+python3 - <<'PY'
+import re
+from pathlib import Path
+text = Path("data/workspace/novel-ash-sea/volumes/volume-01.md").read_text(encoding="utf-8")
+print(len(re.findall(r"[\u4e00-\u9fff]", text)))
+PY
+rg '^## 第.*章' "$FILE" | sort | uniq -d
+```
+
+最后一条命令应无输出。同时检查 `GET /actuator/health`、`GET /api/v1/goals/{id}/execution`、continuation 日志、进度账本和最新产物时间。只有重启后能写入新的工作单元，并且没有丢失排队输入或重复上一个单元，才算恢复验证通过。
+
+::: warning 当前边界
+Persistent Goal 第一版面向单后端实例和 Native Runtime 设计与验证。数据库状态可以跨该实例重启恢复，但任意外部副作用并非严格一次。付款、发送、发布和破坏性操作应使用服务商幂等键、执行前后核对或人工复核。
+:::
+
 > **以前你每轮都要把上下文重复一遍。现在你定一个目标，员工自己跟。**
 
 一次对话里你说"帮我把这个博客部署到 fly.io"，员工答完一轮就停了。下一轮你要再问"DNS 配好没？证书呢？测试跑了吗？"——你在替它记目标。
@@ -109,7 +195,7 @@ POST /api/v1/goals
 
 ### 自动延续是怎么发生的
 
-如果 `autoFollowupEnabled=true` 且这一轮 evaluator 判 "continue"，后台会：
+持续模式会持久化下一次执行时间，由 supervisor 发起新的图片段。下面的图内延续流程只适用于 `persistentExecution=false` 的旧模式：
 
 1. 写一条 `followup_injected` 事件到时间线
 2. 给对话末尾 APPEND 一条用户消息。**1.5.0 起，如果目标有清单，这条消息会明确列出还没通过的那几条准则**——"5/8 已完成，剩余：① …… ② ……，去做剩下的"；没有清单时回退到笼统的 "Continue working on the goal. Still missing: {gap}."
@@ -169,6 +255,10 @@ Plan-Execute 模式下，单个步骤可能**抛异常**，也可能陷入**停�
 
 **完成判定是确定性的。** 只有当**每一条准则都通过**，才判完成。20 条里过了 19 条（0.95 分）依然是"继续"——差一条就还差一条，没有模糊阈值。
 
+::: warning 长任务要验证交付证据
+异步子任务的 `status=succeeded`、`progress=100` 只是运行生命周期终态，不能直接作为准则通过的证据。对文件、长文、测试场景等交付，准则应写成可复核形式，例如“目标文件存在且回读成功”“正文字符数不少于 N”“至少有 N 条独立场景并可枚举”。若写文件或执行工具失败、只生成了提纲、仍有待办项，对应准则必须保持未通过。
+:::
+
 **怎么给目标加清单——三种途径：**
 
 - **创建时直接带**——`setGoal` 工具传 `criteria: ["DNS 解析正确", "SSL 有效", "测试全绿"]`，或 `POST /api/v1/goals` 传 `criteria`。省去 bootstrap 那一轮。
@@ -198,9 +288,9 @@ Plan-Execute 模式下，单个步骤可能**抛异常**，也可能陷入**停�
 
 ---
 
-## 4 个内置工具（员工可用）
+## 内置目标工具（员工可用）
 
-员工的工具集里默认包含这 4 个（无需手动绑定，是 agent-wide 系统级工具）：
+员工的工具集里默认包含以下工具（无需手动绑定，是 agent-wide 系统级工具）：
 
 | 工具 | 用途 | 触发提示词示例 |
 |---|---|---|
@@ -208,6 +298,7 @@ Plan-Execute 模式下，单个步骤可能**抛异常**，也可能陷入**停�
 | **addGoalCriterion** | 追加子准则到已有目标 | "再加一条准则：必须支持 IPv6" |
 | **completeGoal** | 显式标记完成 | "所有事项已做完，请 completeGoal" |
 | **getGoalStatus** | 查询当前 goal 状态 | "我们现在进展到哪了？" |
+| **waitForGoalInput** | 持续目标缺少必要输入时暂停并记录原因 | "缺少部署域名，请等待用户补充" |
 
 完成时（`completeGoal`，或 evaluator 判定**每一条准则都通过**），员工会把这个目标的总结同步到[长期记忆](./memory)，后续对话能查得回来。
 
@@ -215,7 +306,7 @@ Plan-Execute 模式下，单个步骤可能**抛异常**，也可能陷入**停�
 
 ## 子员工不能改父员工的目标
 
-[多员工协作](./agents)里 parent 员工可以委派 child 员工干活。Child **看不到**这 4 个 goal 工具 — 目标是 parent 会话的状态，child 是无状态的执行体。
+[多员工协作](./agents)里 parent 员工可以委派 child 员工干活。Child **看不到**这些 goal 工具 — 目标是 parent 会话的状态，child 是无状态的执行体。
 
 > 这一条是设计意图，不是 bug。child 帮 parent 做事，但目标的"所有权"留在 parent 那。
 
@@ -227,7 +318,7 @@ Plan-Execute 模式下，单个步骤可能**抛异常**，也可能陷入**停�
 turnsUsed >= turnBudget  或  (agentLlmCallsUsed + evalLlmCallsUsed) >= llmCallBudget
 ```
 
-任一条命中 → 目标状态翻为 **exhausted**，不再触发评估、不再注入 follow-up，光环变橙红色。员工的最后一轮回答会正常发送给你。
+持续模式仅检查正预算；`0` 表示不限。达到预算后目标进入 **paused**，调度状态为 **budget_limited**，增加预算后可 resume。旧模式仍进入终态 **exhausted**，需要新建目标才能继续。当前片段的回答仍会保存。
 
 你的选择：
 
@@ -247,7 +338,8 @@ turnsUsed >= turnBudget  或  (agentLlmCallsUsed + evalLlmCallsUsed) >= llmCallB
    
  active ──evaluator 全部准则通过 / completeGoal──→ completed (终态)
    ↓
- active ──turns_used/llm_calls 用完 ─────────→ exhausted (终态)
+ active ──正预算用完（持续模式）───────────→ paused
+ active ──预算用完（旧模式）───────────────→ exhausted (终态)
    ↓
  active ──user abandon ─────────────────────→ abandoned (终态)
 ```
@@ -300,9 +392,18 @@ mateclaw:
     default-auto-followup: true
     # 运行期总开关；关掉则无论 per-goal 标志如何，都不注入自动延续
     allow-auto-followup: true
-    # 默认 turn 预算
+    # 单后端实例同时运行的持久化目标 Segment 上限
+    max-concurrent-segments: 4
+    # 普通 Segment 结算后再次续跑的全局最小间隔（秒）
+    minimum-continuation-interval-seconds: 1
+    # provider 或评估器发生可重试故障后，暂停认领其他目标的时间（秒；0 = 关闭）
+    provider-failure-global-backoff-seconds: 30
+    # 新目标默认持续模式；省略预算表示不限（0）
+    default-persistent-execution: true
+    supervisor-poll-ms: 5000
+    # 旧模式的默认 turn 预算
     default-turn-budget: 20
-    # 默认 LLM 调用预算（agent + evaluator 之和）
+    # 旧模式的默认 LLM 调用预算（agent + evaluator 之和）
     default-llm-call-budget: 200
     # 自动延续之间至少隔多久（秒）
     auto-followup-cooldown-seconds: 0
@@ -318,18 +419,23 @@ mateclaw:
     evaluator-context-messages: 8
 ```
 
+`minimum-continuation-interval-seconds` 与目标自身的 `followupCooldownSeconds` 取较大值。
+provider 全局退避只保存在当前后端实例内；重启恢复仍以数据库中的 continuation
+`next_run_at` 和每目标失败次数为准。耐久或低配模型测试建议使用并发 `1`、最小间隔
+`300` 秒、provider 全局退避 `300` 秒，再根据日志逐步放量。
+
 ---
 
 ## 数据库
 
-两张表，都用 `mate_` 前缀：
+相关表使用 `mate_` 前缀：
 
 | 表 | 用途 |
 |---|---|
 | `mate_agent_goal` | 目标本体；含 status / budget / 双 LLM 计数器 / 自动延续配置 |
 | `mate_agent_goal_event` | 目标的事件追加日志，drawer 时间线读它 |
 
-迁移由 Flyway 跑 `V120__agent_goal.sql`（H2 / MySQL / KingbaseES 三方言）。
+持续调度表 `mate_goal_continuation` 记录队列、到期时间和租约。迁移由 Flyway 跑 `V120__agent_goal.sql` 和 `V188__goal_continuation.sql`（H2 / MySQL / KingbaseES 三方言）。
 
 ---
 
@@ -338,3 +444,7 @@ mateclaw:
 **Goal 不是给员工加一个功能。是改它的状态。**
 
 以前的员工"答完就忘"。Goal 让员工跨多轮记住一件事 — 它在干什么、还差什么、什么时候算完。你只用说一次。剩下的，让头像旁边那圈光替你跟。
+
+## 3.0.0：续跑决策与副作用恢复
+
+续跑建议经有界结构化决策与业务约束检查，默认 SHADOW。工具执行前保存带 fence 的检查点；副作用后结果不确定时要求干预而不是盲目重放。详情见[决策层](./decision-layer)和[更新日志](./changelog)。

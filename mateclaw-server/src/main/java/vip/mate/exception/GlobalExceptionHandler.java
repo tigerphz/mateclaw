@@ -142,9 +142,22 @@ public class GlobalExceptionHandler {
                                                    HttpServletRequest request,
                                                    HttpServletResponse response) {
         if (response.isCommitted() || isSseRequest(request)) {
-            log.warn("Exception after response committed or during SSE (suppressed): {} {} - {}",
-                    request.getMethod(), request.getRequestURI(), e.getMessage());
+            if (isExpectedClientDisconnect(e)) {
+                // Browser reloads and tab closes routinely tear down the SSE
+                // socket. This is transport lifecycle noise, not an
+                // application warning, and should not page operators.
+                log.debug("SSE client disconnected: {} {} - {}",
+                        request.getMethod(), request.getRequestURI(), e.getMessage());
+            } else {
+                log.warn("Exception after response committed or during SSE (suppressed): {} {} - {}",
+                        request.getMethod(), request.getRequestURI(), e.getMessage());
+            }
             return null;
+        }
+        if (e instanceof org.springframework.dao.DataAccessResourceFailureException) {
+            log.error("Database unavailable: {} {}", request.getMethod(), request.getRequestURI(), e);
+            return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE)
+                    .body(R.fail(503, "Database temporarily unavailable. Please try again later."));
         }
         log.error("Unexpected error: {} {}", request.getMethod(), request.getRequestURI(), e);
         return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(R.fail("Internal server error"));
@@ -165,6 +178,21 @@ public class GlobalExceptionHandler {
         // Fallback path match for stream endpoints that omit explicit headers.
         String uri = request.getRequestURI();
         return uri != null && uri.contains("/chat/stream");
+    }
+
+    static boolean isExpectedClientDisconnect(Throwable error) {
+        for (Throwable current = error; current != null; current = current.getCause()) {
+            String type = current.getClass().getName();
+            String message = current.getMessage() == null ? "" : current.getMessage().toLowerCase();
+            if (type.endsWith("ClientAbortException")
+                    || message.contains("broken pipe")
+                    || message.contains("connection reset")
+                    || message.contains("disconnected client")
+                    || message.contains("connection aborted")) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private HttpStatus httpStatusForCode(int code) {

@@ -1,5 +1,9 @@
 package vip.mate.agent.graph;
 
+import vip.mate.llm.chatmodel.ChatModelDefaults;
+import vip.mate.llm.chatmodel.AssistantMessageParts;
+import org.springframework.ai.chat.messages.part.ReasoningPart;
+import org.springframework.ai.chat.metadata.FinishReasonCategory;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.chat.messages.AssistantMessage;
@@ -8,27 +12,33 @@ import org.springframework.ai.chat.messages.UserMessage;
 import org.springframework.ai.chat.model.ChatModel;
 import org.springframework.ai.chat.model.ChatResponse;
 import org.springframework.ai.chat.prompt.Prompt;
+import org.springframework.ai.openai.OpenAiChatOptions;
 import org.springframework.http.HttpHeaders;
-import org.springframework.web.client.RestClientResponseException;
 import org.springframework.web.reactive.function.client.WebClientResponseException;
 import vip.mate.channel.web.ChatStreamTracker;
+import vip.mate.llm.ProviderHttpError;
 import vip.mate.llm.chatmodel.AssistantThinkingRelay;
 import vip.mate.llm.chatmodel.ReasoningContentCache;
 import vip.mate.llm.chatmodel.ThinkingLevelHolder;
 
 import reactor.core.Disposable;
+import reactor.core.publisher.Flux;
 
+import java.time.Duration;
 import java.time.Instant;
 import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.LinkedHashMap;
+import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
@@ -91,6 +101,26 @@ public class NodeStreamingChatHelper {
      * tests) — every provider then counts as in-pool (fail-open).
      */
     private final vip.mate.llm.failover.AvailableProviderPool providerPool;
+
+    /**
+     * Inter-frame idle timeout (seconds) applied to every streaming LLM call.
+     * The JDK HttpClient request timeout (which {@code setReadTimeout} maps to)
+     * only protects up to the response headers; once they arrive the clock
+     * stops, so a provider that returns 200 + a first SSE frame then goes
+     * silent hangs the body Flux forever — no exception, so health tracking /
+     * failover never engage (issue #585). A reactor {@code .timeout()} on the
+     * delta Flux fills that gap: total silence for this long propagates a
+     * {@code TimeoutException} down the existing error path (classifyError
+     * buckets it as a retryable SERVER_ERROR).
+     * <p>
+     * Defaults to {@link vip.mate.llm.chatmodel.HttpTimeouts#DEFAULT_STREAM_IDLE_TIMEOUT}
+     * (180s). {@code 0} or negative disables it (for tests / opt-out).
+     * Production wiring sets it from {@code ModelConfigEntity.requestTimeoutSeconds}
+     * so a single per-model knob governs both the connect-level read timeout
+     * and the body-level idle timeout.
+     */
+    private long streamIdleTimeoutSec =
+            vip.mate.llm.chatmodel.HttpTimeouts.DEFAULT_STREAM_IDLE_TIMEOUT.toSeconds();
 
     public NodeStreamingChatHelper(ChatStreamTracker streamTracker) {
         this(streamTracker, List.of(), null, null, null, null);
@@ -190,27 +220,6 @@ public class NodeStreamingChatHelper {
     }
 
     /**
-     * Record a single primary-model outcome to the health tracker. No-op when
-     * either the tracker bean isn't wired or the primary's providerId is
-     * unknown (e.g., tests, legacy callers built without the full constructor).
-     */
-    private void recordPrimary(boolean success) {
-        if (healthTracker == null || primaryProviderId == null) return;
-        if (success) healthTracker.recordSuccess(primaryProviderId);
-        else healthTracker.recordFailure(primaryProviderId);
-    }
-
-    /**
-     * Record a primary failure carrying a provider-stated retry window so the
-     * health tracker can start a cooldown of exactly that length. No-op under
-     * the same conditions as {@link #recordPrimary}.
-     */
-    private void recordPrimaryFailure(long cooldownOverrideMs) {
-        if (healthTracker == null || primaryProviderId == null) return;
-        healthTracker.recordFailure(primaryProviderId, cooldownOverrideMs);
-    }
-
-    /**
      * Map an {@link ErrorType} to the matching pool
      * {@link vip.mate.llm.failover.AvailableProviderPool.RemovalSource} for
      * provider-wide HARD failures (AUTH / BILLING). Returns {@code null} for
@@ -282,7 +291,7 @@ public class NodeStreamingChatHelper {
      */
     public StreamResult streamCall(ChatModel chatModel, Prompt prompt,
                                    String conversationId, String phase) {
-        return streamCallInternal(chatModel, prompt, conversationId, phase, true);
+        return streamCallInternal(chatModel, prompt, conversationId, phase, PublicationMode.LIVE);
     }
 
     /**
@@ -299,7 +308,20 @@ public class NodeStreamingChatHelper {
      */
     public StreamResult streamCallSilent(ChatModel chatModel, Prompt prompt,
                                           String conversationId, String phase) {
-        return streamCallInternal(chatModel, prompt, conversationId, phase, false);
+        return streamCallInternal(chatModel, prompt, conversationId, phase, PublicationMode.SILENT);
+    }
+
+    /**
+     * Accumulate a candidate answer without publishing content deltas. Thinking
+     * and lifecycle/error events remain live while the caller validates it.
+     */
+    public StreamResult streamCallBufferedContent(ChatModel chatModel, Prompt prompt,
+                                                  String conversationId, String phase) {
+        return streamCallInternal(chatModel, prompt, conversationId, phase, PublicationMode.BUFFER_CONTENT);
+    }
+
+    private enum PublicationMode {
+        LIVE, BUFFER_CONTENT, SILENT
     }
 
     /**
@@ -325,16 +347,14 @@ public class NodeStreamingChatHelper {
 
     // ==================== 重试配置 ====================
 
+    /** Start checking for repeated reasoning only after a substantial transcript. */
+    private static final int THINKING_REPEAT_MIN_CHARS = 32768;
     /**
-     * Soft upper bound on per-call thinking ({@code reasoning_content}) chars
-     * with zero visible content and zero tool calls. Beyond this the helper
-     * disposes the upstream subscription and returns a partial result so the
-     * graph can advance instead of streaming thinking forever. Calibrated
-     * against typical Claude/DeepSeek extended-thinking budgets — well above
-     * normal long-form reasoning, low enough to bound a runaway loop in under
-     * ~30 seconds of wall clock.
+     * Memory safety fallback, distinct from repetition. The local highest
+     * Anthropic thinking tier allows 32768 tokens, not characters; reserve
+     * conservative character headroom and honor larger configured output budgets.
      */
-    private static final int THINKING_ONLY_HARD_CAP_CHARS = 32768;
+    private static final long THINKING_ONLY_MIN_SAFETY_CAP_CHARS = 32768L * 16;
 
     /**
      * Narrow content-repetition guard — fires when the buffer ends with
@@ -385,6 +405,7 @@ public class NodeStreamingChatHelper {
     // retry (e.g., proxy timeout returns HTTP 200 with empty body). Keep
     // the cap low — if it truly takes 4+ attempts, the provider is sick.
     static final int MAX_RETRIES_EMPTY_RESPONSE = 3;
+    static final long EMPTY_RESPONSE_BACKOFF_MS = 250;
     // UNKNOWN: conservative retry cap. Defensive: retry what we can't
     // classify, but with a smaller budget than SERVER_ERROR (5 vs 10) to
     // avoid masking truly fatal errors. MAX_TOTAL_DURATION_MS is the
@@ -445,6 +466,17 @@ public class NodeStreamingChatHelper {
         this.maxTotalDurationMs = maxTotalDurationMs;
     }
 
+    /**
+     * Override the streaming inter-frame idle timeout (seconds). Wired from
+     * {@code ModelConfigEntity.requestTimeoutSeconds} by AgentGraphBuilder so a
+     * single per-model knob governs both the connect-level read timeout and
+     * the body-level idle timeout. {@code 0} or negative disables the idle
+     * timeout (used by tests / opt-out). See {@link #streamIdleTimeoutSec}.
+     */
+    public void setStreamIdleTimeoutSec(long seconds) {
+        this.streamIdleTimeoutSec = seconds;
+    }
+
     private static final ObjectMapper TOOL_ARG_JSON_MAPPER = new ObjectMapper();
 
     /**
@@ -452,6 +484,23 @@ public class NodeStreamingChatHelper {
      */
     private static ErrorType classifyError(Throwable error) {
         String msg = extractFullErrorChain(error);
+        // Trust structured transport status before body text (which can mention
+        // unrelated context/token errors). Bound malformed cyclic cause chains.
+        Throwable current = error;
+        int transportStatus = 0;
+        for (int depth = 0; current != null && depth < 32; depth++, current = current.getCause()) {
+            int status = current instanceof WebClientResponseException response
+                    ? response.getStatusCode().value() : ProviderHttpError.status(current);
+            if (status == 413) return ErrorType.PAYLOAD_TOO_LARGE;
+            if (transportStatus == 0 && status != 0) transportStatus = status;
+        }
+        String payloadText = msg.toLowerCase(Locale.ROOT);
+        if (transportStatus == 0 && (hasHttpStatus(0, msg, 413)
+                || payloadText.contains("payload too large")
+                || payloadText.contains("request entity too large")
+                || payloadText.contains("请求体过大"))) {
+            return ErrorType.PAYLOAD_TOO_LARGE;
+        }
         // PTL: prompt too long / context length exceeded
         if (msg.contains("prompt is too long")
                 || msg.contains("context_length_exceeded")
@@ -483,7 +532,7 @@ public class NodeStreamingChatHelper {
                 || msg.contains("certificate_unknown")) {
             return ErrorType.AUTH_ERROR;
         }
-        if (msg.contains("401") || msg.contains("Unauthorized") || msg.contains("Invalid API Key")
+        if (hasHttpStatus(transportStatus, msg, 401) || msg.contains("Unauthorized") || msg.contains("Invalid API Key")
                 || msg.contains("authentication") || msg.contains("AuthenticationError")) {
             return ErrorType.AUTH_ERROR;
         }
@@ -497,13 +546,13 @@ public class NodeStreamingChatHelper {
                 || msg.contains("overloaded_error")     // Anthropic 529 body type
                 || msg.contains("Overloaded")           // Anthropic 529 message
                 || msg.contains("model is overloaded")  // Gemini / OpenAI-compatible
-                || msg.contains("529")
+                || hasHttpStatus(transportStatus, msg, 529)
                 || msg.contains("server is busy")
                 || msg.contains("当前分组上游负载已饱和")) { // SiliconFlow group saturation
             return ErrorType.OVERLOADED;
         }
         // Rate limit
-        if (msg.contains("429") || msg.contains("rate_limit") || msg.contains("RateLimitError")
+        if (hasHttpStatus(transportStatus, msg, 429) || msg.contains("rate_limit") || msg.contains("RateLimitError")
                 || msg.contains("Too Many Requests")) {
             return ErrorType.RATE_LIMIT;
         }
@@ -519,7 +568,8 @@ public class NodeStreamingChatHelper {
         // ("credit balance is too low") use these phrases in 402-class responses.
         // Chinese provider patterns (Zhipu 1113, DashScope, general) — same hard
         // failure semantics: retrying the same provider won't refill the balance.
-        if (msg.contains("402") || msg.contains("insufficient_quota")
+        String lowerMsg = msg.toLowerCase(Locale.ROOT);
+        if (hasHttpStatus(transportStatus, msg, 402) || msg.contains("insufficient_quota")
                 || msg.contains("credit balance is too low")
                 || msg.contains("billing_error") || msg.contains("billing_hard_limit_reached")
                 || msg.contains("You exceeded your current quota")
@@ -527,7 +577,13 @@ public class NodeStreamingChatHelper {
                 || msg.contains("余额不足") || msg.contains("请充值")
                 || msg.contains("\"code\":\"1113\"") || msg.contains("\"code\":1113")
                 || msg.contains("AccountBalanceNotEnough")
-                || msg.contains("balance not enough")) {
+                || msg.contains("balance not enough")
+                || lowerMsg.contains("invalidsubscription")
+                || lowerMsg.contains("subscription has expired")
+                || lowerMsg.contains("arrearage")
+                || lowerMsg.contains("account is in good standing")
+                || lowerMsg.contains("insufficient_balance")
+                || lowerMsg.contains("insufficient balance")) {
             return ErrorType.BILLING;
         }
         // RFC-009 P3.2: MODEL_NOT_FOUND — provider rejects the requested model id.
@@ -569,7 +625,7 @@ public class NodeStreamingChatHelper {
         // to the user as "LLM 调用失败" with no recovery attempt. These are
         // network-layer transients that almost always succeed on retry, so
         // they belong in the same retryable bucket as 5xx/timeouts.
-        if (msg.contains("500") || msg.contains("502") || msg.contains("503") || msg.contains("504")
+        if (hasHttpStatus(transportStatus, msg, 500) || hasHttpStatus(transportStatus, msg, 502) || hasHttpStatus(transportStatus, msg, 503) || hasHttpStatus(transportStatus, msg, 504)
                 || msg.contains("APITimeoutError") || msg.contains("APIConnectionError")
                 || msg.contains("Connection reset") || msg.contains("Connection refused")
                 || msg.contains("timeout") || msg.contains("Timeout")
@@ -605,13 +661,26 @@ public class NodeStreamingChatHelper {
         // parameter. These fail identically on every provider, so classifying them as CLIENT_ERROR
         // (rather than MODEL_NOT_FOUND) keeps the model in the failover pool and surfaces the real
         // cause instead of a misleading "model not available" message.
-        if (msg.contains("400") || msg.contains("Bad Request")
+        if (hasHttpStatus(transportStatus, msg, 400) || msg.contains("Bad Request")
                 || msg.contains("invalid_request_error") || msg.contains("unsupported")
                 || msg.contains("Tool names are not allowed")
                 || msg.contains("InvalidParameter")) {
             return ErrorType.CLIENT_ERROR;
         }
         return ErrorType.UNKNOWN;
+    }
+
+    /** Numeric status evidence must come from transport or explicit HTTP/status syntax. */
+    private static boolean hasHttpStatus(int transportStatus, String message, int expected) {
+        if (transportStatus != 0) return transportStatus == expected;
+        // Leading codes cover old adapters ("503 Service Unavailable"). The
+        // chain delimiter also permits a nested exception's leading status.
+        // Never interpret digits embedded in request IDs, counters or payloads.
+        String code = Integer.toString(expected);
+        return java.util.regex.Pattern.compile(
+                "(?im)(?:^|\\|)\\s*" + code + "(?![\\w-])"
+                + "|\\b(?:http(?:/\\d(?:\\.\\d)?)?|status(?:\\s+code)?)\\s*[:=]?\\s*" + code + "(?![\\w-])")
+                .matcher(message).find();
     }
 
     /**
@@ -659,8 +728,8 @@ public class NodeStreamingChatHelper {
             HttpHeaders headers = null;
             if (cur instanceof WebClientResponseException wre) {
                 headers = wre.getHeaders();
-            } else if (cur instanceof RestClientResponseException rre) {
-                headers = rre.getResponseHeaders();
+            } else {
+                headers = ProviderHttpError.headers(cur);
             }
             if (headers == null) continue;
             long ms = parseRetryWindowMs(headers);
@@ -742,14 +811,33 @@ public class NodeStreamingChatHelper {
                 } catch (Exception ignored) {
                 }
             }
+            int status = ProviderHttpError.status(cur);
+            if (status != 0) {
+                sb.append("HTTP ").append(status).append(" | ");
+                String body = ProviderHttpError.body(cur);
+                if (!body.isEmpty()) sb.append(body.length() > 1024 ? body.substring(0, 1024) : body).append(" | ");
+            }
             cur = cur.getCause();
         }
         return sb.toString();
     }
 
+    private void throwIfCancelled(String conversationId) {
+        if (streamTracker.isStopRequested(conversationId) || Thread.currentThread().isInterrupted()) {
+            throw new CancellationException("LLM call cancelled");
+        }
+    }
+
+    private static CancellationException cancellation(InterruptedException interrupted) {
+        CancellationException cancelled = new CancellationException("LLM call interrupted");
+        cancelled.initCause(interrupted);
+        return cancelled;
+    }
+
     private StreamResult streamCallInternal(ChatModel chatModel, Prompt prompt,
                                              String conversationId, String phase,
-                                             boolean broadcast) {
+                                             PublicationMode publicationMode) {
+        boolean broadcast = publicationMode != PublicationMode.SILENT;
         // Normalize every assistant tool call in the outgoing history to valid
         // JSON arguments. The streaming aggregator already does this for the
         // current turn's calls, but tool calls replayed from persisted history
@@ -780,8 +868,8 @@ public class NodeStreamingChatHelper {
                     phase, primaryProviderId, reason);
             if (broadcast) {
                 broadcastDelta(conversationId, "warning",
-                        buildDeltaJson("主模型暂时不可用（" + (primaryOutOfPool ? "已下线" : "冷却中")
-                                + "），直接尝试备选模型..."));
+                        "主模型暂时不可用（" + (primaryOutOfPool ? "已下线" : "冷却中")
+                                + "），将尝试可用备选模型；如无可用模型请稍后重试。");
             }
         }
 
@@ -817,13 +905,12 @@ public class NodeStreamingChatHelper {
             }
             llmCallCount++;
             if (attempt > 0) retryCount++;
-            lastResult = doStreamCall(chatModel, prompt, conversationId, phase, broadcast, attempt, true, retryType, retryHint);
+            lastResult = doStreamCall(chatModel, prompt, conversationId, phase, publicationMode, attempt, true, retryType, retryHint, primaryProviderId);
+            if (lastResult == null || !lastResult.stopped()) throwIfCancelled(conversationId);
             if (lastResult != null) {
                 ErrorType errType = lastResult.errorType();
                 // Success — reaffirm health / pool membership and return.
                 if (lastResult.errorMessage() == null || errType == ErrorType.NONE) {
-                    recordPrimary(true);
-                    addToPool(primaryProviderId);
                     logPerfSummary(phase, conversationId, callStartMs, llmCallCount, retryCount, failoverCount);
                     return lastResult;
                 }
@@ -832,7 +919,7 @@ public class NodeStreamingChatHelper {
                 // the error must surface unchanged (never routed to fallback —
                 // a different provider has a different window and the caller
                 // would lose the compaction signal).
-                if (errType == ErrorType.PROMPT_TOO_LONG) {
+                if (errType == ErrorType.PROMPT_TOO_LONG || errType == ErrorType.PAYLOAD_TOO_LARGE) {
                     return lastResult;
                 }
                 // THINKING_BLOCK_ERROR — side-effectful recovery: strip stale
@@ -854,6 +941,7 @@ public class NodeStreamingChatHelper {
                 if (errType == ErrorType.EMPTY_RESPONSE && attempt < errType.retryBudget()) {
                     log.warn("[{}] Primary returned empty response (attempt {}/{}), retrying same model...",
                             phase, attempt + 1, errType.retryBudget() + 1);
+                    retryType.set(ErrorType.EMPTY_RESPONSE);
                     continue;
                 }
                 // Generic routing — driven entirely by the ErrorType policy
@@ -865,22 +953,9 @@ public class NodeStreamingChatHelper {
                     // surface to the caller instead of burning the chain.
                     return lastResult;
                 }
-                if (errType.countsHealth()) {
-                    // A rate-limit response carrying an explicit retry window
-                    // becomes a health-cooldown override: later turns skip the
-                    // provider until the stated instant instead of re-probing
-                    // it every ~5 minutes and re-collecting the same 429.
-                    Long hintMs = retryHint.get();
-                    if (errType == ErrorType.RATE_LIMIT && hintMs != null && hintMs > 0) {
-                        recordPrimaryFailure(hintMs);
-                    } else {
-                        recordPrimary(false);
-                    }
-                    healthRecorded = true;
-                }
-                if (errType.evictsProvider()) {
-                    removeFromPool(primaryProviderId, errType, lastResult.errorMessage());
-                }
+                // Outcome / pool state is published under the admission permit,
+                // before queued requests can pass their cooldown check.
+                healthRecorded = errType.countsHealth();
                 log.warn("[{}] Primary failed (type={}) — handing off to fallback chain", phase, errType);
                 break;
             }
@@ -893,7 +968,7 @@ public class NodeStreamingChatHelper {
         // errors (MODEL_NOT_FOUND et al.) never dent provider health.
         if (!primarySkipped && !healthRecorded && lastResult != null
                 && isProviderLevelFailure(lastResult.errorType())) {
-            recordPrimary(false);
+            if (healthTracker != null) healthTracker.recordFailure(primaryProviderId);
         }
 
         // Primary exhausted retries — walk the fallback chain in priority order.
@@ -903,6 +978,7 @@ public class NodeStreamingChatHelper {
         // Providers in cooldown (RFC-009 P3.3) are also skipped so a known-bad
         // provider doesn't add latency to every conversation turn.
         for (int i = 0; i < fallbackChain.size(); i++) {
+            throwIfCancelled(conversationId);
             vip.mate.llm.failover.FallbackEntry entry = fallbackChain.get(i);
             ChatModel fallback = entry.chatModel();
             if (fallback == chatModel) continue;
@@ -925,43 +1001,43 @@ public class NodeStreamingChatHelper {
                     fallback.getClass().getSimpleName(), conversationId);
             if (broadcast) {
                 broadcastDelta(conversationId, "warning",
-                        buildDeltaJson("主模型不可用，正在切换到备选模型 (" + (i + 1) + "/" + fallbackChain.size() + ")..."));
+                        "主模型不可用，正在切换到备选模型 (" + (i + 1) + "/" + fallbackChain.size() + ")...");
             }
             failoverCount++;
             llmCallCount++;
-            StreamResult fallbackResult = doStreamCall(fallback, prompt, conversationId,
-                    phase + "_fallback_" + (i + 1), broadcast, 0, false,
-                    new AtomicReference<>(), new AtomicReference<>(0L));
+            StreamResult fallbackResult = doStreamCall(fallback, promptForFallback(prompt, fallback), conversationId,
+                    phase + "_fallback_" + (i + 1), publicationMode, 0, false,
+                    new AtomicReference<>(), new AtomicReference<>(0L), entry.providerId());
+            if (fallbackResult == null || !fallbackResult.stopped()) throwIfCancelled(conversationId);
+            if (fallbackResult != null && fallbackResult.isPayloadTooLarge()) return fallbackResult;
             // Accept only fully successful fallbacks. Non-successful results (auth
             // error, client error, still-rate-limited) propagate to the next
             // fallback instead of being surfaced as the final result.
             if (fallbackResult != null
                     && fallbackResult.errorType() == ErrorType.NONE
                     && fallbackResult.errorMessage() == null) {
-                if (healthTracker != null) healthTracker.recordSuccess(entry.providerId());
-                addToPool(entry.providerId());
                 logPerfSummary(phase, conversationId, callStartMs, llmCallCount, retryCount, failoverCount);
                 return fallbackResult;
             }
-            // Only provider-level failures count toward the cooldown tracker. A
-            // null result is a retryable soft failure; a MODEL_NOT_FOUND result is
-            // model-scoped and must not penalise an otherwise-healthy provider.
-            if (healthTracker != null
-                    && (fallbackResult == null || isProviderLevelFailure(fallbackResult.errorType()))) {
-                healthTracker.recordFailure(entry.providerId());
-            }
             if (fallbackResult != null) {
-                // HARD errors (auth / billing) evict the provider from the pool so
-                // later walks skip it outright. SOFT and model-scoped errors keep it
-                // in-pool — absorbed by the tracker's cooldown or simply retried.
-                removeFromPool(entry.providerId(), fallbackResult.errorType(), fallbackResult.errorMessage());
                 lastResult = fallbackResult; // remember most recent to report if the whole chain fails
             }
         }
 
         logPerfSummary(phase, conversationId, callStartMs, llmCallCount, retryCount, failoverCount);
+        if (lastResult == null && primaryInCooldown && !primaryOutOfPool)
+            return buildErrorResultWithType("供应商冷却中，且没有可用备选模型，请稍后重试", conversationId,
+                    phase, ErrorType.PROVIDER_BUSY, publicationMode);
         return lastResult != null ? lastResult
-                : buildErrorResult("LLM 调用失败，已达最大重试次数", conversationId, phase);
+                : buildErrorResult("当前没有可用模型，请检查供应商状态或稍后重试", conversationId, phase, publicationMode);
+    }
+
+    /** Rebase only model identity; preserve per-call budgets, tool restrictions and other controls. */
+    private static Prompt promptForFallback(Prompt prompt, ChatModel fallback) {
+        if (prompt.getOptions() == null) return prompt;
+        var defaults = ChatModelDefaults.optionsFor(fallback);
+        String model = defaults == null ? null : defaults.getModel();
+        return new Prompt(prompt.getInstructions(), prompt.getOptions().mutate().model(model).build());
     }
 
     /** D-6: log a structured performance summary for the LLM call phase. */
@@ -982,9 +1058,9 @@ public class NodeStreamingChatHelper {
      */
     private StreamResult doStreamCall(ChatModel chatModel, Prompt prompt,
                                        String conversationId, String phase,
-                                       boolean broadcast, int attempt, boolean primaryCall,
+                                       PublicationMode publicationMode, int attempt, boolean primaryCall,
                                        AtomicReference<ErrorType> retryTypeRef,
-                                       AtomicReference<Long> retryHintRef) {
+                                       AtomicReference<Long> retryHintRef, String providerId) {
         // Collapse every SystemMessage in the prompt into a single SystemMessage
         // at index 0. Some OpenAI-compatible providers (LM Studio's built-in
         // server, certain strict vLLM / SGLang deployments) reject 400
@@ -997,7 +1073,7 @@ public class NodeStreamingChatHelper {
         // system into their top-level system field exactly as before.
         // Preserves the input's options reference so downstream relay logic
         // (options.user = relay token) keeps working.
-        Prompt outbound = MessageNormalizer.normalize(prompt);
+        Prompt outbound = MediaRequestNormalizer.normalize(MessageNormalizer.normalize(prompt));
 
         // PR-2 L4 (RFC-049 §2.4.2): normalize as a pre-egress step (not only on retry).
         // Strip reasoning_content from prior-turn AssistantMessages (i <= lastUserIdx),
@@ -1024,27 +1100,55 @@ public class NodeStreamingChatHelper {
         // provider. We only activate relay on OpenAiChatOptions paths — Anthropic has
         // its own thinking mechanism (extended thinking via AnthropicChatOptions.thinking).
         String relayToken = null;
-        String originalUser = null;
-        org.springframework.ai.openai.OpenAiChatOptions oaiOptsForRelay = null;
         if (outbound.getOptions() instanceof org.springframework.ai.openai.OpenAiChatOptions oaiOpts) {
             List<String> thinkings = extractAssistantThinkings(outbound);
             if (thinkings.stream().anyMatch(s -> !s.isEmpty())) {
-                originalUser = oaiOpts.getUser();
-                relayToken = AssistantThinkingRelay.stash(thinkings, originalUser);
-                oaiOpts.setUser(relayToken);
-                oaiOptsForRelay = oaiOpts;
+                relayToken = AssistantThinkingRelay.stash(thinkings, oaiOpts.getUser());
+                outbound = new Prompt(outbound.getInstructions(), oaiOpts.mutate().user(relayToken).build());
             }
         }
 
-        try {
-            return doStreamCallInner(chatModel, outbound, conversationId, phase, broadcast, attempt, primaryCall, retryTypeRef, retryHintRef);
+        try (var permit = healthTracker == null ? null : healthTracker.acquireRequest(providerId,
+                () -> streamTracker.isStopRequested(conversationId) || Thread.currentThread().isInterrupted())) {
+            throwIfCancelled(conversationId);
+            if (healthTracker != null && permit == null)
+                return buildErrorResultWithType("供应商请求排队超时，请稍后重试或降低并发", conversationId,
+                        phase, ErrorType.PROVIDER_BUSY, publicationMode);
+            // Another request may have triggered cooldown while this one queued.
+            if (!inPool(providerId))
+                return buildErrorResultWithType("供应商已下线，请检查配置或切换模型", conversationId,
+                        phase, ErrorType.PROVIDER_BUSY, publicationMode);
+            if (healthTracker != null && healthTracker.isInCooldown(providerId))
+                return buildErrorResultWithType("供应商冷却中，请稍后重试", conversationId,
+                        phase, ErrorType.PROVIDER_BUSY, publicationMode);
+            StreamResult result = doStreamCallInner(chatModel, outbound, conversationId, phase,
+                    publicationMode, attempt, primaryCall, retryTypeRef, retryHintRef, providerId);
+            // Publish completion state BEFORE releasing capacity. Otherwise a queued
+            // request can slip between permit release and a newly established cooldown.
+            if (result != null) {
+                ErrorType type = result.errorType();
+                if (result.errorMessage() == null || type == ErrorType.NONE) {
+                    if (healthTracker != null) healthTracker.recordSuccess(providerId);
+                    addToPool(providerId);
+                } else {
+                    boolean emptyRetryPending = primaryCall && type == ErrorType.EMPTY_RESPONSE
+                            && attempt < type.retryBudget();
+                    if (healthTracker != null && type.countsHealth() && !emptyRetryPending) {
+                        Long hint = retryHintRef.get();
+                        healthTracker.recordFailure(providerId,
+                                type == ErrorType.RATE_LIMIT && hint != null ? hint : 0);
+                    }
+                    removeFromPool(providerId, type, result.errorMessage());
+                }
+            }
+            return result;
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            throw cancellation(interrupted);
         } finally {
             // Idempotent: if consumer already took the entry, discard is a no-op.
             if (relayToken != null) {
                 AssistantThinkingRelay.discard(relayToken);
-                if (oaiOptsForRelay != null) {
-                    oaiOptsForRelay.setUser(originalUser);
-                }
             }
         }
     }
@@ -1059,9 +1163,11 @@ public class NodeStreamingChatHelper {
         List<String> out = new ArrayList<>();
         for (Message m : prompt.getInstructions()) {
             if (m instanceof AssistantMessage am) {
-                Map<String, Object> meta = am.getMetadata();
-                Object rc = meta != null ? meta.get("reasoningContent") : null;
-                out.add(rc instanceof String s ? s : "");
+                // Let the native adapter replay signed blocks only to their own provider.
+                // The legacy wire relay must never turn them into unsigned OpenAI reasoning.
+                boolean signed = am.getReasoning().stream().anyMatch(part -> part.payload() != null);
+                String reasoning = signed ? null : AssistantMessageParts.reasoningText(am);
+                out.add(reasoning != null ? reasoning : "");
             }
         }
         return out;
@@ -1069,11 +1175,14 @@ public class NodeStreamingChatHelper {
 
     private StreamResult doStreamCallInner(ChatModel chatModel, Prompt prompt,
                                             String conversationId, String phase,
-                                            boolean broadcast, int attempt, boolean primaryCall,
+                                            PublicationMode publicationMode, int attempt, boolean primaryCall,
                                             AtomicReference<ErrorType> retryTypeRef,
-                                            AtomicReference<Long> retryHintRef) {
+                                            AtomicReference<Long> retryHintRef, String providerId) {
+        boolean broadcast = publicationMode != PublicationMode.SILENT;
+        throwIfCancelled(conversationId);
         if (attempt > 0) {
             boolean overloaded = retryTypeRef.get() == ErrorType.OVERLOADED;
+            boolean emptyResponse = retryTypeRef.get() == ErrorType.EMPTY_RESPONSE;
             Long hintedMs = retryHintRef.get();
             long delay;
             if (hintedMs != null && hintedMs > 0) {
@@ -1084,6 +1193,8 @@ public class NodeStreamingChatHelper {
                 // in lockstep at the stated instant.
                 delay = Math.min(hintedMs, HINTED_BACKOFF_CAP_MS)
                         + ThreadLocalRandom.current().nextLong(0, 1_000);
+            } else if (emptyResponse) {
+                delay = EMPTY_RESPONSE_BACKOFF_MS;
             } else if (overloaded) {
                 // Saturated provider: recovery periods run tens of seconds, so
                 // the generic 3s-based exponential would burn attempts before
@@ -1101,10 +1212,10 @@ public class NodeStreamingChatHelper {
             log.warn("[{}] Retry attempt {}/{} after {}ms (prev type={}) for conversation {}",
                     phase, attempt, MAX_RETRIES, delay, retryTypeRef.get(), conversationId);
             // 广播给前端：用户可见的重试倒计时
-            if (broadcast) {
+            if (broadcast && !emptyResponse) {
                 String cause = overloaded ? "模型服务繁忙" : "请求频率受限";
                 broadcastDelta(conversationId, "warning",
-                        buildDeltaJson("⏱️ " + cause + "，等待 " + (delay / 1000) + " 秒后重试（第 " + attempt + "/" + MAX_RETRIES + " 次）..."));
+                        "⏱️ " + cause + "，等待 " + (delay / 1000) + " 秒后重试（第 " + attempt + "/" + MAX_RETRIES + " 次）...");
             }
             // Poll stop flag every 100ms so user Stop is honored mid-backoff.
             long remaining = delay;
@@ -1119,7 +1230,7 @@ public class NodeStreamingChatHelper {
                     Thread.sleep(slice);
                 } catch (InterruptedException ie) {
                     Thread.currentThread().interrupt();
-                    return buildErrorResult("LLM 调用被中断", conversationId, phase);
+                    throw cancellation(ie);
                 }
                 remaining -= slice;
             }
@@ -1128,8 +1239,13 @@ public class NodeStreamingChatHelper {
         StringBuilder contentAccum = new StringBuilder();
         StringBuilder thinkingAccum = new StringBuilder();
         List<ToolCallAccumulator> toolCallAccumulators = new ArrayList<>();
-        AtomicReference<AssistantMessage> lastAssistantMessage = new AtomicReference<>();
+        StreamingMessageParts messageParts = new StreamingMessageParts();
+        AtomicReference<Map<String, Object>> providerMetadata = new AtomicReference<>(Map.of());
+        boolean cumulativeReasoning = ChatModelDefaults.optionsFor(chatModel) instanceof OpenAiChatOptions;
+        AtomicReference<String> previousReasoning = new AtomicReference<>("");
         AtomicReference<Throwable> errorRef = new AtomicReference<>();
+        AtomicReference<String> finishReason = new AtomicReference<>();
+        AtomicReference<FinishReasonCategory> finishCategory = new AtomicReference<>(FinishReasonCategory.UNSPECIFIED);
         AtomicInteger promptTokens = new AtomicInteger(0);
         AtomicInteger completionTokens = new AtomicInteger(0);
         // Prompt cache / reasoning counters; providers that don't report them stay 0.
@@ -1137,11 +1253,17 @@ public class NodeStreamingChatHelper {
         AtomicInteger cacheWriteTokens = new AtomicInteger(0);
         AtomicInteger reasoningTokens = new AtomicInteger(0);
 
-        // thinking-only soft cap 触发后设为 true，外层轮询线程据此 dispose 订阅。
-        // 注意：内容流的字符级 / 句子级重复检测已整体移除（设计取舍：
-        // agent 不替模型审核输出退化，靠 max_tokens + max_iterations 兜底）；
-        // 仅保留 thinking-only 这条体积兜底，处理 volcengine-plan 等 provider
-        // 在 thinking 通道堆字符不出 content 的死循环（生产 trace c1eefa45）。
+        // Detect actual reasoning loops; retain a budget-aware volume fallback.
+        long thinkingSafetyCapChars = THINKING_ONLY_MIN_SAFETY_CAP_CHARS;
+        var defaultOptions = ChatModelDefaults.optionsFor(chatModel);
+        if (defaultOptions != null && defaultOptions.getMaxTokens() != null) {
+            thinkingSafetyCapChars = Math.max(thinkingSafetyCapChars, defaultOptions.getMaxTokens().longValue() * 16);
+        }
+        if (prompt.getOptions() != null && prompt.getOptions().getMaxTokens() != null) {
+            thinkingSafetyCapChars = Math.max(thinkingSafetyCapChars, prompt.getOptions().getMaxTokens().longValue() * 16);
+        }
+        final long thinkingOnlySafetyCapChars = thinkingSafetyCapChars;
+        AtomicInteger lastThinkingRepeatCheckLen = new AtomicInteger(0);
         AtomicBoolean thinkingOnlyCapTriggered = new AtomicBoolean(false);
         // Content-repetition guard: trips when the same paragraph-sized
         // suffix appears CONTENT_REPEAT_MAX_OCCURRENCES+ times in
@@ -1174,9 +1296,9 @@ public class NodeStreamingChatHelper {
                     "timestamp", System.currentTimeMillis()
             ));
             String modelId = identifyModel(chatModel);
-            String providerId = primaryProviderId != null ? primaryProviderId : "";
+            String actualProviderId = providerId != null ? providerId : "";
             streamTracker.broadcastObject(conversationId, "llm_request_sent", Map.of(
-                    "provider", providerId,
+                    "provider", actualProviderId,
                     "model", modelId != null ? modelId : "",
                     "phase", phase != null ? phase : "",
                     "timestamp", System.currentTimeMillis()
@@ -1220,14 +1342,60 @@ public class NodeStreamingChatHelper {
 
         CountDownLatch latch = new CountDownLatch(1);
 
-        Disposable subscription = chatModel.stream(prompt)
+        // Issue #585: inter-frame idle timeout on the streaming body Flux.
+        // The JDK HttpClient request timeout (which setReadTimeout maps to)
+        // only protects up to the response headers; once they arrive the
+        // clock stops, so a provider that returns 200 + a first frame then
+        // goes silent hangs the body forever. This reactor timeout measures
+        // the gap between successive stream elements, so total silence for
+        // streamIdleTimeoutSec propagates an error down the existing path.
+        // The fallback Flux carries a descriptive message so classifyError's
+        // "timeout" pattern matches it (vanilla TimeoutException.getMessage()
+        // is null) and the health tracker / failover chain engage.
+        throwIfCancelled(conversationId);
+        Flux<ChatResponse> streamWithIdleGuard =
+                streamIdleTimeoutSec > 0
+                        ? chatModel.stream(prompt).timeout(
+                                Duration.ofSeconds(streamIdleTimeoutSec),
+                                Flux.error(new TimeoutException(
+                                        "LLM stream idle timeout after " + streamIdleTimeoutSec
+                                                + "s with no delta — provider half-open or stalled")))
+                        : chatModel.stream(prompt);
+
+        Disposable subscription = streamWithIdleGuard
                 .doOnNext(chatResponse -> {
-                    if (chatResponse == null || chatResponse.getResults() == null || chatResponse.getResults().isEmpty()) {
+                    if (chatResponse == null) return;
+                    messageParts.accept(chatResponse);
+                    // Usage-only terminal frames have no generations. Read reported counters
+                    // before the content guard so completed calls do not silently become zero.
+                    if (chatResponse.getMetadata() != null && chatResponse.getMetadata().getUsage() != null) {
+                        var usage = chatResponse.getMetadata().getUsage();
+                        if (usage.getPromptTokens() != null && usage.getPromptTokens() > 0) {
+                            promptTokens.set(usage.getPromptTokens().intValue());
+                        }
+                        if (usage.getCompletionTokens() != null && usage.getCompletionTokens() > 0) {
+                            completionTokens.set(usage.getCompletionTokens().intValue());
+                        }
+                        // Reflective extraction of provider-native cache / reasoning
+                        // counters (Anthropic / OpenAI-compatible / DashScope).
+                        var cache = vip.mate.llm.cache.CacheUsageExtractor.extract(usage);
+                        if (cache.cacheReadTokens() > 0)  cacheReadTokens.set(cache.cacheReadTokens());
+                        if (cache.cacheWriteTokens() > 0) cacheWriteTokens.set(cache.cacheWriteTokens());
+                        if (cache.reasoningTokens() > 0)  reasoningTokens.set(cache.reasoningTokens());
+                    }
+                    if (chatResponse.getResults() == null || chatResponse.getResults().isEmpty()) {
                         return;
                     }
                     var generation = chatResponse.getResult();
+                    if (generation.getMetadata() != null
+                            && generation.getMetadata().getFinishReason() != null
+                            && !generation.getMetadata().getFinishReason().isBlank()) {
+                        finishReason.set(generation.getMetadata().getFinishReason());
+                    }
                     AssistantMessage msg = generation.getOutput();
-                    lastAssistantMessage.set(msg);
+                    FinishReasonCategory category = generation.getMetadata().getFinishReasonCategory();
+                    if (category != FinishReasonCategory.UNSPECIFIED) finishCategory.set(category);
+                    providerMetadata.updateAndGet(previous -> mergeProviderMetadata(previous, msg.getMetadata()));
 
                     // thinking-only soft cap 已触发 → 跳过一切处理（等外层 dispose）
                     if (thinkingOnlyCapTriggered.get() || contentRepeatCapTriggered.get()) {
@@ -1238,6 +1406,14 @@ public class NodeStreamingChatHelper {
                     //    内联标签提取（此类模型不会再用 <think> 包裹思考，正文里的
                     //    字面标签是真实内容）。
                     String nativeThinking = extractReasoningContent(msg);
+                    if (cumulativeReasoning && msg.getReasoning().isEmpty() && nativeThinking != null && !nativeThinking.isEmpty()) {
+                        String previous = previousReasoning.get();
+                        if (!nativeThinking.startsWith(previous)) {
+                            throw new IllegalArgumentException("OpenAI cumulative reasoning is not monotonic");
+                        }
+                        previousReasoning.set(nativeThinking);
+                        nativeThinking = nativeThinking.substring(previous.length());
+                    }
                     if (nativeThinking != null && !nativeThinking.isEmpty()) {
                         thinkExtractor.disable();
                     }
@@ -1249,6 +1425,8 @@ public class NodeStreamingChatHelper {
                         contentDelta = split.content();
                         tagThinking = split.thinking();
                     }
+
+                    if (!java.util.Objects.equals(rawContent, contentDelta)) messageParts.markTextTransformed();
 
                     // 2. 标签提取的 thinking 先处理：形如 "…</think>answer" 的
                     //    chunk 里思考先于正文出现。
@@ -1272,7 +1450,7 @@ public class NodeStreamingChatHelper {
                             ));
                         }
                         contentAccum.append(contentDelta);
-                        if (broadcast) {
+                        if (publicationMode == PublicationMode.LIVE) {
                             broadcastDelta(conversationId, "content_delta", contentDelta);
                         }
                     }
@@ -1296,20 +1474,29 @@ public class NodeStreamingChatHelper {
                     // would trip the guard before we observe the tool_call —
                     // the user would see "INCOMPLETE: thinking-only" on a
                     // request that was actually about to dispatch a tool.
-                    // Pattern-agnostic; fires on volume alone. Outer poll
-                    // tears the subscription down within 500ms once the
-                    // flag flips.
-                    if (thinkingAccum.length() >= THINKING_ONLY_HARD_CAP_CHARS
+                    // Long, diverse reasoning is progress: length alone must
+                    // not classify it as a loop. Throttle suffix scans as for content.
+                    int thinkingLen = thinkingAccum.length();
+                    boolean repeatingThinking = false;
+                    if (thinkingLen >= THINKING_REPEAT_MIN_CHARS
+                            && thinkingLen - lastThinkingRepeatCheckLen.get() >= CONTENT_REPEAT_CHECK_INTERVAL) {
+                        lastThinkingRepeatCheckLen.set(thinkingLen);
+                        repeatingThinking = hasRepeatingSuffix(thinkingAccum, CONTENT_REPEAT_MIN_PERIOD,
+                                CONTENT_REPEAT_MAX_PERIOD, CONTENT_REPEAT_MAX_OCCURRENCES);
+                    }
+                    if ((repeatingThinking || thinkingLen >= thinkingOnlySafetyCapChars)
                             && contentAccum.length() == 0
                             && toolCallAccumulators.isEmpty()
                             && !msg.hasToolCalls()) {
-                        log.warn("[{}] Thinking-only soft cap reached " +
-                                        "({} thinking chars, no content/tool yet) " +
+                        log.warn("[{}] Thinking-only guard reached " +
+                                        "(trigger={}, {} thinking chars, safety limit={} chars, no content/tool yet) " +
                                         "— disposing stream for conversation {}",
-                                phase, thinkingAccum.length(), conversationId);
-                        broadcastContentTruncated(conversationId,
-                                "thinking_only_no_content",
-                                thinkingAccum.length());
+                                phase, repeatingThinking ? "repetition" : "safety_limit",
+                                thinkingLen, thinkingOnlySafetyCapChars, conversationId);
+                        if (broadcast) {
+                            broadcastContentTruncated(conversationId,
+                                    "thinking_only_no_content", thinkingAccum.length());
+                        }
                         thinkingOnlyCapTriggered.set(true);
                         return;
                     }
@@ -1336,29 +1523,12 @@ public class NodeStreamingChatHelper {
                                             "— disposing stream for conversation {}",
                                     phase, currentLen, CONTENT_REPEAT_MAX_OCCURRENCES,
                                     conversationId);
-                            broadcastContentTruncated(conversationId,
-                                    "content_repetition",
-                                    currentLen);
+                            if (broadcast) {
+                                broadcastContentTruncated(conversationId, "content_repetition", currentLen);
+                            }
                             contentRepeatCapTriggered.set(true);
                             return;
                         }
-                    }
-
-                    // 8. 提取 token usage（通常最后一个 chunk 携带完整 usage）
-                    if (chatResponse.getMetadata() != null && chatResponse.getMetadata().getUsage() != null) {
-                        var usage = chatResponse.getMetadata().getUsage();
-                        if (usage.getPromptTokens() != null && usage.getPromptTokens() > 0) {
-                            promptTokens.set(usage.getPromptTokens().intValue());
-                        }
-                        if (usage.getCompletionTokens() != null && usage.getCompletionTokens() > 0) {
-                            completionTokens.set(usage.getCompletionTokens().intValue());
-                        }
-                        // Reflective extraction of provider-native cache / reasoning
-                        // counters (Anthropic / OpenAI-compatible / DashScope).
-                        var cache = vip.mate.llm.cache.CacheUsageExtractor.extract(usage);
-                        if (cache.cacheReadTokens() > 0)  cacheReadTokens.set(cache.cacheReadTokens());
-                        if (cache.cacheWriteTokens() > 0) cacheWriteTokens.set(cache.cacheWriteTokens());
-                        if (cache.reasoningTokens() > 0)  reasoningTokens.set(cache.reasoningTokens());
                     }
                 })
                 .subscribe(
@@ -1378,7 +1548,7 @@ public class NodeStreamingChatHelper {
                     subscription.dispose();
                     if (broadcast) {
                         broadcastDelta(conversationId, "warning",
-                                buildDeltaJson("模型在思考阶段停留过久，已自动截断"));
+                                "模型在思考阶段停留过久，已自动截断");
                     }
                     // dispose 后 latch 可能不会 countDown，直接跳出
                     break;
@@ -1393,7 +1563,7 @@ public class NodeStreamingChatHelper {
                     subscription.dispose();
                     if (broadcast) {
                         broadcastDelta(conversationId, "warning",
-                                buildDeltaJson("检测到回答内容反复重复，已自动截断"));
+                                "检测到回答内容反复重复，已自动截断");
                     }
                     break;
                 }
@@ -1412,7 +1582,7 @@ public class NodeStreamingChatHelper {
                         return assembleStoppedResult(contentAccum, thinkingAccum, toolCallAccumulators,
                                 promptTokens.get(), completionTokens.get(),
                                 cacheReadTokens.get(), cacheWriteTokens.get(),
-                                reasoningTokens.get(), phase);
+                                reasoningTokens.get(), phase, providerMetadata.get(), messageParts.finish());
                     }
                     log.info("[{}] Stop requested during LLM call, no content accumulated, aborting: conversationId={}",
                             phase, conversationId);
@@ -1421,13 +1591,13 @@ public class NodeStreamingChatHelper {
                 if (System.currentTimeMillis() > deadlineMs) {
                     subscription.dispose();
                     log.warn("[{}] Stream call timed out for conversation {}", phase, conversationId);
-                    return buildErrorResult("LLM 调用超时", conversationId, phase);
+                    return buildErrorResult("LLM 调用超时", conversationId, phase, publicationMode);
                 }
             }
         } catch (InterruptedException e) {
             subscription.dispose();
             Thread.currentThread().interrupt();
-            return buildErrorResult("LLM 调用被中断", conversationId, phase);
+            throw cancellation(e);
         }
 
         // Stream is over (complete, error, or disposed by a guard) — drain the
@@ -1446,13 +1616,13 @@ public class NodeStreamingChatHelper {
                         phase, contentAccum.length(), toolCallAccumulators.size(), error.getMessage());
                 if (broadcast) {
                     broadcastDelta(conversationId, "warning",
-                            buildDeltaJson("LLM 响应中断，使用已生成的部分内容继续"));
+                            "LLM 响应中断，使用已生成的部分内容继续");
                 }
                 return assembleResult(contentAccum, thinkingAccum, toolCallAccumulators,
                         promptTokens.get(), completionTokens.get(),
                         cacheReadTokens.get(), cacheWriteTokens.get(),
                         reasoningTokens.get(),
-                        phase, true, error.getMessage());
+                        phase, true, error.getMessage(), providerMetadata.get(), messageParts.finish());
             }
 
             // ===== 无内容：分类错误并决定是否重试 =====
@@ -1482,7 +1652,7 @@ public class NodeStreamingChatHelper {
                     }
                 }
                 return buildErrorResultWithType("Prompt 过长: " + extractUserFriendlyError(error),
-                        conversationId, phase, errorType);
+                        conversationId, phase, errorType, publicationMode);
             }
 
             // Generic retry gate — the ErrorType's own budget decides whether
@@ -1504,17 +1674,22 @@ public class NodeStreamingChatHelper {
             String message = switch (errorType) {
                 case AUTH_ERROR -> "认证失败: " + friendly;
                 case CLIENT_ERROR -> "Bad request: " + friendly;
+                case PAYLOAD_TOO_LARGE -> "请求体过大（HTTP 413）";
                 default -> "LLM 调用失败: " + friendly;
             };
             log.error("[{}] LLM call failed (type={}) after {} attempts for conversation {}: {}",
                     phase, errorType, attempt + 1, conversationId, error.getMessage());
-            return buildErrorResultWithType(message, conversationId, phase, errorType);
+            return buildErrorResultWithType(message, conversationId, phase, errorType, publicationMode);
         }
 
         // ===== 成功（检查是否因 thinking-only 软上限或内容重复被截断） =====
         boolean truncatedByThinkingCap = thinkingOnlyCapTriggered.get();
         boolean truncatedByContentRepeat = contentRepeatCapTriggered.get();
-        boolean truncated = truncatedByThinkingCap || truncatedByContentRepeat;
+        boolean thinkingTokenLimit = (finishCategory.get() == FinishReasonCategory.TRUNCATED
+                || isOutputLimitFinishReason(finishReason.get()))
+                && thinkingAccum.length() > 0 && contentAccum.toString().isBlank()
+                && toolCallAccumulators.isEmpty();
+        boolean truncated = truncatedByThinkingCap || truncatedByContentRepeat || thinkingTokenLimit;
         if (truncatedByThinkingCap) {
             log.warn("[{}] LLM stream disposed: thinking-only soft cap reached for conversation {}",
                     phase, conversationId);
@@ -1535,18 +1710,27 @@ public class NodeStreamingChatHelper {
                 && thinkingAccum.length() == 0
                 && toolCallAccumulators.isEmpty()) {
             log.warn("[{}] LLM returned empty response (no content, no thinking, no tool calls) — marking as EMPTY_RESPONSE for fallback", phase);
-            return buildErrorResultWithType("LLM 返回空响应", conversationId, phase, ErrorType.EMPTY_RESPONSE);
+            // The outer policy owns retry/failover. Keep transient empty
+            // attempts out of the user-visible error stream, and leave text
+            // blank so callers can apply a deterministic final fallback.
+            return buildEmptyResponseResult();
         }
 
         String truncationReason = truncatedByThinkingCap ? "thinking_only_no_content"
                 : truncatedByContentRepeat ? "content_repetition"
+                : thinkingTokenLimit ? "thinking_token_limit"
                 : null;
+        // Retain the provider's end condition even when it emitted some content.
+        // A verifier JSON cut off by length is not a malformed completed verdict.
+        Map<String, Object> resultMetadata = new LinkedHashMap<>(providerMetadata.get());
+        if (finishReason.get() != null) resultMetadata.put("generationFinishReason", finishReason.get());
+        resultMetadata.put("generationFinishReasonCategory", finishCategory.get().name());
         return assembleResult(contentAccum, thinkingAccum, toolCallAccumulators,
                 promptTokens.get(), completionTokens.get(),
                 cacheReadTokens.get(), cacheWriteTokens.get(),
                 reasoningTokens.get(), phase,
                 truncated,
-                truncationReason);
+                truncationReason, resultMetadata, messageParts.finish(contentAccum, thinkingAccum));
     }
 
     /** 组装 stopped partial 结果（用户主动停止，有已累积内容） */
@@ -1554,7 +1738,7 @@ public class NodeStreamingChatHelper {
                                                 List<ToolCallAccumulator> toolCallAccumulators,
                                                 int promptTok, int completionTok,
                                                 int cacheReadTok, int cacheWriteTok,
-                                                int reasoningTok, String phase) {
+                                                int reasoningTok, String phase, Map<String, Object> providerMetadata, AssistantMessage nativeMessage) {
         List<AssistantMessage.ToolCall> finalToolCalls = buildFinalToolCalls(toolCallAccumulators);
         String fullContent = contentAccum.toString();
         String fullThinking = thinkingAccum.toString();
@@ -1568,7 +1752,7 @@ public class NodeStreamingChatHelper {
             }
         }
 
-        AssistantMessage assembledMessage = buildAssistantMessageWithThinking(fullContent, fullThinking, finalToolCalls);
+        AssistantMessage assembledMessage = buildAssistantMessageWithThinking(fullContent, fullThinking, finalToolCalls, providerMetadata, nativeMessage);
 
         // Cache reasoning_content for MiMo-style providers that require it on
         // subsequent turns.
@@ -1585,7 +1769,7 @@ public class NodeStreamingChatHelper {
                                          List<ToolCallAccumulator> toolCallAccumulators,
                                          int promptTok, int completionTok,
                                          int cacheReadTok, int cacheWriteTok, int reasoningTok,
-                                         String phase, boolean partial, String errorMsg) {
+                                         String phase, boolean partial, String errorMsg, Map<String, Object> providerMetadata, AssistantMessage nativeMessage) {
         List<AssistantMessage.ToolCall> finalToolCalls = buildFinalToolCalls(toolCallAccumulators);
         String fullContent = contentAccum.toString();
         String fullThinking = thinkingAccum.toString();
@@ -1601,7 +1785,7 @@ public class NodeStreamingChatHelper {
             }
         }
 
-        AssistantMessage assembledMessage = buildAssistantMessageWithThinking(fullContent, fullThinking, finalToolCalls);
+        AssistantMessage assembledMessage = buildAssistantMessageWithThinking(fullContent, fullThinking, finalToolCalls, providerMetadata, nativeMessage);
 
         // Cache reasoning_content for MiMo-style providers that require it on
         // subsequent turns. The cache replays real values instead of empty strings.
@@ -1613,31 +1797,46 @@ public class NodeStreamingChatHelper {
                 partial, errorMsg, ErrorType.NONE, false, cacheReadTok, cacheWriteTok, reasoningTok);
     }
 
-    /**
-     * PR-2 L2 (RFC-049): Build an {@link AssistantMessage} that persists the per-turn
-     * {@code fullThinking} into the message's properties under key {@code "reasoningContent"}.
-     *
-     * <p>This is the linchpin of the structural fix: without writing thinking back into
-     * the AssistantMessage that enters the next ReAct round's state, the outbound
-     * request's {@code reasoning_content} is lost (Spring AI 1.1.4's
-     * {@code OpenAiChatModel.lambda$createRequest$20} hardcodes {@code null} on the
-     * outbound conversion, so the relay in {@code AssistantThinkingRelay} is the only
-     * way back — see RFC-049 §2.3 L3).
-     *
-     * <p>Note the Spring AI naming asymmetry: the builder method is
-     * {@code .properties(Map)} but the reader is {@code getMetadata()} (see
-     * {@link #stripThinkingFromPrompt} L937).
-     */
+    /** Preserve native ordered parts and retain legacy metadata for saved histories and plugins. */
     private static AssistantMessage buildAssistantMessageWithThinking(
-            String fullContent, String fullThinking, List<AssistantMessage.ToolCall> finalToolCalls) {
-        AssistantMessage.Builder builder = AssistantMessage.builder().content(fullContent);
-        if (finalToolCalls != null && !finalToolCalls.isEmpty()) {
+            String fullContent, String fullThinking, List<AssistantMessage.ToolCall> finalToolCalls,
+            Map<String, Object> providerMetadata, AssistantMessage nativeMessage) {
+        AssistantMessage.Builder<?> builder = nativeMessage == null ? AssistantMessage.builder() : nativeMessage.mutate();
+        if (nativeMessage == null || !java.util.Objects.equals(nativeMessage.getText(), fullContent)) {
+            builder.content(fullContent);
+        }
+        if (finalToolCalls != null && (nativeMessage == null || !finalToolCalls.equals(nativeMessage.getToolCalls()))) {
             builder.toolCalls(finalToolCalls);
         }
-        if (fullThinking != null && !fullThinking.isEmpty()) {
-            builder.properties(Map.of("reasoningContent", fullThinking));
+        if (fullThinking != null && !fullThinking.isEmpty()
+                && (nativeMessage == null || nativeMessage.getReasoning().isEmpty())) {
+            builder.reasoning(ReasoningPart.of(fullThinking));
         }
+        Map<String, Object> metadata = new LinkedHashMap<>(providerMetadata);
+        if (fullThinking != null && !fullThinking.isEmpty()) {
+            metadata.put("reasoningContent", fullThinking);
+        }
+        builder.properties(metadata);
         return builder.build();
+    }
+
+    private static Map<String, Object> mergeProviderMetadata(Map<String, Object> previous, Map<String, Object> incoming) {
+        Map<String, Object> merged = new LinkedHashMap<>(previous);
+        for (String key : List.of("anthropicThinkingBlocks", "openai.tool_calls.additional_properties", "search_info")) {
+            Object value = incoming.get(key);
+            if (value == null || value instanceof Map<?, ?> map && map.isEmpty()
+                    || value instanceof List<?> list && list.isEmpty()
+                    || value instanceof String text && text.isBlank()) continue;
+            if ("openai.tool_calls.additional_properties".equals(key) && value instanceof Map<?, ?> properties) {
+                Map<Object, Object> combined = new LinkedHashMap<>();
+                if (previous.get(key) instanceof Map<?, ?> oldProperties) combined.putAll(oldProperties);
+                combined.putAll(properties);
+                merged.put(key, Map.copyOf(combined));
+            } else {
+                merged.put(key, value);
+            }
+        }
+        return Map.copyOf(merged);
     }
 
     /**
@@ -1716,19 +1915,11 @@ public class NodeStreamingChatHelper {
             // Only strip prior-turn assistant thinking (i <= lastUserIdx); in-turn (i > lastUserIdx) stays
             if (msg instanceof AssistantMessage am && i <= lastUserIdx) {
                 Map<String, Object> meta = am.getMetadata();
-                if (meta != null && meta.containsKey("reasoningContent")) {
+                if (meta.containsKey("reasoningContent") || !am.getReasoning().isEmpty()) {
                     Map<String, Object> cleanMeta = new java.util.HashMap<>(meta);
                     cleanMeta.remove("reasoningContent");
-                    AssistantMessage.Builder builder = AssistantMessage.builder()
-                            .content(am.getText())
-                            .properties(cleanMeta);
-                    if (am.getToolCalls() != null && !am.getToolCalls().isEmpty()) {
-                        builder.toolCalls(am.getToolCalls());
-                    }
-                    if (am.getMedia() != null && !am.getMedia().isEmpty()) {
-                        builder.media(am.getMedia());
-                    }
-                    cleaned.add(builder.build());
+                    cleanMeta.remove("reasoning_content");
+                    cleaned.add(AssistantMessageParts.withoutReasoning(am, true, cleanMeta));
                     strippedCount++;
                     continue;
                 }
@@ -1816,16 +2007,9 @@ public class NodeStreamingChatHelper {
             if (rebuilt == null) {
                 rebuilt = new ArrayList<>(messages.subList(0, i));
             }
-            AssistantMessage.Builder builder = AssistantMessage.builder()
-                    .content(am.getText() == null ? "" : am.getText())
-                    .toolCalls(fixedCalls);
-            if (am.getMetadata() != null && !am.getMetadata().isEmpty()) {
-                builder.properties(am.getMetadata());
-            }
-            if (am.getMedia() != null && !am.getMedia().isEmpty()) {
-                builder.media(am.getMedia());
-            }
-            rebuilt.add(builder.build());
+            rebuilt.add(AssistantMessageParts.mapToolCalls(am, tc ->
+                    new AssistantMessage.ToolCall(tc.id(), tc.type(), tc.name(),
+                            sanitizeToolCallArguments(tc.name(), tc.arguments()))));
         }
         if (rebuilt == null) {
             return prompt;
@@ -1834,11 +2018,12 @@ public class NodeStreamingChatHelper {
         return new Prompt(rebuilt, prompt.getOptions());
     }
 
-    private StreamResult buildErrorResult(String errorMsg, String conversationId, String phase) {
+    private StreamResult buildErrorResult(String errorMsg, String conversationId, String phase,
+                                          PublicationMode publicationMode) {
         log.error("[{}] Building error result for conversation {}: {}", phase, conversationId, errorMsg);
-        if (streamTracker != null && conversationId != null) {
+        if (publicationMode != PublicationMode.SILENT && streamTracker != null && conversationId != null) {
             broadcastDelta(conversationId, "warning",
-                    buildDeltaJson(errorMsg));
+                    errorMsg);
         }
         AssistantMessage errorMessage = new AssistantMessage("[错误] " + errorMsg);
         return new StreamResult("[错误] " + errorMsg, "", errorMessage,
@@ -1847,11 +2032,11 @@ public class NodeStreamingChatHelper {
 
     /** 构建带错误类型的 StreamResult */
     private StreamResult buildErrorResultWithType(String errorMsg, String conversationId,
-                                                    String phase, ErrorType errorType) {
+                                                    String phase, ErrorType errorType, PublicationMode publicationMode) {
         log.error("[{}] Building typed error result for conversation {}: {} (type={})",
                 phase, conversationId, errorMsg, errorType);
-        if (streamTracker != null && conversationId != null) {
-            broadcastDelta(conversationId, "warning", buildDeltaJson(errorMsg));
+        if (publicationMode != PublicationMode.SILENT && streamTracker != null && conversationId != null) {
+            broadcastDelta(conversationId, "warning", errorMsg);
             // 广播结构化 error 事件，供前端展示错误卡片
             String errorJson = buildErrorEventJson(errorMsg, conversationId, errorType);
             streamTracker.broadcast(conversationId, "error", errorJson);
@@ -1859,6 +2044,12 @@ public class NodeStreamingChatHelper {
         AssistantMessage errorMessage = new AssistantMessage("[错误] " + errorMsg);
         return new StreamResult("[错误] " + errorMsg, "", errorMessage,
                 List.of(), false, 0, 0, false, errorMsg, errorType);
+    }
+
+    private StreamResult buildEmptyResponseResult() {
+        return new StreamResult("", "", new AssistantMessage(""),
+                List.of(), false, 0, 0, false,
+                "LLM 返回空响应", ErrorType.EMPTY_RESPONSE);
     }
 
     /** 构建 error 事件的 JSON payload */
@@ -1961,9 +2152,26 @@ public class NodeStreamingChatHelper {
                 || combined.contains("model not found") || combined.contains("not_found_error")) {
             return "Model name not available on this provider — verify the model exists and is supported (Settings → Models)";
         }
+        // Do not mislabel unsupported model parameters as image errors (#640).
+        // Only emit known parameter names and fixed guidance, never raw response
+        // bodies, which may contain credentials or echoed conversation content.
+        String lowerError = combined.toLowerCase(java.util.Locale.ROOT);
+        if (lowerError.contains("unsupported parameter") || lowerError.contains("unsupported_parameter")
+                || lowerError.contains("unsupported value") || lowerError.contains("unsupported_value")) {
+            if (lowerError.contains("max_tokens") && lowerError.contains("max_completion_tokens")) {
+                return "模型不支持 max_tokens，请改用 max_completion_tokens。请更新 MateClaw，并检查模型及提供商生成参数配置。";
+            }
+            for (String parameter : java.util.List.of("max_completion_tokens", "max_tokens", "temperature", "top_p",
+                    "reasoning_effort", "stream_options", "parallel_tool_calls", "tool_choice", "response_format")) {
+                if (lowerError.contains(parameter)) {
+                    return "模型不支持生成参数或参数值：" + parameter + "。请检查模型及提供商生成参数配置。";
+                }
+            }
+            return "模型不支持当前生成参数或参数值，请检查模型及提供商生成参数配置。";
+        }
         // 对 Jackson 反序列化错误，提取关键信息
         if (msg.contains("engine_overloaded")) return "Model service overloaded, please retry later";
-        if (msg.contains("unsupported image format") || msg.contains("unsupported")) return "Unsupported file format (e.g. SVG), use PNG/JPG instead";
+        if (lowerError.contains("unsupported image format")) return "Unsupported file format (e.g. SVG), use PNG/JPG instead";
         if (msg.contains("invalid_request_error") || msg.contains("400 Bad Request")) return "Bad request, please check input";
         if (msg.contains("rate_limit") || msg.contains("429")) return "Rate limit exceeded, please retry later";
         if (msg.contains("timeout") || msg.contains("Timeout")) return "Request timeout, please retry";
@@ -2018,6 +2226,8 @@ public class NodeStreamingChatHelper {
          * staying on a rate-limited provider wastes time — then fail over.
          */
         RATE_LIMIT           (MAX_RETRIES_RATE_LIMIT,     true,      false,  true),
+        /** Local admission/cooldown; no provider request failed and health must not be penalized. */
+        PROVIDER_BUSY        (0,                          true,      false,  false),
         /**
          * The provider's serving capacity is saturated (HTTP 529,
          * "engine_overloaded", "model is overloaded"). The caller's key is
@@ -2032,6 +2242,7 @@ public class NodeStreamingChatHelper {
          * Context window exceeded. Never retried here — returned to the node,
          * which owns structured compaction and its own retry.
          */
+        PAYLOAD_TOO_LARGE    (0,                          false,     false,  false),
         PROMPT_TOO_LONG      (0,                          false,     false,  false),
         /** Auth / infrastructure failure (bad key, cert, DNS). Will not self-heal. */
         AUTH_ERROR           (0,                          true,      true,   true),
@@ -2097,6 +2308,10 @@ public class NodeStreamingChatHelper {
 
         /** Whether this failure counts toward the provider health cooldown tracker. */
         public boolean countsHealth() { return countsHealth; }
+    }
+
+    private static boolean isOutputLimitFinishReason(String reason) {
+        return FinishReasonCategory.categorize(reason) == FinishReasonCategory.TRUNCATED;
     }
 
     /**
@@ -2165,8 +2380,22 @@ public class NodeStreamingChatHelper {
         }
 
         /** 是否为 Prompt 过长错误 */
+        public boolean isPayloadTooLarge() {
+            return errorType == ErrorType.PAYLOAD_TOO_LARGE;
+        }
+
         public boolean isPromptTooLong() {
             return errorType == ErrorType.PROMPT_TOO_LONG;
+        }
+
+        /** Explicit provider output-limit stop, distinct from transport errors and loop guards. */
+        public boolean isOutputTokenLimit() {
+            if (stopped || hasToolCalls || errorType != ErrorType.NONE) return false;
+            if ("thinking_token_limit".equals(errorMessage)) return true;
+            return errorMessage == null && assistantMessage != null
+                    && (FinishReasonCategory.TRUNCATED.name().equals(
+                            assistantMessage.getMetadata().get("generationFinishReasonCategory"))
+                        || isOutputLimitFinishReason(String.valueOf(assistantMessage.getMetadata().get("generationFinishReason"))));
         }
 
         /** 是否有任何可保存的内容（text/thinking/toolCalls） */
@@ -2179,22 +2408,9 @@ public class NodeStreamingChatHelper {
 
     // ==================== 内部方法 ====================
 
-    /**
-     * 从 AssistantMessage 的 properties 中提取 reasoningContent
-     * <p>
-     * Spring AI 1.1.3 的 OpenAiChatModel 在流式路径中会将 delta.reasoning_content
-     * 放入 properties 的 "reasoningContent" key。
-     */
+    /** Native parts carry reasoning deltas; older providers expose reasoningContent metadata. */
     private String extractReasoningContent(AssistantMessage msg) {
-        Map<String, Object> metadata = msg.getMetadata();
-        if (metadata == null) {
-            return null;
-        }
-        Object rc = metadata.get("reasoningContent");
-        if (rc instanceof String s && !s.isEmpty()) {
-            return s;
-        }
-        return null;
+        return AssistantMessageParts.reasoningText(msg);
     }
 
     /**
@@ -2336,31 +2552,11 @@ public class NodeStreamingChatHelper {
         return total;
     }
 
-    /**
-     * Pick a stable model identifier from whatever {@link ChatModel}
-     * implementation we received — Spring AI doesn't expose a single accessor.
-     * We try the well-known fields by reflection so this stays decoupled from
-     * concrete provider classes (Anthropic / OpenAI / DashScope all expose
-     * {@code defaultOptions.model} or equivalent).
-     */
+    /** Uses the common Spring AI options contract for provider request telemetry. */
     private static String identifyModel(ChatModel chatModel) {
         if (chatModel == null) return "";
-        try {
-            // Common Spring AI shape: getDefaultOptions().getModel()
-            java.lang.reflect.Method getDefaultOptions = chatModel.getClass().getMethod("getDefaultOptions");
-            Object opts = getDefaultOptions.invoke(chatModel);
-            if (opts != null) {
-                try {
-                    java.lang.reflect.Method getModel = opts.getClass().getMethod("getModel");
-                    Object model = getModel.invoke(opts);
-                    if (model != null) return model.toString();
-                } catch (NoSuchMethodException ignored) {
-                    // fall through
-                }
-            }
-        } catch (Exception ignored) {
-            // fall through to class-name fallback
-        }
+        var options = ChatModelDefaults.optionsFor(chatModel);
+        if (options != null && options.getModel() != null) return options.getModel();
         return chatModel.getClass().getSimpleName();
     }
 
@@ -2442,9 +2638,39 @@ public class NodeStreamingChatHelper {
                     acc.id,
                     acc.type != null ? acc.type : "function",
                     acc.name,
-                    sanitizeToolCallArguments(acc.name, acc.arguments.toString())));
+                    toolCallArgumentsForExecution(acc.name, acc.arguments.toString())));
         }
         return result;
+    }
+
+    /**
+     * Finalize a streamed tool call for local execution.
+     *
+     * <p>Blank arguments are a common zero-argument representation and remain
+     * normalized to an empty object. Invalid non-blank JSON, however, must be
+     * preserved until {@code ToolExecutionExecutor} sees it; replacing it with
+     * {@code {}} loses the distinction between a truncated stream and a real
+     * empty call and can execute the wrong operation. The outgoing-history
+     * normalization path still calls {@link #sanitizeToolCallArguments} before
+     * a later provider request.</p>
+     */
+    private static String toolCallArgumentsForExecution(String toolName, String arguments) {
+        if (arguments == null || arguments.isBlank()) {
+            return "{}";
+        }
+        try {
+            TOOL_ARG_JSON_MAPPER.readTree(arguments);
+            return arguments;
+        } catch (Exception e) {
+            log.warn("Tool '{}' arguments are not valid JSON after stream aggregation "
+                            + "(len={}, head={}); preserving the payload for safe executor rejection. "
+                            + "Parse error: {}",
+                    toolName,
+                    arguments.length(),
+                    arguments.substring(0, Math.min(80, arguments.length())),
+                    e.getMessage());
+            return arguments;
+        }
     }
 
     /**

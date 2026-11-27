@@ -9,6 +9,7 @@ import org.springframework.ai.tool.annotation.ToolParam;
 import org.springframework.lang.Nullable;
 import org.springframework.stereotype.Component;
 import vip.mate.tool.document.GeneratedFileCache;
+import vip.mate.execution.evidence.service.ExecutionObservationSink;
 import vip.mate.tool.document.WorkspaceArtifactSurfacer;
 
 import java.io.IOException;
@@ -46,23 +47,33 @@ public class ShellExecuteTool {
     private final vip.mate.i18n.I18nService i18n;
     private final GeneratedFileCache generatedFileCache;
 
+    @org.springframework.beans.factory.annotation.Autowired
+    private vip.mate.tool.sandbox.MemberSandboxExecutor memberSandboxExecutor;
+
     private static final int DEFAULT_TIMEOUT_SECONDS = 60;
     private static final int MAX_OUTPUT_BYTES = 10_000;
     private static final boolean IS_WINDOWS = System.getProperty("os.name", "")
             .toLowerCase(Locale.ROOT).contains("win");
 
     @vip.mate.tool.ConcurrencyUnsafe("shell command execution can mutate global state in ways the executor can't reason about")
-    @Tool(description = "Execute a shell command on the local server. For running system commands, viewing files, running scripts. "
-            + "Uses cmd.exe on Windows, /bin/sh on Linux/macOS. "
-            + "Dangerous operations trigger security approval. Returns structured result with exitCode, stdout, stderr, timedOut, "
-            + "and (when the command wrote files) a generatedFiles string of [name](url) download links — echo them so the user can download what you produced.")
-    public String execute_shell_command(
+    @Tool(name = "execute_shell_command", description = "Execute a shell command on the local server. Uses cmd.exe on Windows and /bin/sh on Linux/macOS. "
+            + "Dangerous operations trigger security approval. Provide a concise intent title in the conversation language. "
+            + "Returns exitCode, stdout, stderr, timedOut and generatedFiles download links; echo those links for generated files.")
+    public String executeShellCommand(
             @ToolParam(description = "Shell command to execute") String command,
+            @ToolParam(description = "Display-only, concise single-line command intent. Describe the intended action, never claim success or include secrets.", required = false) String title,
             @ToolParam(description = "Timeout in seconds, default 60", required = false) Integer timeoutSeconds,
-            // RFC-063r §2.5: hidden from LLM by JsonSchemaGenerator. Carries the
-            // ChatOrigin so the workspace boundary check honors per-agent basePath.
             @Nullable ToolContext ctx) {
+        return execute_shell_command(command, timeoutSeconds, ctx);
+    }
 
+    /** Legacy Java entry point; presentation metadata never reaches execution. */
+    public String execute_shell_command(String command, Integer timeoutSeconds, @Nullable ToolContext ctx) {
+
+        if (vip.mate.workspace.core.service.MemberFileIsolation.isEnabled()) {
+            return executeIsolated(command, timeoutSeconds, ctx);
+        }
+        ExecutionObservationSink evidence = ExecutionObservationSink.from(ctx);
         int timeout = (timeoutSeconds != null && timeoutSeconds > 0) ? timeoutSeconds : DEFAULT_TIMEOUT_SECONDS;
         // 硬上限：不允许超过 300 秒
         timeout = Math.min(timeout, 300);
@@ -80,16 +91,19 @@ public class ShellExecuteTool {
             vip.mate.tool.guard.WorkspacePathGuard.validateShellCommand(command, ctx);
         } catch (IllegalArgumentException e) {
             log.warn("[ShellExecute] Sandbox rejected command: {}", e.getMessage());
+            if (evidence != null) evidence.command(-1, false, false, true);
             result.set("exitCode", -1);
             result.set("stdout", "");
             result.set("stderr", e.getMessage());
             result.set("timedOut", false);
             result.set("error", e.getMessage());
-            return JSONUtil.toJsonPrettyStr(result);
+            return renderResult(result, ctx);
         }
 
         Path stdoutFile = null;
         Path stderrFile = null;
+        Process process = null;
+        String observedDirectory = null;
 
         try {
             // 处理命令中的嵌入换行符（LLM 生成的 JSON 解码后可能包含真实换行）
@@ -97,6 +111,7 @@ public class ShellExecuteTool {
             String sanitizedCommand = collapseEmbeddedNewlines(command);
 
             ProcessBuilder pb = buildShellProcess(sanitizedCommand, ctx);
+            observedDirectory = (pb.directory() == null ? Path.of("") : pb.directory().toPath()).toAbsolutePath().normalize().toString();
             // 不继承环境变量中的敏感信息
             pb.environment().keySet().removeIf(key ->
                     key.contains("KEY") || key.contains("SECRET") || key.contains("TOKEN")
@@ -113,13 +128,14 @@ public class ShellExecuteTool {
             pb.redirectError(stderrFile.toFile());
 
             long runStart = System.currentTimeMillis();
-            Process process = pb.start();
+            process = pb.start();
 
             boolean completed = process.waitFor(timeout, TimeUnit.SECONDS);
 
             if (!completed) {
                 // 超时：强制终止进程（树）
                 killProcessTree(process);
+                if (evidence != null) evidence.command(null, true, false, false, observedDirectory);
                 log.warn("[ShellExecute] Command timed out after {}s: {}", timeout, truncateForLog(command));
                 result.set("exitCode", -1);
                 result.set("stdout", readFileTruncated(stdoutFile, MAX_OUTPUT_BYTES));
@@ -128,6 +144,7 @@ public class ShellExecuteTool {
                 result.set("message", i18n.msg("tool.shell.error.timeout", timeout));
             } else {
                 int exitCode = process.exitValue();
+                if (evidence != null) evidence.command(exitCode, false, false, false, observedDirectory);
                 String stdout = readFileTruncated(stdoutFile, MAX_OUTPUT_BYTES);
                 String stderr = readFileTruncated(stderrFile, MAX_OUTPUT_BYTES);
                 log.info("[ShellExecute] Command completed: exitCode={}, stdout={}chars, stderr={}chars",
@@ -146,7 +163,23 @@ public class ShellExecuteTool {
                 }
             }
 
+        } catch (InterruptedException e) {
+            // A conversation Stop interrupts the active tool thread. Kill the
+            // subprocess tree before returning control; otherwise the Flux is
+            // gone but the shell command keeps running in the background.
+            if (process != null && process.isAlive()) {
+                killProcessTree(process);
+            }
+            Thread.currentThread().interrupt();
+            if (evidence != null) evidence.command(null, false, true, false, observedDirectory);
+            log.info("[ShellExecute] Command interrupted by cancellation");
+            result.set("exitCode", -1);
+            result.set("stdout", "");
+            result.set("stderr", "Command cancelled by user");
+            result.set("timedOut", false);
+            result.set("cancelled", true);
         } catch (Exception e) {
+            if (evidence != null) evidence.command(null, false, false, false, observedDirectory);
             log.error("[ShellExecute] Command execution failed: {}", e.getMessage(), e);
             result.set("exitCode", -1);
             result.set("stdout", "");
@@ -158,7 +191,7 @@ public class ShellExecuteTool {
             deleteQuietly(stderrFile);
         }
 
-        return JSONUtil.toJsonPrettyStr(result);
+        return renderResult(result, ctx);
     }
 
     /**
@@ -171,6 +204,48 @@ public class ShellExecuteTool {
      *   from the calling environment still apply; falls back to /bin/sh
      *   when $SHELL is unset or points at a non-executable path.
      */
+    private String executeIsolated(String command, Integer timeoutSeconds, ToolContext ctx) {
+        JSONObject result = new JSONObject();
+        result.set("command", command);
+        ExecutionObservationSink evidence = ExecutionObservationSink.from(ctx);
+        try {
+            var scoped = vip.mate.workspace.core.service.MemberFileIsolation.scope(vip.mate.agent.context.ChatOrigin.from(ctx));
+            Path root = Path.of(scoped.workspaceBasePath());
+            long since = System.currentTimeMillis();
+            var output = memberSandboxExecutor.execute(List.of("/bin/sh", "-c", command), root, java.util.Map.of(),
+                    timeoutSeconds == null || timeoutSeconds <= 0 ? DEFAULT_TIMEOUT_SECONDS : timeoutSeconds);
+            result.set("exitCode", output.exitCode());
+            result.set("stdout", output.stdout());
+            result.set("stderr", output.stderr());
+            result.set("timedOut", output.timedOut());
+            if (evidence != null) evidence.command(output.exitCode(), output.timedOut(), false, false, root.toString());
+            List<String> files = WorkspaceArtifactSurfacer.collect(generatedFileCache, root, since, scoped.toToolContext());
+            if (!files.isEmpty()) result.set("generatedFiles", String.join("\n", files));
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            result.set("exitCode", -1); result.set("cancelled", true); result.set("stderr", "Command cancelled");
+            if (evidence != null) evidence.command(null, false, true, false);
+        } catch (Exception e) {
+            result.set("exitCode", -1); result.set("stdout", ""); result.set("timedOut", false);
+            result.set("stderr", "Isolated execution failed: " + e.getMessage());
+            if (evidence != null) evidence.command(null, false, false, true);
+        }
+        return renderResult(result, ctx);
+    }
+
+    /** Report the native outcome before serialization; output text is never used as evidence. */
+    private static String renderResult(JSONObject result, @Nullable ToolContext ctx) {
+        boolean cancelled = Boolean.TRUE.equals(result.getBool("cancelled"));
+        boolean timedOut = Boolean.TRUE.equals(result.getBool("timedOut"));
+        Integer exitCode = result.getInt("exitCode");
+        if (cancelled || timedOut || exitCode != null && exitCode != 0 || result.containsKey("error")) {
+            var capture = vip.mate.tool.mcp.runtime.McpToolResultCapture.from(ctx);
+            if (capture != null) capture.recordFailure(cancelled ? "Shell command cancelled"
+                    : timedOut ? "Shell command timed out" : "Shell command failed (exit code " + exitCode + ")");
+        }
+        return JSONUtil.toJsonPrettyStr(result);
+    }
+
     private static ProcessBuilder buildShellProcess(String command, @Nullable ToolContext ctx) {
         ProcessBuilder pb;
         if (IS_WINDOWS) {

@@ -93,6 +93,14 @@ class TeamContextBuilderTest {
         assertTrue(ctx.contains("LEAD — you orchestrate"));
         assertTrue(ctx.contains("Delegation workflow (mandatory)"));
         assertTrue(ctx.contains("Delegation is NOT completion"));
+        assertTrue(ctx.contains("acceptanceCriteria"));
+        assertTrue(ctx.contains("preferred assignees"));
+        assertTrue(ctx.contains("current membership"));
+        int start = ctx.indexOf("team_tasks(action=\"start_run\"");
+        int create = ctx.indexOf("team_tasks(action=\"create\"");
+        int seal = ctx.indexOf("team_tasks(action=\"seal_run\"");
+        assertTrue(start >= 0 && start < create && create < seal,
+                "lead playbook must require start_run -> create* -> seal_run");
         assertTrue(ctx.contains("写手"));
         assertTrue(ctx.contains("agentId: " + MEMBER_ID));
         // The lead must not receive member execution instructions.

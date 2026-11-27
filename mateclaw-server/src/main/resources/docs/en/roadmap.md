@@ -1,5 +1,8 @@
 # Roadmap
 
+3.1.0 stable release · **2026-11-19**: lesson withdrawal and restore previews, precise memory editing, chat status, and execution/channel reliability. See [Releases](https://github.com/mateaix/mateclaw/releases) for packages and read the [upgrade guidance](./changelog#upgrade-and-validation).
+
+
 > "People don't know what they want until you show it to them."
 >
 > This isn't a feature list. It's a manifesto about **how your AI assistant should exist.**
@@ -130,7 +133,7 @@ The employee turns **outward and finishes a whole job** — from a one-sentence 
 
 Full story: [v1.8.0 release notes](./releases/1.8.0.md).
 
-### v2.0 — It leads a team ✅ Released (2026-07-26)
+### v2.0 — It leads a team ✅ Released (2026-07-31)
 
 From "one person who gets things done" to "a team that collaborates" — **Agent Teams** become a standing roster around a shared task board.
 
@@ -143,15 +146,61 @@ From "one person who gets things done" to "a team that collaborates" — **Agent
 
 Full story: [v2.0.0 release notes](./releases/2.0.0.md); user guide: [Agent Teams](./teams).
 
+### v2.1 — It turns team work into a governable run ✅ Released (2026-08-15)
+
+2.0 built teams and their task board. 2.1 joins the three chains exposed by continuous use: **one identity for a team request, a replayable trajectory for execution, and provenance plus recovery for every skill improvement**.
+
+- **Unified Team Runs**: one `runId` links request, task DAG, worker execution, final synthesis, and deliverables; Chat delivers, Agents observes, and Teams governs the same projection
+- **Outcome-first delivery**: worker conversations leave the normal sidebar, intermediate announcements fold in, and summaries, files, exceptions, and approvals lead while detail drills down progressively
+- **Closed skill-evolution loop**: reflection + cross-session recurring-request mining + promotion + constrained auto-binding + curator governance handover + snapshot/restore; reflection/routine default off, curator stays preview-only before activation, and changes remain workspace-scoped and reversible
+- **Replayable reasoning and execution**: every thinking round, wall-clock duration, tool/observation order, superseded narration, and linear trajectory export
+- **Capabilities reach real operations**: proactive channel messages, targeted Cron delivery, model-level context windows, progressive tool bridge, and action-completion policy
+- Broad hardening across browser automation, WebChat/SSE, Feishu progress, Qwen3-ASR, file layout, and 64-bit id precision
+
+Full story: [v2.1.0 release notes](./releases/2.1.0.md); guides: [Team Runs](./teams) and [Skills](./skills).
+
+### v2.2 — Replaceable runtimes, recoverable long work ✅ Released (2026-08-29)
+
+2.1 defined a complete run. 2.2 turns “what executes it, how it resumes after interruption, and how it collaborates with external agents” into infrastructure.
+
+- **Employee Runtime Contract**: provider registry, session factory, capability declarations, and normalized events let native and external runtimes share conversations, workspaces, tool governance, and UI projection
+- **DeepSeek Harness Runtime**: authenticated JSON-RPC process bridge, thinking/text/tool/lifecycle events, host tool policy, managed installation and configuration, and child-environment isolation
+- **Durable Goal execution**: bounded segments + database scheduler + supervisor + leases / attempts / accepted-input queue recover unfinished goals after backend restarts
+- **A2A interoperability**: MateClaw acts as both A2A server and client with Agent Cards, streamed tasks, get/cancel, and constrained outbound calls
+- **Runtime reliability and boundaries**: Team delivery gates, checkpoint recovery, long-form output, approval-time input, generated files, and workspace-scoped administration are hardened
+- Optional OfficeCLI, ACP prompt timeout, and plugin-tool discovery round out external-runtime operations
+
+Full story: [v2.2.0 release notes](./releases/2.2.0.md); guides: [DeepSeek Harness](./deepseek-harness), [Persistent Goals](./goals), and [A2A](./a2a).
+
+### v2.3 — JSON acceptance and execution evidence ✅ Released (2026-09-20)
+
+- **Managed JSON acceptance**: users select required fields; the server stores immutable JSON versions, binds checks to requirement revisions and slot generations, and rechecks them at Goal completion.
+- **Execution evidence**: observe mode records execution and artifacts by default; on-demand version and JSON field diagnostics do not establish Goal acceptance.
+- **Worker intervention**: handle worker tool approvals, denial, and feedback from team details while retaining conversation governance and exclusive execution.
+- **Skill uploads**: upload documents, binary files, and folders with directory structure preserved; each file is limited to 10 MiB.
+- **Reliability fixes**: bounded DSH history/output tokens, vLLM thinking control, SSE line-ending support, bounded spreadsheet extraction, and tool timeouts.
+
+[v2.3.0](./releases/2.3.0) · [Goals](./goals) · [Teams](./teams) · [Skills](./skills)
+
 ---
 
-## Next: Agent Loop & Team follow-through
+### v3.0 — Native execution architecture ✅ Released (2026-10-26)
+
+Java 21, Spring Boot 4, Spring AI 2 and native AgentScope loops form the execution foundation. MateClaw retains approvals, permissions, Goals, SSE and persistence. [3.0.0 notes](./releases/3.0.0)
+
+### v3.1 — Reviewable lessons and more reliable execution · Released (2026-11-19)
+
+Withdraw individual lessons, preview snapshot restores, edit memory precisely and quote answers into follow-ups. Harden model context/media recovery, visible tool failures, Wiki citations and channel delivery. [3.1.0 notes](./releases/3.1.0)
+
+---
+
+## Next: Resident runtimes & Team follow-through
 
 > "Great things in business are never done by one person. They're done by a team of people."
 
-Look back along the line: v1.2 gave employees an identity, v1.3 made flows orchestratable, v1.4 made employees follow goals and spin up delegation trees, v1.7 made long tasks visible, and **v2.0 made teams a standing roster**.
+Look back along the line: v1.2 gave employees an identity, v1.3 made flows orchestratable, v1.4 made employees follow goals and spin up delegation trees, v1.7 made long tasks visible, v2.0 made teams a standing roster, v2.1 made every round deliverable, learnable, and governable, and **v2.2 made execution engines replaceable, long goals recoverable across requests and restarts, and agents interoperable across systems**.
 
-One "stop" remains: **employees are reactive.** Goal auto-followup only lives **within a single run**; cron and triggers can wake an employee up, but every wake-up is an isolated response. No employee is truly **on duty** — continuously watching its area of responsibility and deciding for itself when to act.
+One “stop” remains: **durable Goals can continue, but employees still lack a general resident responsibility loop.** Cron and triggers can wake them, and the Goal supervisor can recover one objective, but there is no unified inbox, heartbeat, duty journal, or priority policy across objectives. The next step generalizes 2.2's runtime / queue / recovery foundation into a true on-duty state.
 
 ### Agent Team follow-through — the roster exists; now it grows skills
 
@@ -170,7 +219,7 @@ A new state for employees: **on duty**. Not waiting for you to speak, but cyclin
 
 - [ ] **Resident loop runtime**: an employee can be set "on duty," waking on a configurable heartbeat (minutes to days) to check its area of responsibility
 - [ ] **Task inbox**: channel messages, trigger events, delegations from other employees, to-dos you toss over — one queue, consumed by priority on each wake-up
-- [ ] **Cross-session goal continuation**: v1.4/v1.5 auto-followup lives inside a single run; the loop carries goals across sessions and across days until every criterion is checked
+- [x] **Cross-request and restart-safe Goal continuation (2.2)**: the Goal supervisor, durable queue, leases / attempts, and recovery carry goals across bounded execution segments and service restarts until the checklist passes or execution explicitly pauses
 - [ ] **Budgets and circuit breakers**: per-loop token / cost / turn budgets; consecutive failures trip the breaker into sleep pending your decision; ToolGuard approval gates still intercept sensitive actions — autonomy is not loss of control
 - [ ] **Loop journal**: what it did each wake-up, why it chose not to act, what it spent — human-readable and replayable, what DREAMS.md is to memory
 - [ ] **Pause / resume / clock-out**: controllable from the UI and from channel commands; the Run Overview sidebar shows every on-duty employee's loop state
@@ -225,7 +274,12 @@ A leader on a loop, members summoned on demand — that's a **self-running digit
 | **v1.7** | It's ready for production | Approval paths closed + Run Overview & cost visibility + context/token budgeting + open API/Deep Research + desktop remote/LAN + operational export | ✅ Released |
 | **v1.8** | It does a whole job | Content Studio — one sentence to a publishable 公众号 / 小红书 post + browser ref interaction | ✅ Released |
 | **v2.0** | **It leads a team** | **Agent Teams + a shared task board — the lead decomposes and dispatches, members run in parallel, deliverables and full observability** | ✅ Released |
-| **Next** | **It's on duty** | **Agent Loop resident cycles + team follow-through (peer review / team goals / group binding / retrospectives) = a department that runs itself** | 📋 Planned |
+| **v2.1** | **It turns collaboration into a run** | **Unified Team Runs + closed skill evolution + replayable reasoning trajectories + proactive channel delivery** | ✅ Released |
+| **v2.2** | **It reshapes the runtime** | **Pluggable runtimes + DeepSeek Harness + durable Goal recovery + A2A interoperability** | ✅ Released |
+| **v2.3** | Managed JSON acceptance | User-configured fields, immutable artifact versions and controlled team intervention | ✅ Released |
+| **v3.0** | Native execution architecture | Java 21, Boot 4, Spring AI 2 and native AgentScope loops | ✅ Released |
+| **v3.1** | Reviewable lessons and reliable execution | Lesson withdrawal, restore previews, precise memory, chat feedback, context and channel recovery | Released |
+| **Next** | **It's on duty** | **Resident runtime (heartbeat / inbox / journal / circuit breakers) + team follow-through = a department that runs itself** | 📋 Planned |
 
 ---
 
@@ -237,7 +291,7 @@ We're building it because we believe one thing:
 
 **AI shouldn't be a chat box on a webpage. It should be your second brain.**
 
-It lives in your DingTalk, your Feishu, your Telegram. It's read every document you have. It remembers what you said three months ago. It uses your company's internal tools. It consolidates memory while you sleep. It runs an entire business flow on your behalf. **Soon it will lead a standing team, stay on duty, and watch over the things you can't get to.**
+It lives in your DingTalk, your Feishu, your Telegram. It's read every document you have. It remembers what you said three months ago. It uses your company's internal tools. It consolidates memory while you sleep. It runs an entire business flow on your behalf. **Its runtime is now replaceable, its long goals recoverable, and its external agents interoperable; next, that foundation becomes a digital department that stays on duty.**
 
 Someday, you'll forget it's a program.
 

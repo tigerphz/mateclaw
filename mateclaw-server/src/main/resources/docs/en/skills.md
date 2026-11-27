@@ -1,5 +1,23 @@
 # Skills
 
+## 3.1.0: lesson withdrawal and restore previews
+
+Review learned entries in the lesson panel and withdraw the intended lesson by durable identity; other lessons remain intact. Market cards and details refresh after changes. Ambiguous legacy records cannot be withdrawn until the intended entry can be identified.
+
+When restoring a curator snapshot, inspect restored, unchanged, missing and archived entries plus changed fields before confirming. Retry a failed preview first. The preview describes current impact; the server still checks permissions and state when applying the restore.
+
+Skill installations run in the background and can be cancelled from their task. Incomplete scans, read failures or scan limits block skill loading. Fix attachments and rescan rather than treating an unfinished check as approval.
+
+## 2.3.0: document and folder uploads
+
+In skill file management, select `references/`, `templates/`, or `scripts/`, then upload files or choose a folder. The selected folder and descendants remain under that bucket, for example `references/manual/chapter.pdf`. The upload endpoint requires workspace admin access; built-in skill files are read-only. Replacing an existing path requires confirmation.
+
+- The server limits each file to **10 MiB**. The frontend batch planner allows at most **100 files totaling 50 MiB**.
+- Text is stored as UTF-8; binary content is stored as Base64 and restored to bytes when synchronized into the skill working directory. Binary files cannot be edited as text; upload a replacement instead.
+- Paths are validated; traversal, invalid separators, duplicate destinations, and overly long paths are rejected.
+- Uploading manages skill attachments; it does not establish that an attachment has been read, executed, or content-validated.
+
+
 **A skill is a tool that thinks in sentences.**
 
 Tools are atomic — read a file, send an HTTP request, run a command. Skills are compositions — "research this topic and write a brief", "review this code and comment on it", "turn my git log into a standup update". A skill is a `SKILL.md` file that combines instructions, parameters, prompt templates, optional scripts, and a list of tools the skill needs. The runtime loads it, renders it with your inputs, and hands the result to the agent.
@@ -192,7 +210,8 @@ The database is the source of truth, the filesystem is a materialized cache. Tha
 | `id` | Primary key |
 | `skill_id` | FK to `mate_skill` |
 | `file_path` | Relative path like `scripts/run.py` or `references/cfg.md` |
-| `content` | UTF-8 text (defaults: ≤1 MB per file, ≤50 MB per bundle — configurable via `mateclaw.skill.upload.max-entry-size-mb` / `max-total-size-mb`) |
+| `content` | Text or Base64-encoded binary content (2.3.0+); see upload limits above |
+| `content_encoding` | `utf8` or `base64` (added by V202); synchronization restores the original bytes |
 | `content_size` | Byte count (so listings don't have to load the blob) |
 | `sha256` | Content fingerprint, drives the syncer's idempotent diff |
 
@@ -673,6 +692,24 @@ Three built-in skills compose the [Content Studio](./content-studio) scene — o
 - **`deai_humanize`** — measurable de-AI-ification: a heuristic AI-trace score drives a detect → rewrite → re-check loop (two tones: 公众号 measured, 小红书 lively), capped at 3 rounds.
 
 See [Content Studio](./content-studio) for the full pipeline, publish chain, and content calendar.
+
+---
+
+## Closed skill-evolution loop (2.1.0+)
+
+2.1.0 expands LESSONS.md learning into an inspectable, reversible improvement chain:
+
+1. **Reflection** proposes a precise patch or new-skill candidate from a completed conversation.
+2. **Routine mining** clusters recent conversations' opening user requests per employee; it does not mine a full execution trace. The default window is 30 days, with at least three occurrences across three distinct days. Once enabled, the nightly job automatically promotes qualified candidates (two per sweep by default); admins may promote early, dismiss, or reopen.
+3. **Automatic binding** only handles a new skill with a source employee, and adds a row only when that employee already uses an explicit, non-empty skill allowlist. Inherit-all needs no binding, while an explicit no-skills choice is never overwritten.
+4. **Curator** organizes stale, archived, and overlapping skills per workspace. It starts preview-only and mutates only after admin activation; consolidation is separately enabled, with umbrella creation and source archiving transactional.
+5. **Adopt / release** transfers governance: adopt hands a user skill to autonomous curation, while release returns it to user ownership. It is not a record of which employee uses the skill.
+6. **Snapshots** create a restore point before every activated mutating sweep and again before restore; five are retained per workspace by default.
+7. **Origin** distinguishes built-in, user, agent, and routine, while also serving as curator policy. Manual handover intentionally changes the user / agent state.
+
+The secure default is **observe before allowing automatic writes**: reflection and routine mining are disabled until explicitly enabled. Reflection's `enabled` switch controls whether transcript/catalog data reaches the reviewer model, while `auto-apply` separately controls mutations; with auto-apply off nothing is written, but there is no persisted human-approval queue. Transcripts and skill bodies are treated as untrusted data; automatic writes allow only create or a unique-context patch. Full replacement, secret exfiltration, approval bypasses, and cross-workspace reads/writes fail closed.
+
+`Settings → Skill Curator` shows workspace state, routine candidates, recent reports, origin, managed/unmanaged skills, and restore points. Curator, routine, snapshot, adopt, and release operations all require the current workspace context.
 
 ---
 

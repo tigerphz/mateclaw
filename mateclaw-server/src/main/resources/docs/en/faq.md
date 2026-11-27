@@ -250,6 +250,28 @@ Expand the chat interface's **thinking panel**. You see every tool call, argumen
 
 ---
 
+## Employee templates and teams
+
+This section covers the current `dev` / `3.2.0-SNAPSHOT` additions; published 3.1.0 packages do not include them.
+
+### Do source employee edits update an existing template?
+
+No. Workspace templates are independent configuration snapshots; save another template for revisions. Deleting a template does not delete recruited employees, and deleting the source does not rewrite the snapshot. It is not a skill-package or knowledge-base backup: inherited defaults and resource references still depend on the current workspace environment. [Template contents and boundaries](./agents)
+
+### Why does custom recruitment report a missing dependency?
+
+Custom snapshots strictly validate saved skill, tool, knowledge-base and model/provider references, including disabled or out-of-scope dependencies. Restore them and retry; recruitment does not skip them and quietly grant broader capabilities. The new employee name must also be unused in the workspace. DSH employees cannot currently be saved as these templates; copying runtime configuration is not a supported workaround.
+
+### Why can I not remove a member or delete an employee/team?
+
+Finish or cancel the relevant unfinished tasks first, including approval waits and recoverable `stale` tasks. Even an idle lead requires its team to be deleted first; ask an administrator if necessary. An employee belongs to one team, and pausing does not release that membership. A failed task cannot be retried to a removed assignee. [Roster protection rules](./teams)
+
+### Why can coordinator mode not be enabled, switched or run?
+
+The switch is on the team's **Members** tab, requires workspace admin or higher, and supports native leads only. Wait for the lead's active turn to end; malformed historical settings JSON must be repaired first. Search-only models or unsupported provider options fail explicitly rather than bypassing coordination through hosted search. The mode defaults to off; turning it off restores the previous configured capabilities from the next turn. Member configuration stays unchanged.
+
+---
+
 ## Channels
 
 ### DingTalk / Feishu webhook isn't receiving messages
@@ -288,7 +310,7 @@ Configure `http_proxy` in the channel config:
 cp ./data/mateclaw.mv.db ./backup/mateclaw-$(date +%Y%m%d).mv.db
 ```
 
-**MySQL (production):**
+**MySQL (supported self-managed deployment):**
 
 ```bash
 mysqldump -u root -p mateclaw > mateclaw-backup-$(date +%Y%m%d).sql
@@ -297,7 +319,7 @@ mysqldump -u root -p mateclaw > mateclaw-backup-$(date +%Y%m%d).sql
 **Docker:**
 
 ```bash
-docker exec mateclaw-mysql mysqldump -u root -p${MYSQL_ROOT_PASSWORD} mateclaw > backup.sql
+docker compose exec -T postgres sh -c 'pg_dump -U "$POSTGRES_USER" "$POSTGRES_DB"' > backup.sql
 ```
 
 **Desktop** data lives in the per-user directory:
@@ -332,19 +354,19 @@ Try launching from a terminal. On Windows, right-click → Unblock. On macOS, al
 
 ```bash
 docker compose logs mateclaw-server
-docker compose logs mateclaw-mysql
+docker compose logs postgres
 ```
 
 Common:
 
-- MySQL not ready yet
-- Port conflicts (18080, 3306)
-- Missing `.env` — copy from `.env.example`
+- PostgreSQL not ready yet
+- Public port 18080 is already in use
+- Missing `.env`, `DB_PASSWORD`, or `DB_ADMIN_PASSWORD`
 
 ### How do I access the database in Docker?
 
 ```bash
-docker exec -it mateclaw-mysql mysql -u root -p mateclaw
+docker compose exec postgres sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB"'
 ```
 
 ---
@@ -397,7 +419,7 @@ curl -N -X POST 'http://localhost:18088/api/v1/chat/stream' \
 
 ```bash
 cd mateclaw-ui
-pnpm build
+npm run build
 ls ../mateclaw-server/src/main/resources/static/
 # Should contain index.html and asset files
 ```

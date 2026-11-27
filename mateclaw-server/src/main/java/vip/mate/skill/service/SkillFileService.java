@@ -8,10 +8,13 @@ import org.springframework.transaction.annotation.Transactional;
 import vip.mate.skill.model.SkillFileEntity;
 import vip.mate.skill.repository.SkillFileMapper;
 
+import java.nio.ByteBuffer;
+import java.nio.charset.CharacterCodingException;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.time.LocalDateTime;
+import java.util.Base64;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -46,9 +49,13 @@ public class SkillFileService {
     /** Compute SHA-256 hex of a UTF-8 string (used for idempotent diffs). */
     public static String sha256Hex(String content) {
         if (content == null) content = "";
+        return sha256Hex(content.getBytes(StandardCharsets.UTF_8));
+    }
+
+    public static String sha256Hex(byte[] bytes) {
         try {
             MessageDigest md = MessageDigest.getInstance("SHA-256");
-            byte[] digest = md.digest(content.getBytes(StandardCharsets.UTF_8));
+            byte[] digest = md.digest(bytes);
             StringBuilder sb = new StringBuilder(digest.length * 2);
             for (byte b : digest) sb.append(String.format("%02x", b));
             return sb.toString();
@@ -73,11 +80,22 @@ public class SkillFileService {
      */
     @Transactional
     public ApplyResult applyBundleFiles(Long skillId, Map<String, String> newFiles, boolean force) {
+        Map<String, byte[]> bytes = new HashMap<>();
+        if (newFiles != null) {
+            newFiles.forEach((path, content) -> bytes.put(path,
+                    (content == null ? "" : content).getBytes(StandardCharsets.UTF_8)));
+        }
+        return applyBundleBytes(skillId, bytes, force);
+    }
+
+    /** Apply a full DB-eligible bundle without decoding binary attachments as text. */
+    @Transactional
+    public ApplyResult applyBundleBytes(Long skillId, Map<String, byte[]> newFiles, boolean force) {
         if (skillId == null) {
             return new ApplyResult(0, 0, false, false);
         }
 
-        Map<String, String> incoming = newFiles == null ? Map.of() : newFiles;
+        Map<String, byte[]> incoming = newFiles == null ? Map.of() : newFiles;
         boolean newHasScripts = bucketHasEntries(incoming, "scripts/");
         boolean newHasRefs = bucketHasEntries(incoming, "references/");
         boolean newHasTemplates = bucketHasEntries(incoming, "templates/");
@@ -122,9 +140,11 @@ public class SkillFileService {
         LocalDateTime now = LocalDateTime.now();
         for (var entry : incoming.entrySet()) {
             String path = entry.getKey();
-            String content = entry.getValue() == null ? "" : entry.getValue();
-            String hash = sha256Hex(content);
-            int size = content.getBytes(StandardCharsets.UTF_8).length;
+            byte[] bytes = entry.getValue() == null ? new byte[0] : entry.getValue();
+            EncodedContent encoded = encode(bytes);
+            String content = encoded.content();
+            String hash = sha256Hex(bytes);
+            int size = bytes.length;
 
             SkillFileEntity prior = existingByPath.get(path);
             if (prior == null) {
@@ -132,14 +152,17 @@ public class SkillFileService {
                 row.setSkillId(skillId);
                 row.setFilePath(path);
                 row.setContent(content);
+                row.setContentEncoding(encoded.encoding());
                 row.setContentSize(size);
                 row.setSha256(hash);
                 row.setCreateTime(now);
                 row.setUpdateTime(now);
                 mapper.insert(row);
                 written++;
-            } else if (!hash.equals(prior.getSha256())) {
+            } else if (!hash.equals(prior.getSha256())
+                    || !encoded.encoding().equals(prior.isBinary() ? "base64" : "utf8")) {
                 prior.setContent(content);
+                prior.setContentEncoding(encoded.encoding());
                 prior.setContentSize(size);
                 prior.setSha256(hash);
                 prior.setUpdateTime(now);
@@ -193,32 +216,34 @@ public class SkillFileService {
      */
     @Transactional
     public SkillFileEntity upsertFile(Long skillId, String filePath, String content) {
-        String safeContent = content == null ? "" : content;
-        String hash = sha256Hex(safeContent);
+        return upsertBytes(skillId, filePath,
+                (content == null ? "" : content).getBytes(StandardCharsets.UTF_8));
+    }
+
+    /** Preserve arbitrary bytes; only strictly valid UTF-8 without control bytes is editable text. */
+    @Transactional
+    public SkillFileEntity upsertBytes(Long skillId, String filePath, byte[] bytes) {
+        EncodedContent encoded = encode(bytes);
+        String content = encoded.content();
+        String encoding = encoded.encoding();
+        String hash = sha256Hex(bytes);
+        SkillFileEntity row = getFile(skillId, filePath);
+        boolean insert = row == null;
+        if (!insert && hash.equals(row.getSha256())) return row;
         LocalDateTime now = LocalDateTime.now();
-
-        SkillFileEntity existing = getFile(skillId, filePath);
-        if (existing != null) {
-            if (hash.equals(existing.getSha256())) {
-                return existing;
-            }
-            existing.setContent(safeContent);
-            existing.setContentSize(safeContent.getBytes(StandardCharsets.UTF_8).length);
-            existing.setSha256(hash);
-            existing.setUpdateTime(now);
-            mapper.updateById(existing);
-            return existing;
+        if (insert) {
+            row = new SkillFileEntity();
+            row.setSkillId(skillId);
+            row.setFilePath(filePath);
+            row.setCreateTime(now);
         }
-
-        SkillFileEntity row = new SkillFileEntity();
-        row.setSkillId(skillId);
-        row.setFilePath(filePath);
-        row.setContent(safeContent);
-        row.setContentSize(safeContent.getBytes(StandardCharsets.UTF_8).length);
+        row.setContent(content);
+        row.setContentEncoding(encoding);
+        row.setContentSize(bytes.length);
         row.setSha256(hash);
-        row.setCreateTime(now);
         row.setUpdateTime(now);
-        mapper.insert(row);
+        if (insert) mapper.insert(row);
+        else mapper.updateById(row);
         return row;
     }
 
@@ -231,7 +256,22 @@ public class SkillFileService {
         return true;
     }
 
-    private boolean bucketHasEntries(Map<String, String> files, String prefix) {
+    private static EncodedContent encode(byte[] bytes) {
+        String text = null;
+        try {
+            text = StandardCharsets.UTF_8.newDecoder().decode(ByteBuffer.wrap(bytes)).toString();
+            if (text.codePoints().anyMatch(c -> c < 32 && c != '\n' && c != '\r' && c != '\t')) text = null;
+        } catch (CharacterCodingException binary) {
+            // Keep the original bytes below.
+        }
+        String encoding = text == null ? "base64" : "utf8";
+        String content = text == null ? Base64.getEncoder().encodeToString(bytes) : text;
+        return new EncodedContent(content, encoding);
+    }
+
+    private record EncodedContent(String content, String encoding) {}
+
+    private boolean bucketHasEntries(Map<String, ?> files, String prefix) {
         for (String key : files.keySet()) {
             if (key != null && key.startsWith(prefix)) return true;
         }
